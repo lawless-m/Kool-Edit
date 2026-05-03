@@ -299,4 +299,40 @@ if (dataChunkSize !== expectedDataBytes) {
 }
 console.log(`mixdown produces ${wavBytes.length}-byte WAV with ${dataChunkSize} bytes of audio`);
 
+// Compressor end-to-end. Steady -10 dB sine, threshold -20 dB, ratio 4:1
+// → expect static gain reduction of ~7.5 dB after the envelope settles.
+const fxEng = new WasmEngine(48000);
+const sampleCount = 48000;
+const amp = Math.pow(10, -10 / 20);
+const sine = new Float32Array(sampleCount);
+for (let n = 0; n < sampleCount; n++) {
+  sine[n] = amp * Math.sin((n / 48) * 2 * Math.PI);
+}
+const fxSrcId = fxEng.importWav("sine.wav", makeWav(sine), new Date().toISOString());
+fxEng.applyOp(
+  fxSrcId,
+  JSON.stringify({
+    Compress: {
+      range: { start: 0, end: sampleCount },
+      params: {
+        threshold_db: -20.0,
+        ratio: 4.0,
+        attack_ms: 1.0,
+        release_ms: 100.0,
+        makeup_db: 0.0,
+        knee_db: 0.0,
+      },
+    },
+  }),
+  new Date().toISOString(),
+);
+const compressed = fxEng.querySamples(fxSrcId, BigInt(sampleCount / 2), BigInt(sampleCount));
+const tailPeak = Math.max(...Array.from(compressed).map(Math.abs));
+const tailDb = 20 * Math.log10(tailPeak);
+if (Math.abs(tailDb + 17.5) > 1.0) {
+  console.error(`FAIL: compressor tail peak ${tailDb.toFixed(2)} dB, expected ~-17.5 dB`);
+  process.exit(1);
+}
+console.log(`compressor settles at ${tailDb.toFixed(2)} dB (target -17.5 dB)`);
+
 console.log("OK");

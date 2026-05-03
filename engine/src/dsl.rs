@@ -14,6 +14,7 @@
 //! envelopes, noise profiles) return [`EmitError::Unsupported`] so callers
 //! see exactly what's missing.
 
+use crate::effect::{CompParams, DelayParams, LimitParams};
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
@@ -215,14 +216,28 @@ impl<'a> Emitter<'a> {
             Op::Generate { at, length, params } => {
                 self.emit_generate(*at, *length, params, sample_rate)?
             }
+            Op::Delay { range, params } => self.line(&format!(
+                "{}  delay {}",
+                fmt_range(*range, sample_rate),
+                fmt_delay_params(params)
+            )),
+            Op::Compress { range, params } => self.line(&format!(
+                "{}  compress {}",
+                fmt_range(*range, sample_rate),
+                fmt_comp_params(params)
+            )),
+            Op::Limit { range, params } => self.line(&format!(
+                "{}  limit {}",
+                fmt_range(*range, sample_rate),
+                fmt_limit_params(params)
+            )),
 
             Op::Insert { .. }
             | Op::PasteMix { .. }
             | Op::PasteOver { .. } => {
                 return Err(EmitError::Unsupported("clipboard ops"));
             }
-            Op::Eq { .. } | Op::Compress { .. } | Op::Limit { .. } | Op::Reverb { .. }
-            | Op::Delay { .. } => {
+            Op::Eq { .. } | Op::Reverb { .. } => {
                 return Err(EmitError::Unsupported("effect param blocks"));
             }
             Op::NoiseReduce { .. } => return Err(EmitError::Unsupported("noise_reduce")),
@@ -407,6 +422,43 @@ impl<'a> Emitter<'a> {
         ));
         self.close();
     }
+}
+
+fn fmt_delay_params(p: &DelayParams) -> String {
+    let mut s = format!(
+        "time:{}ms feedback:{} mix:{}",
+        fmt_float(p.time_ms),
+        fmt_float(p.feedback),
+        fmt_float(p.mix)
+    );
+    if p.ping_pong {
+        s.push_str(" ping_pong:true");
+    }
+    if let Some(hz) = p.feedback_lp_hz {
+        s.push_str(&format!(" feedback_lp:{}Hz", fmt_float(hz)));
+    }
+    s
+}
+
+fn fmt_comp_params(p: &CompParams) -> String {
+    format!(
+        "threshold:{} ratio:{} attack:{}ms release:{}ms makeup:{} knee:{}",
+        fmt_db(p.threshold_db),
+        fmt_float(p.ratio),
+        fmt_float(p.attack_ms),
+        fmt_float(p.release_ms),
+        fmt_db(p.makeup_db),
+        fmt_db(p.knee_db)
+    )
+}
+
+fn fmt_limit_params(p: &LimitParams) -> String {
+    format!(
+        "ceiling:{} lookahead:{}ms release:{}ms",
+        fmt_db(p.ceiling_db),
+        fmt_float(p.lookahead_ms),
+        fmt_float(p.release_ms)
+    )
 }
 
 fn fade_keyword(d: FadeDirection) -> &'static str {
@@ -725,6 +777,56 @@ mod tests {
         let dsl = project_to_dsl(&p).unwrap();
         assert!(dsl.contains("marker \"Verse 1\" @00:00:00.000"), "got:\n{dsl}");
         assert!(dsl.contains("marker \"Chorus\" @00:00:48.000"), "got:\n{dsl}");
+    }
+
+    #[test]
+    fn emits_delay_compress_limit_ops() {
+        use crate::effect::{CompParams, DelayParams, LimitParams};
+        let mut p = Project::new(96_000);
+        let mut s = fixture_source("src_a", 96_000, 96_000);
+        s.edits.apply(Op::Delay {
+            range: SampleRange::new(0, 96_000).unwrap(),
+            params: DelayParams {
+                time_ms: 250.0,
+                feedback: 0.4,
+                mix: 0.3,
+                ping_pong: true,
+                feedback_lp_hz: None,
+            },
+        });
+        s.edits.apply(Op::Compress {
+            range: SampleRange::new(0, 96_000).unwrap(),
+            params: CompParams {
+                threshold_db: -18.0,
+                ratio: 3.0,
+                attack_ms: 5.0,
+                release_ms: 80.0,
+                makeup_db: 3.0,
+                knee_db: 6.0,
+            },
+        });
+        s.edits.apply(Op::Limit {
+            range: SampleRange::new(0, 96_000).unwrap(),
+            params: LimitParams {
+                ceiling_db: -0.3,
+                lookahead_ms: 5.0,
+                release_ms: 50.0,
+            },
+        });
+        p.sources.insert(s.id.clone(), s);
+        let dsl = project_to_dsl(&p).unwrap();
+        assert!(
+            dsl.contains("delay time:250ms feedback:0.4 mix:0.3 ping_pong:true"),
+            "delay missing\n{dsl}"
+        );
+        assert!(
+            dsl.contains("compress threshold:-18dB ratio:3 attack:5ms release:80ms makeup:+3dB knee:+6dB"),
+            "compress missing\n{dsl}"
+        );
+        assert!(
+            dsl.contains("limit ceiling:-0.3dB lookahead:5ms release:50ms"),
+            "limit missing\n{dsl}"
+        );
     }
 
     #[test]
