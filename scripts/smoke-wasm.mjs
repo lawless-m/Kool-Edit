@@ -518,4 +518,25 @@ console.log(
   `kepz archive round-trip: ${archive.length}-byte zip preserves source samples`,
 );
 
+// DSL round-trip: emit, parse, re-emit, expect identical text.
+const dslRoundEng = new WasmEngine(96000);
+dslRoundEng.applyOp(
+  dslRoundEng.importWav("d.wav", makeWav(new Float32Array(1024).fill(0.25)), new Date().toISOString()),
+  JSON.stringify({ Silence: { range: { start: 100, end: 500 } } }),
+  new Date().toISOString(),
+);
+const dslText = dslRoundEng.projectDsl();
+const dslEng2 = new WasmEngine(96000);
+dslEng2.loadProjectDsl(dslText);
+const dslText2 = dslEng2.projectDsl();
+if (dslText !== dslText2) {
+  console.error("FAIL: DSL emit→parse→emit not idempotent");
+  console.error("--- first  ---");
+  console.error(dslText);
+  console.error("--- second ---");
+  console.error(dslText2);
+  process.exit(1);
+}
+console.log(`DSL round-trip: ${dslText.length} chars survive emit→parse→emit`);
+
 console.log("OK");

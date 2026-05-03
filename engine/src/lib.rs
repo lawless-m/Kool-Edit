@@ -184,6 +184,17 @@ mod wasm_api {
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
+        /// Parse `.keds` text and replace the engine's project with the
+        /// result. The supported subset matches the emitter; anything else
+        /// returns a typed `Unsupported` error.
+        #[wasm_bindgen(js_name = loadProjectDsl)]
+        pub fn load_project_dsl(&mut self, dsl: &str) -> Result<(), JsError> {
+            let project = crate::dsl::parse_project(dsl)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            self.inner.replace_project(project);
+            Ok(())
+        }
+
         /// Mix the project down to a 32-bit float WAV, returned as bytes
         /// suitable for download. Errors describe which feature blocked the
         /// render (envelopes, automation, time stretch, sample-rate
