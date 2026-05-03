@@ -1,8 +1,19 @@
 //! Kool-Edit engine.
 //!
-//! See `kool-edit-design-docs/kool-edit-docs/02-architecture.md` for the module
-//! layout this crate is growing into. At the scaffold stage there is just a
-//! version constant and a smoke-test entry point.
+//! See `kool-edit-design-docs/kool-edit-docs/02-architecture.md` for the
+//! module layout this crate is growing into. The first slice is the data
+//! model from doc 03: sources with edit lists, and the multitrack project
+//! hierarchy. DSP, storage, and serialisation come in later slices.
+
+pub mod edit_list;
+pub mod effect;
+pub mod envelope;
+pub mod ids;
+pub mod op;
+pub mod project;
+pub mod range;
+pub mod source;
+pub mod spectral;
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const DEFAULT_PROJECT_SAMPLE_RATE: u32 = 96_000;
