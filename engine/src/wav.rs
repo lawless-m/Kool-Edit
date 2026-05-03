@@ -42,6 +42,27 @@ impl From<hound::Error> for WavError {
     }
 }
 
+/// Encode interleaved float samples as a 32-bit float WAV. Used for mixdown
+/// export and tests.
+pub fn encode_f32(samples: &[f32], channels: u16, sample_rate: u32) -> Vec<u8> {
+    let spec = hound::WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+    {
+        let mut writer = hound::WavWriter::new(&mut buf, spec)
+            .expect("WAV header for in-memory cursor cannot fail");
+        for &s in samples {
+            writer.write_sample(s).expect("in-memory write");
+        }
+        writer.finalize().expect("finalize in-memory WAV");
+    }
+    buf.into_inner()
+}
+
 pub fn decode(bytes: &[u8]) -> Result<DecodedWav, WavError> {
     let cursor = Cursor::new(bytes);
     let mut reader = hound::WavReader::new(cursor)?;
@@ -146,6 +167,27 @@ mod tests {
         assert_eq!(decoded.frames, 4);
         assert_eq!(decoded.samples.len(), 8);
         assert!((decoded.samples[2] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn encode_then_decode_round_trips_mono_float() {
+        let samples = [0.0_f32, 0.25, -0.5, 1.0, -1.0];
+        let bytes = encode_f32(&samples, 1, 48_000);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.channel_count, 1);
+        assert_eq!(decoded.sample_rate, 48_000);
+        assert_eq!(decoded.samples, samples);
+    }
+
+    #[test]
+    fn encode_then_decode_round_trips_stereo_float() {
+        let samples = [0.0_f32, 0.0, 0.5, -0.5, -0.25, 0.25, 1.0, -1.0];
+        let bytes = encode_f32(&samples, 2, 96_000);
+        let decoded = decode(&bytes).unwrap();
+        assert_eq!(decoded.channel_count, 2);
+        assert_eq!(decoded.sample_rate, 96_000);
+        assert_eq!(decoded.frames, 4);
+        assert_eq!(decoded.samples, samples);
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub mod effect;
 pub mod engine;
 pub mod envelope;
 pub mod ids;
+pub mod mixdown;
 pub mod op;
 pub mod peaks;
 pub mod project;
@@ -177,6 +178,18 @@ mod wasm_api {
         #[wasm_bindgen(js_name = projectDsl)]
         pub fn project_dsl(&self) -> Result<String, JsError> {
             crate::dsl::project_to_dsl(self.inner.project())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Mix the project down to a 32-bit float WAV, returned as bytes
+        /// suitable for download. Errors describe which feature blocked the
+        /// render (envelopes, automation, time stretch, sample-rate
+        /// mismatch, etc.).
+        #[wasm_bindgen(js_name = mixdownWav)]
+        pub fn mixdown_wav(&self) -> Result<Box<[u8]>, JsError> {
+            self.inner
+                .mixdown_wav()
+                .map(|v| v.into_boxed_slice())
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 

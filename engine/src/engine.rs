@@ -106,6 +106,14 @@ impl Engine {
         &self.project
     }
 
+    /// Mutable project access. Used by callers that build the project
+    /// structure directly (e.g. tests, the multitrack UI). Destructive
+    /// edits on a source still go through [`Self::apply_op`] so the edit
+    /// list and timestamps stay consistent.
+    pub fn project_mut(&mut self) -> &mut Project {
+        &mut self.project
+    }
+
     /// Replace the in-memory project, e.g. after loading from JSON. The
     /// caller is responsible for ensuring the storage backend already
     /// contains every base file the new project references.
@@ -276,6 +284,19 @@ impl Engine {
         source.edits.truncate_history();
         source.modified_at = now;
         Ok(())
+    }
+
+    /// Render the project as interleaved stereo at the project's sample rate.
+    /// See [`crate::mixdown`] for what's currently supported.
+    pub fn mixdown_stereo(&self) -> Result<Vec<f32>, crate::mixdown::MixdownError> {
+        crate::mixdown::mixdown_stereo(self)
+    }
+
+    /// Convenience: render the project and encode the result as a 32-bit
+    /// float WAV. The output is suitable for download or for writing to disk.
+    pub fn mixdown_wav(&self) -> Result<Vec<u8>, crate::mixdown::MixdownError> {
+        let stereo = self.mixdown_stereo()?;
+        Ok(crate::wav::encode_f32(&stereo, 2, self.project.sample_rate()))
     }
 }
 

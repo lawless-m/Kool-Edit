@@ -224,4 +224,79 @@ for (const needle of expected) {
 }
 console.log("DSL emitter produces expected lines");
 
+// Mixdown: build a project with a single mono clip on one track and verify
+// the resulting WAV has the expected RIFF header and a non-trivial payload.
+const mixEng = new WasmEngine(48000);
+const mixWav = makeWav(new Float32Array(48).fill(0.5));
+const mixSrcId = mixEng.importWav("mix.wav", mixWav, new Date().toISOString());
+
+// Reuse the existing project (which already contains the imported source)
+// and add a track + clip via JSON edit + loadProjectJson round-trip.
+const proj = JSON.parse(mixEng.projectJson());
+proj.tracks.push({
+  id: 1,
+  name: "T",
+  height: 80.0,
+  mute: false,
+  solo: false,
+  arm: false,
+  gain_db: 0.0,
+  pan: 0.0,
+  inserts: [],
+  automation: [],
+  clips: [
+    {
+      id: 1,
+      source_id: mixSrcId,
+      name: "c",
+      track_position: { start: 0, end: 48 },
+      source_in: 0,
+      source_out: 48,
+      gain_db: 0.0,
+      pan: 0.0,
+      fade_in: { duration_samples: 0, shape: "Linear" },
+      fade_out: { duration_samples: 0, shape: "Linear" },
+      time_stretch: 1.0,
+      pitch_shift_cents: 0.0,
+      envelopes: [],
+      locked: false,
+      group: null,
+    },
+  ],
+});
+mixEng.loadProjectJson(JSON.stringify(proj));
+
+const wavBytes = mixEng.mixdownWav();
+const riff = String.fromCharCode(...wavBytes.slice(0, 4));
+const wave = String.fromCharCode(...wavBytes.slice(8, 12));
+if (riff !== "RIFF" || wave !== "WAVE") {
+  console.error(`FAIL: mixdown WAV header bad: ${riff}/${wave}`);
+  process.exit(1);
+}
+// The "data" chunk's size field follows the four ASCII bytes "data". WAV
+// spec lets fmt and fact chunks sit between the header and data, so we
+// search rather than assume an offset.
+let dataOffset = -1;
+for (let i = 12; i < wavBytes.length - 8; i++) {
+  if (
+    wavBytes[i] === 0x64 && wavBytes[i + 1] === 0x61 &&
+    wavBytes[i + 2] === 0x74 && wavBytes[i + 3] === 0x61
+  ) {
+    dataOffset = i;
+    break;
+  }
+}
+if (dataOffset < 0) {
+  console.error("FAIL: no `data` chunk in mixdown WAV");
+  process.exit(1);
+}
+const dataChunkSize = new DataView(wavBytes.buffer, wavBytes.byteOffset + dataOffset + 4, 4)
+  .getUint32(0, true);
+const expectedDataBytes = 48 * 2 * 4;
+if (dataChunkSize !== expectedDataBytes) {
+  console.error(`FAIL: data chunk ${dataChunkSize} bytes, expected ${expectedDataBytes}`);
+  process.exit(1);
+}
+console.log(`mixdown produces ${wavBytes.length}-byte WAV with ${dataChunkSize} bytes of audio`);
+
 console.log("OK");
