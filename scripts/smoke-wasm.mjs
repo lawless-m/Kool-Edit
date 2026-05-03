@@ -443,4 +443,60 @@ if (lateRms >= earlyRms) {
 const ratio = earlyRms / Math.max(lateRms, 1e-9);
 console.log(`reverb tail decays ${ratio.toFixed(1)}× from early to late window`);
 
+// Noise reduction end-to-end: source contains pure noise (first 0.25 s) +
+// signal-plus-noise (next 0.5 s). Capture profile from the noise region,
+// apply NR, then verify the formerly-noisy first quarter is now quiet.
+const nrEng = new WasmEngine(48000);
+const nrFs = 48000;
+const noiseLen = nrFs / 4;
+const sigLen = nrFs / 2;
+const total = noiseLen + sigLen;
+const data = new Float32Array(total);
+function rand(seed) {
+  let s = seed | 1;
+  return () => {
+    s ^= s << 13;
+    s ^= s >>> 17;
+    s ^= s << 5;
+    return ((s >>> 0) / 0xffffffff) * 2 - 1;
+  };
+}
+const r1 = rand(0xdead);
+for (let n = 0; n < noiseLen; n++) data[n] = 0.1 * r1();
+const r2 = rand(0xbeef);
+for (let n = 0; n < sigLen; n++) {
+  data[noiseLen + n] = 0.5 * Math.sin((n / 48) * 2 * Math.PI) + 0.1 * r2();
+}
+const nrSrcId = nrEng.importWav("noisy.wav", makeWav(data), new Date().toISOString());
+nrEng.captureNoiseProfile(nrSrcId, 0n, BigInt(noiseLen), "AC", "np_001", 512);
+nrEng.applyOp(
+  nrSrcId,
+  JSON.stringify({
+    NoiseReduce: {
+      range: { start: 0, end: total },
+      profile: "np_001",
+      params: {
+        amount_db: 24.0,
+        floor_db: -30.0,
+        oversubtraction: 1.5,
+        attack_ms: 5.0,
+        release_ms: 50.0,
+        freq_smoothing: 0.0,
+        fft_size: 512,
+      },
+    },
+  }),
+  new Date().toISOString(),
+);
+const beforeNoise = data.slice(0, noiseLen);
+const beforeRms = rms(beforeNoise);
+const afterNoise = nrEng.querySamples(nrSrcId, 0n, BigInt(noiseLen));
+const afterRms = rms(afterNoise);
+const reductionDb = 20 * Math.log10(afterRms / beforeRms);
+if (reductionDb > -3.0) {
+  console.error(`FAIL: NR reduction ${reductionDb.toFixed(2)} dB, expected < -3`);
+  process.exit(1);
+}
+console.log(`noise reduction lowers floor by ${(-reductionDb).toFixed(2)} dB`);
+
 console.log("OK");

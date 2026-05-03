@@ -13,12 +13,14 @@ pub mod engine;
 pub mod envelope;
 pub mod ids;
 pub mod mixdown;
+pub mod nr;
 pub mod op;
 pub mod peaks;
 pub mod project;
 pub mod range;
 pub mod source;
 pub mod spectral;
+pub mod stft;
 pub mod storage;
 pub mod wav;
 
@@ -40,7 +42,7 @@ mod wasm_api {
     use wasm_bindgen::prelude::*;
 
     use crate::engine::Engine;
-    use crate::ids::SourceId;
+    use crate::ids::{ProfileId, SourceId};
     use crate::op::Op;
     use crate::project::Project;
     use crate::range::SampleRange;
@@ -190,6 +192,32 @@ mod wasm_api {
             self.inner
                 .mixdown_wav()
                 .map(|v| v.into_boxed_slice())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Capture a noise profile from a region of a source. The averaged
+        /// magnitude spectrum is stored under `profile_id` and can be
+        /// referenced by subsequent NoiseReduce ops.
+        #[wasm_bindgen(js_name = captureNoiseProfile)]
+        pub fn capture_noise_profile(
+            &mut self,
+            source_id: &str,
+            start_frame: u64,
+            end_frame: u64,
+            name: &str,
+            profile_id: &str,
+            fft_size: u32,
+        ) -> Result<(), JsError> {
+            let range = SampleRange::new(start_frame, end_frame)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            self.inner
+                .capture_noise_profile(
+                    &SourceId::new(source_id),
+                    range,
+                    name.to_string(),
+                    ProfileId::new(profile_id),
+                    fft_size,
+                )
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 

@@ -11,10 +11,11 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
 use crate::dsp::{self, DspError};
-use crate::ids::SourceId;
+use crate::ids::{ProfileId, SourceId};
+use crate::nr::{self, NrSettings};
 use crate::op::Op;
 use crate::peaks::{DEFAULT_DECIMATION, MinMax, PeakCache};
-use crate::project::Project;
+use crate::project::{NoiseProfile, Project};
 use crate::range::SampleRange;
 use crate::source::{Source, StoragePath, Timestamp};
 use crate::storage::{MemoryStorage, SampleStorage, StorageError};
@@ -52,6 +53,7 @@ impl From<StorageError> for ImportError {
 #[derive(Debug)]
 pub enum QueryError {
     UnknownSource(SourceId),
+    UnknownProfile(ProfileId),
     Storage(StorageError),
     Dsp(DspError),
 }
@@ -60,6 +62,7 @@ impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnknownSource(id) => write!(f, "unknown source: {id}"),
+            Self::UnknownProfile(id) => write!(f, "unknown noise profile: {id}"),
             Self::Storage(e) => write!(f, "{e}"),
             Self::Dsp(e) => write!(f, "{e}"),
         }
@@ -251,9 +254,66 @@ impl Engine {
         let full = SampleRange::new(0, source.base_length).expect("base_length valid range");
         let mut buf = self.read_base_samples(id, full)?;
         for op in source.edits.active() {
-            dsp::apply(op, &mut buf, source.channel_count, source.sample_rate)?;
+            // NoiseReduce needs the profile data, which lives outside the
+            // Op record; route it through a dedicated path that pulls the
+            // profile from the project. Everything else goes through the
+            // standard dsp::apply.
+            if let Op::NoiseReduce {
+                range,
+                profile,
+                params,
+            } = op
+            {
+                let prof = self
+                    .project
+                    .noise_profiles
+                    .get(profile)
+                    .ok_or_else(|| QueryError::UnknownProfile(profile.clone()))?;
+                apply_noise_reduce(
+                    &mut buf,
+                    source.channel_count,
+                    source.sample_rate,
+                    *range,
+                    prof,
+                    params,
+                )?;
+            } else {
+                dsp::apply(op, &mut buf, source.channel_count, source.sample_rate)?;
+            }
         }
         Ok(buf)
+    }
+
+    /// Capture a noise profile from a region of a source (post any active
+    /// edits) and store it under `profile_id`. The captured spectrum is the
+    /// average magnitude across STFT frames at `fft_size`/`fft_size/4` hop.
+    pub fn capture_noise_profile(
+        &mut self,
+        source_id: &SourceId,
+        range: SampleRange,
+        name: impl Into<String>,
+        profile_id: ProfileId,
+        fft_size: u32,
+    ) -> Result<(), QueryError> {
+        let source_channels = self
+            .project
+            .sources
+            .get(source_id)
+            .ok_or_else(|| QueryError::UnknownSource(source_id.clone()))?
+            .channel_count as usize;
+        let interleaved = self.query_samples(source_id, range)?;
+        let mono = mono_sum(&interleaved, source_channels);
+        let hop = (fft_size as usize / 4).max(1);
+        let magnitudes = nr::estimate_profile(&mono, fft_size as usize, hop);
+        let profile = NoiseProfile {
+            id: profile_id.clone(),
+            name: name.into(),
+            captured_from: source_id.clone(),
+            range,
+            magnitudes,
+        };
+        self.project.noise_profiles.insert(profile_id, profile);
+        Ok(())
     }
 
     /// Doc 03 §Flattening: render the current state to a new base file and
@@ -298,6 +358,75 @@ impl Engine {
         let stereo = self.mixdown_stereo()?;
         Ok(crate::wav::encode_f32(&stereo, 2, self.project.sample_rate()))
     }
+}
+
+/// Run noise reduction on a single channel-interleaved range. Builds a mono
+/// view, processes through the spectral subtractor, and overlays the result
+/// onto every channel of the original buffer.
+fn apply_noise_reduce(
+    buffer: &mut [f32],
+    channels: u16,
+    sample_rate: u32,
+    range: SampleRange,
+    profile: &NoiseProfile,
+    params: &crate::effect::NrParams,
+) -> Result<(), QueryError> {
+    let _ = sample_rate; // smoothing parameters use sample_rate; unused for now
+    let ch = channels as u64;
+    let total_frames = buffer.len() as u64 / ch;
+    if range.end() > total_frames {
+        return Err(QueryError::Dsp(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        }));
+    }
+    let frame_lo = (range.start() * ch) as usize;
+    let frame_hi = (range.end() * ch) as usize;
+    let region = &mut buffer[frame_lo..frame_hi];
+    let ch_us = channels as usize;
+    let frames = region.len() / ch_us;
+    if frames == 0 {
+        return Ok(());
+    }
+    // Mono-sum the region, run NR, then write the processed signal back to
+    // every channel. A per-channel pass would keep stereo width but doubles
+    // CPU; this matches the "single profile applied to the whole region"
+    // model the design doc describes.
+    let mono = mono_sum(region, ch_us);
+    let hop = (params.fft_size as usize / 4).max(1);
+    let processed = nr::apply(
+        &mono,
+        &profile.magnitudes,
+        params.fft_size as usize,
+        hop,
+        NrSettings {
+            amount_db: params.amount_db,
+            floor_db: params.floor_db,
+            oversubtraction: params.oversubtraction,
+        },
+    );
+    for f in 0..frames {
+        for c in 0..ch_us {
+            region[f * ch_us + c] = processed[f];
+        }
+    }
+    Ok(())
+}
+
+fn mono_sum(interleaved: &[f32], channels: usize) -> Vec<f32> {
+    if channels == 1 {
+        return interleaved.to_vec();
+    }
+    let frames = interleaved.len() / channels;
+    let mut out = Vec::with_capacity(frames);
+    for f in 0..frames {
+        let mut s = 0.0_f32;
+        for c in 0..channels {
+            s += interleaved[f * channels + c];
+        }
+        out.push(s / channels as f32);
+    }
+    out
 }
 
 /// Doc 04 §"Identifier conventions": `src_xxxx` where xxxx is the first 4 hex
@@ -579,6 +708,121 @@ mod tests {
             assert_eq!(p.min, 0.0);
             assert_eq!(p.max, 0.0);
         }
+    }
+
+    #[test]
+    fn noise_reduction_lowers_floor_on_a_real_signal() {
+        use crate::effect::NrParams;
+        use crate::ids::ProfileId;
+
+        let sample_rate = 48_000;
+        // Build a source: 0.25 s of pure noise, followed by 0.5 s of
+        // sine + the same noise. The first half is the profile capture
+        // region; the second half is what NR processes.
+        let noise_samples: Vec<f32> = (0..sample_rate / 4)
+            .map(|n| {
+                let mut state = (n as u32).wrapping_mul(0x9e37_79b1) | 1;
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                ((state as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.1
+            })
+            .collect();
+        let signal_with_noise: Vec<f32> = (0..sample_rate / 2)
+            .map(|n: usize| {
+                let sine =
+                    0.5 * (n as f32 / 48.0 * std::f32::consts::TAU).sin();
+                let mut state = (n as u32).wrapping_add(99_999).wrapping_mul(0x9e37_79b1) | 1;
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                let noise = ((state as f32 / u32::MAX as f32) * 2.0 - 1.0) * 0.1;
+                sine + noise
+            })
+            .collect();
+        let mut full = noise_samples;
+        full.extend(signal_with_noise);
+        let bytes = wav::encode_f32(&full, 1, sample_rate as u32);
+
+        let mut engine = Engine::new(sample_rate as u32);
+        let id = engine.import_wav("noisy.wav", &bytes, now()).unwrap();
+
+        // Capture profile from the noise-only region.
+        engine
+            .capture_noise_profile(
+                &id,
+                SampleRange::new(0, sample_rate as u64 / 4).unwrap(),
+                "AC",
+                ProfileId::new("np_001"),
+                512,
+            )
+            .unwrap();
+
+        // Measure RMS of the (silent) profile region BEFORE NR — this is
+        // pure noise and gives us our baseline noise level.
+        let pre_noise_rms = {
+            let pre = engine
+                .query_samples(&id, SampleRange::new(0, sample_rate as u64 / 4).unwrap())
+                .unwrap();
+            rms(&pre)
+        };
+
+        // Apply NR across the entire source.
+        engine
+            .apply_op(
+                &id,
+                Op::NoiseReduce {
+                    range: SampleRange::new(0, full_len(&engine, &id)).unwrap(),
+                    profile: ProfileId::new("np_001"),
+                    params: NrParams {
+                        amount_db: 24.0,
+                        floor_db: -30.0,
+                        oversubtraction: 1.5,
+                        attack_ms: 5.0,
+                        release_ms: 50.0,
+                        freq_smoothing: 0.0,
+                        fft_size: 512,
+                    },
+                },
+                now(),
+            )
+            .unwrap();
+
+        // The noise-only region should now be much quieter.
+        let post = engine
+            .query_samples(&id, SampleRange::new(0, sample_rate as u64 / 4).unwrap())
+            .unwrap();
+        let post_rms = rms(&post);
+        let reduction_db = 20.0 * (post_rms / pre_noise_rms).log10();
+        assert!(
+            reduction_db < -3.0,
+            "expected real noise reduction, got {reduction_db} dB"
+        );
+
+        // The signal-plus-noise region should retain a strong tonal level —
+        // peak energy stays in the same ballpark as the dry signal.
+        let signal_region = engine
+            .query_samples(
+                &id,
+                SampleRange::new(sample_rate as u64 / 4, sample_rate as u64 * 3 / 4)
+                    .unwrap(),
+            )
+            .unwrap();
+        let signal_rms = rms(&signal_region);
+        // Loose lower bound — 0.5 amplitude sine has RMS ~0.354.
+        assert!(signal_rms > 0.2, "tonal region too quiet after NR: {signal_rms}");
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let s: f64 = samples.iter().map(|&x| (x as f64).powi(2)).sum();
+        (s / samples.len() as f64).sqrt() as f32
+    }
+
+    fn full_len(engine: &Engine, id: &SourceId) -> u64 {
+        engine.effective_frame_count(id).unwrap()
     }
 
     #[test]

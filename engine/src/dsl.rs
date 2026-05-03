@@ -16,8 +16,9 @@
 
 use crate::effect::{
     CompParams, DelayParams, EffectParams, EqBand, EqBandKind, EqParams, LimitParams,
-    ReverbModel, ReverbParams,
+    NrParams, ReverbModel, ReverbParams,
 };
+use crate::ids::ProfileId;
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
@@ -243,13 +244,21 @@ impl<'a> Emitter<'a> {
                 fmt_range(*range, sample_rate),
                 fmt_reverb_params(params)
             )),
+            Op::NoiseReduce {
+                range,
+                profile,
+                params,
+            } => self.line(&format!(
+                "{}  noise_reduce {}",
+                fmt_range(*range, sample_rate),
+                fmt_nr_params(profile, params)
+            )),
 
             Op::Insert { .. }
             | Op::PasteMix { .. }
             | Op::PasteOver { .. } => {
                 return Err(EmitError::Unsupported("clipboard ops"));
             }
-            Op::NoiseReduce { .. } => return Err(EmitError::Unsupported("noise_reduce")),
             Op::SpectralEdit { .. } => return Err(EmitError::Unsupported("spectral edit")),
         }
         Ok(())
@@ -624,6 +633,19 @@ fn eq_band_kind_name(k: EqBandKind) -> &'static str {
         EqBandKind::Peak => "peak",
         EqBandKind::Notch => "notch",
     }
+}
+
+fn fmt_nr_params(profile: &ProfileId, p: &NrParams) -> String {
+    format!(
+        "profile:{} amount:{} floor:{} oversub:{} fft:{} attack:{}ms release:{}ms",
+        profile,
+        fmt_db(p.amount_db),
+        fmt_db(p.floor_db),
+        fmt_float(p.oversubtraction),
+        p.fft_size,
+        fmt_float(p.attack_ms),
+        fmt_float(p.release_ms),
+    )
 }
 
 fn fmt_reverb_params(p: &ReverbParams) -> String {
@@ -1097,22 +1119,17 @@ mod tests {
 
     #[test]
     fn unsupported_features_report_clear_errors() {
-        use crate::effect::NrParams;
-        use crate::ids::ProfileId;
+        use crate::spectral::{SpectralOp, StftParams, TimeFreqRegion};
         let mut p = Project::new(96_000);
         let mut s = fixture_source("src_a", 100, 96_000);
-        s.edits.apply(Op::NoiseReduce {
-            range: SampleRange::new(0, 100).unwrap(),
-            profile: ProfileId::new("np_001"),
-            params: NrParams {
-                amount_db: 12.0,
-                floor_db: -40.0,
-                oversubtraction: 1.0,
-                attack_ms: 5.0,
-                release_ms: 50.0,
-                freq_smoothing: 0.5,
-                fft_size: 2048,
+        s.edits.apply(Op::SpectralEdit {
+            region: TimeFreqRegion::Rect {
+                time: SampleRange::new(0, 100).unwrap(),
+                freq_low_hz: 1_000.0,
+                freq_high_hz: 4_000.0,
             },
+            operation: SpectralOp::Silence,
+            stft: StftParams::DEFAULT,
         });
         p.sources.insert(s.id.clone(), s);
         let err = project_to_dsl(&p).unwrap_err();
