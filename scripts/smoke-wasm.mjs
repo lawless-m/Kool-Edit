@@ -124,4 +124,65 @@ if (!reload.sources[id]) {
 }
 console.log("project json round-trip preserves sources");
 
+// Length-changing op: Cut. Re-import a fresh source so we don't fight the
+// previous flatten.
+const cutSrcWav = makeWav(new Float32Array(100).fill(0.5));
+const cutSrcId = eng.importWav("cut.wav", cutSrcWav, new Date().toISOString());
+const beforeFrames = Number(eng.sourceFrameCount(cutSrcId));
+eng.applyOp(
+  cutSrcId,
+  JSON.stringify({ Cut: { range: { start: 20, end: 80 } } }),
+  new Date().toISOString(),
+);
+const cutAll = eng.querySamples(cutSrcId, 0n, BigInt(beforeFrames - 60));
+if (cutAll.length !== beforeFrames - 60) {
+  console.error(`FAIL: expected ${beforeFrames - 60} frames after cut, got ${cutAll.length}`);
+  process.exit(1);
+}
+console.log(`cut shortens buffer (${beforeFrames} -> ${cutAll.length})`);
+
+// Generate: insert a half-second of sine.
+const genSrcWav = makeWav(new Float32Array(10).fill(0.0));
+const genSrcId = eng.importWav("gen.wav", genSrcWav, new Date().toISOString());
+eng.applyOp(
+  genSrcId,
+  JSON.stringify({
+    Generate: {
+      at: 5,
+      length: 100,
+      params: { Tone: { shape: "Sine", frequency_hz: 440.0, amplitude_db: 0.0 } },
+    },
+  }),
+  new Date().toISOString(),
+);
+const generated = eng.querySamples(genSrcId, 0n, 110n);
+if (generated.length !== 110) {
+  console.error(`FAIL: generate did not extend buffer (length=${generated.length})`);
+  process.exit(1);
+}
+const generatedPeak = Math.max(...Array.from(generated.slice(5, 105)).map(Math.abs));
+if (Math.abs(generatedPeak - 1.0) > 0.05) {
+  console.error(`FAIL: generated tone peak ${generatedPeak}, expected ~1.0`);
+  process.exit(1);
+}
+console.log(`generate inserts samples (length 10 -> ${generated.length}, peak ${generatedPeak.toFixed(3)})`);
+
+// Normalize-peak to -6 dB.
+const normSrcWav = makeWav(new Float32Array(50).fill(0.1));
+const normSrcId = eng.importWav("norm.wav", normSrcWav, new Date().toISOString());
+eng.applyOp(
+  normSrcId,
+  JSON.stringify({
+    Normalize: { range: { start: 0, end: 50 }, target: "Peak", value_db: -6.0206 },
+  }),
+  new Date().toISOString(),
+);
+const normalized = eng.querySamples(normSrcId, 0n, 50n);
+const normPeak = Math.max(...Array.from(normalized).map(Math.abs));
+if (Math.abs(normPeak - 0.5) > 1e-2) {
+  console.error(`FAIL: normalize peak got ${normPeak}, expected ~0.5`);
+  process.exit(1);
+}
+console.log(`normalize-peak scales to target (peak ${normPeak.toFixed(3)})`);
+
 console.log("OK");

@@ -204,16 +204,37 @@ impl Engine {
         Ok(source.edits.redo().is_some())
     }
 
-    /// Read base samples and replay every active op in `range`'s source's
-    /// edit list. The current implementation renders the whole source and
-    /// then slices; once Cut/Insert land it'll need to walk ops in order to
-    /// keep range arithmetic correct anyway, so this is a fine starting
-    /// point.
+    /// Render the source's full effective buffer (base + all active ops),
+    /// then return the requested frame range. The render-then-slice approach
+    /// stays correct under length-changing ops (Cut, Generate) because the
+    /// final buffer's length already reflects them; it's just expensive on
+    /// long sources. Optimised range-aware replay can land later.
     pub fn query_samples(
         &self,
         id: &SourceId,
         range: SampleRange,
     ) -> Result<Vec<f32>, QueryError> {
+        let buf = self.render_full(id)?;
+        let source = self
+            .project
+            .sources
+            .get(id)
+            .expect("verified by render_full");
+        let ch = source.channel_count as u64;
+        let start = ((range.start() * ch) as usize).min(buf.len());
+        let end = ((range.end() * ch) as usize).min(buf.len());
+        Ok(buf[start..end].to_vec())
+    }
+
+    /// Effective length of a source's current rendered buffer in frames.
+    /// Equals base_length when no length-changing ops are active.
+    pub fn effective_frame_count(&self, id: &SourceId) -> Result<u64, QueryError> {
+        let buf = self.render_full(id)?;
+        let source = self.project.sources.get(id).expect("verified by render_full");
+        Ok(buf.len() as u64 / source.channel_count as u64)
+    }
+
+    fn render_full(&self, id: &SourceId) -> Result<Vec<f32>, QueryError> {
         let source = self
             .project
             .sources
@@ -222,19 +243,18 @@ impl Engine {
         let full = SampleRange::new(0, source.base_length).expect("base_length valid range");
         let mut buf = self.read_base_samples(id, full)?;
         for op in source.edits.active() {
-            dsp::apply(op, &mut buf, source.channel_count)?;
+            dsp::apply(op, &mut buf, source.channel_count, source.sample_rate)?;
         }
-        let ch = source.channel_count as u64;
-        let start = (range.start() * ch) as usize;
-        let end = (range.end() * ch) as usize;
-        Ok(buf[start.min(buf.len())..end.min(buf.len())].to_vec())
+        Ok(buf)
     }
 
     /// Doc 03 §Flattening: render the current state to a new base file and
-    /// clear the edit list. Regenerates the peak cache from the freshly
-    /// rendered samples.
+    /// clear the edit list. Updates `base_length` if length-changing ops
+    /// (Cut, Generate) made the buffer larger or smaller. Regenerates the
+    /// peak cache from the freshly rendered samples.
     pub fn flatten(&mut self, id: &SourceId, now: Timestamp) -> Result<(), QueryError> {
-        let (path, base_length, channel_count) = {
+        let rendered = self.render_full(id)?;
+        let (path, channel_count) = {
             let source = self
                 .project
                 .sources
@@ -242,18 +262,17 @@ impl Engine {
                 .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
             (
                 source.base_file.as_str().to_owned(),
-                source.base_length,
                 source.channel_count,
             )
         };
-        let full = SampleRange::new(0, base_length).expect("base_length valid range");
-        let rendered = self.query_samples(id, full)?;
         self.storage.write_all(&path, &rendered)?;
 
         let new_peaks = PeakCache::from_samples(&rendered, channel_count, DEFAULT_DECIMATION);
         self.peaks.insert(id.clone(), new_peaks);
 
+        let new_length = rendered.len() as u64 / channel_count as u64;
         let source = self.project.sources.get_mut(id).expect("checked above");
+        source.base_length = new_length;
         source.edits.truncate_history();
         source.modified_at = now;
         Ok(())
