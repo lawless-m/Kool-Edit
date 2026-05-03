@@ -12,6 +12,7 @@ pub mod effect;
 pub mod engine;
 pub mod envelope;
 pub mod ids;
+pub mod kepz;
 pub mod mixdown;
 pub mod nr;
 pub mod op;
@@ -219,6 +220,28 @@ mod wasm_api {
                     fft_size,
                 )
                 .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Build a `.kepz` portable archive (project JSON + every source's
+        /// base file in one zip). Returns the raw bytes.
+        #[wasm_bindgen(js_name = exportKepz)]
+        pub fn export_kepz(&self) -> Result<Box<[u8]>, JsError> {
+            self.inner
+                .export_kepz()
+                .map(|v| v.into_boxed_slice())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Replace the engine's project + sources with the contents of a
+        /// `.kepz` archive. The samples are restored into a fresh in-memory
+        /// storage; peak caches are not serialised so any peak-rendering UI
+        /// will fetch them lazily.
+        #[wasm_bindgen(js_name = importKepz)]
+        pub fn import_kepz(&mut self, bytes: &[u8]) -> Result<(), JsError> {
+            let new_engine = Engine::import_kepz(bytes)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            self.inner = new_engine;
+            Ok(())
         }
 
         #[wasm_bindgen(js_name = loadProjectJson)]

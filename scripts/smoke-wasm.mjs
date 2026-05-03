@@ -499,4 +499,23 @@ if (reductionDb > -3.0) {
 }
 console.log(`noise reduction lowers floor by ${(-reductionDb).toFixed(2)} dB`);
 
+// .kepz round-trip: export the NR engine's project, import into a fresh
+// engine, verify the same query returns the same samples.
+const before = nrEng.querySamples(nrSrcId, 0n, 1024n);
+const archive = nrEng.exportKepz();
+const restored = new WasmEngine(48000);
+restored.importKepz(archive);
+const after = restored.querySamples(nrSrcId, 0n, 1024n);
+let mismatch = 0;
+for (let i = 0; i < before.length; i++) {
+  if (Math.abs(before[i] - after[i]) > 1e-6) mismatch++;
+}
+if (mismatch > 0) {
+  console.error(`FAIL: kepz round-trip differs at ${mismatch} samples`);
+  process.exit(1);
+}
+console.log(
+  `kepz archive round-trip: ${archive.length}-byte zip preserves source samples`,
+);
+
 console.log("OK");

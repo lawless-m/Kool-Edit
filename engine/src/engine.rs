@@ -12,6 +12,7 @@ use std::hash::Hasher;
 
 use crate::dsp::{self, DspError};
 use crate::ids::{ProfileId, SourceId};
+use crate::kepz::{self, KepzError, KepzSource};
 use crate::nr::{self, NrSettings};
 use crate::op::Op;
 use crate::peaks::{DEFAULT_DECIMATION, MinMax, PeakCache};
@@ -357,6 +358,54 @@ impl Engine {
     pub fn mixdown_wav(&self) -> Result<Vec<u8>, crate::mixdown::MixdownError> {
         let stereo = self.mixdown_stereo()?;
         Ok(crate::wav::encode_f32(&stereo, 2, self.project.sample_rate()))
+    }
+
+    /// Build a `.kepz` portable archive: project JSON plus every source's
+    /// base file, zipped. The result is shareable across machines without
+    /// any external file dependencies.
+    pub fn export_kepz(&self) -> Result<Vec<u8>, KepzError> {
+        let mut sources = Vec::with_capacity(self.project.sources.len());
+        for source in self.project.sources.values() {
+            let path = source.base_file.as_str().to_owned();
+            let len = self
+                .storage
+                .length(&path)
+                .map_err(|e| KepzError::Io(std::io::Error::other(e.to_string())))?;
+            let samples = self
+                .storage
+                .read(&path, 0..len)
+                .map_err(|e| KepzError::Io(std::io::Error::other(e.to_string())))?;
+            sources.push(KepzSource { path, samples });
+        }
+        kepz::write_archive(&self.project, sources)
+    }
+
+    /// Read a `.kepz` archive and load it into a fresh engine. The returned
+    /// engine owns a [`MemoryStorage`] populated with every source's base
+    /// file. Pass an explicit storage backend with [`Self::import_kepz_into`]
+    /// if you want the samples on disk.
+    pub fn import_kepz(bytes: &[u8]) -> Result<Self, KepzError> {
+        Self::import_kepz_into(bytes, Box::new(MemoryStorage::new()))
+    }
+
+    pub fn import_kepz_into(
+        bytes: &[u8],
+        mut storage: Box<dyn SampleStorage>,
+    ) -> Result<Self, KepzError> {
+        let archive = kepz::read_archive(bytes)?;
+        for source in &archive.sources {
+            storage
+                .write_all(&source.path, &source.samples)
+                .map_err(|e| KepzError::Io(std::io::Error::other(e.to_string())))?;
+        }
+        // Peak caches aren't serialised; the engine will rebuild them on
+        // demand. peak_summary returns None for imported sources until they
+        // are regenerated.
+        Ok(Self {
+            project: archive.project,
+            storage,
+            peaks: std::collections::BTreeMap::new(),
+        })
     }
 }
 
@@ -823,6 +872,43 @@ mod tests {
 
     fn full_len(engine: &Engine, id: &SourceId) -> u64 {
         engine.effective_frame_count(id).unwrap()
+    }
+
+    #[test]
+    fn kepz_round_trip_preserves_sources_and_destructive_edits() {
+        // Source A: 0.5 amplitude tone; apply a Silence op over the middle
+        // half. The reloaded engine should show the same edit list and the
+        // same query_samples output.
+        let mut engine = Engine::new(48_000);
+        let src_bytes = synth_mono_wav(&[0.5_f32; 100], 48_000);
+        let id = engine.import_wav("a.wav", &src_bytes, now()).unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Silence {
+                    range: SampleRange::new(25, 75).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        let pre_query = engine
+            .query_samples(&id, SampleRange::new(0, 100).unwrap())
+            .unwrap();
+
+        // Export, then reload into a fresh engine.
+        let archive_bytes = engine.export_kepz().unwrap();
+        let restored = Engine::import_kepz(&archive_bytes).unwrap();
+
+        // Project structure preserved (sources + edit list).
+        assert_eq!(restored.project().sources.len(), 1);
+        let restored_source = restored.project().sources.get(&id).unwrap();
+        assert_eq!(restored_source.edits.len(), 1);
+
+        // Sample data preserved through the storage round-trip.
+        let post_query = restored
+            .query_samples(&id, SampleRange::new(0, 100).unwrap())
+            .unwrap();
+        assert_eq!(pre_query, post_query);
     }
 
     #[test]
