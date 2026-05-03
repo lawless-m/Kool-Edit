@@ -15,13 +15,13 @@
 //! see exactly what's missing.
 
 use crate::effect::{
-    CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams, ReverbModel,
-    ReverbParams,
+    CompParams, DelayParams, EffectParams, EqBand, EqBandKind, EqParams, LimitParams,
+    ReverbModel, ReverbParams,
 };
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
-use crate::project::{Clip, MasterBus, Project, Track};
+use crate::project::{Clip, EffectInstance, MasterBus, Project, Track};
 use crate::range::SampleRange;
 use crate::source::Source;
 
@@ -329,7 +329,8 @@ impl<'a> Emitter<'a> {
         }
 
         if !track.inserts.is_empty() {
-            return Err(EmitError::Unsupported("track inserts"));
+            self.out.push('\n');
+            self.emit_inserts(&track.inserts);
         }
         if !track.automation.is_empty() {
             return Err(EmitError::Unsupported("track automation"));
@@ -399,13 +400,82 @@ impl<'a> Emitter<'a> {
 
     fn emit_master(&mut self) -> Result<(), EmitError> {
         let MasterBus { gain_db, inserts } = &self.project.master;
-        if !inserts.is_empty() {
-            return Err(EmitError::Unsupported("master inserts"));
-        }
         self.open("master");
         self.line(&format!("gain: {}", fmt_db(*gain_db)));
+        if !inserts.is_empty() {
+            self.out.push('\n');
+            self.emit_inserts(inserts);
+        }
         self.close();
         Ok(())
+    }
+
+    fn emit_inserts(&mut self, inserts: &[EffectInstance]) {
+        self.open("inserts");
+        for insert in inserts {
+            self.emit_insert(insert);
+        }
+        self.close();
+    }
+
+    fn emit_insert(&mut self, insert: &EffectInstance) {
+        let header = if insert.bypass {
+            format!("{} (bypassed)", insert.params.kind_name())
+        } else {
+            insert.params.kind_name().to_string()
+        };
+        match &insert.params {
+            EffectParams::Eq(p) => {
+                self.open(&header);
+                for (i, band) in p.bands.iter().enumerate() {
+                    self.line(&fmt_eq_band(i + 1, band));
+                }
+                self.close();
+            }
+            EffectParams::Compressor(p) => {
+                self.open(&header);
+                self.line(&format!("threshold: {}", fmt_db(p.threshold_db)));
+                self.line(&format!("ratio: {}", fmt_float(p.ratio)));
+                self.line(&format!("attack: {}ms", fmt_float(p.attack_ms)));
+                self.line(&format!("release: {}ms", fmt_float(p.release_ms)));
+                self.line(&format!("makeup: {}", fmt_db(p.makeup_db)));
+                self.line(&format!("knee: {}", fmt_db(p.knee_db)));
+                self.close();
+            }
+            EffectParams::Limiter(p) => {
+                self.open(&header);
+                self.line(&format!("ceiling: {}", fmt_db(p.ceiling_db)));
+                self.line(&format!("lookahead: {}ms", fmt_float(p.lookahead_ms)));
+                self.line(&format!("release: {}ms", fmt_float(p.release_ms)));
+                self.close();
+            }
+            EffectParams::Reverb(p) => {
+                self.open(&header);
+                let model = match p.model {
+                    ReverbModel::Room => "room",
+                    ReverbModel::Hall => "hall",
+                    ReverbModel::Plate => "plate",
+                };
+                self.line(&format!("model: {model}"));
+                self.line(&format!("size: {}", fmt_float(p.size)));
+                self.line(&format!("damping: {}", fmt_float(p.damping)));
+                self.line(&format!("mix: {}", fmt_float(p.mix)));
+                self.close();
+            }
+            EffectParams::Delay(p) => {
+                self.open(&header);
+                self.line(&format!("time: {}ms", fmt_float(p.time_ms)));
+                self.line(&format!("feedback: {}", fmt_float(p.feedback)));
+                self.line(&format!("mix: {}", fmt_float(p.mix)));
+                if p.ping_pong {
+                    self.line("ping_pong: true");
+                }
+                if let Some(hz) = p.feedback_lp_hz {
+                    self.line(&format!("feedback_lp: {}Hz", fmt_float(hz)));
+                }
+                self.close();
+            }
+        }
     }
 
     fn emit_markers(&mut self) {
@@ -971,6 +1041,62 @@ mod tests {
     }
 
     #[test]
+    fn emits_track_with_compressor_and_eq_inserts() {
+        use crate::effect::{
+            CompParams, EffectParams, EqBand, EqBandKind, EqParams,
+        };
+        use crate::project::EffectInstance;
+
+        let mut p = Project::new(96_000);
+        let track = Track {
+            id: TrackId(1),
+            name: "Vocal".into(),
+            height: 80.0,
+            mute: false,
+            solo: false,
+            arm: false,
+            gain_db: 0.0,
+            pan: 0.0,
+            inserts: vec![
+                EffectInstance {
+                    id: EffectInstanceId(1),
+                    bypass: false,
+                    params: EffectParams::Eq(EqParams {
+                        bands: vec![EqBand {
+                            kind: EqBandKind::Highpass,
+                            frequency_hz: 80.0,
+                            gain_db: 0.0,
+                            q: 0.7,
+                            enabled: true,
+                        }],
+                    }),
+                },
+                EffectInstance {
+                    id: EffectInstanceId(2),
+                    bypass: false,
+                    params: EffectParams::Compressor(CompParams {
+                        threshold_db: -18.0,
+                        ratio: 3.0,
+                        attack_ms: 5.0,
+                        release_ms: 80.0,
+                        makeup_db: 3.0,
+                        knee_db: 6.0,
+                    }),
+                },
+            ],
+            automation: Vec::new(),
+            clips: Vec::new(),
+        };
+        p.tracks.push(track);
+        let dsl = project_to_dsl(&p).unwrap();
+        assert!(dsl.contains("inserts {"), "no inserts block:\n{dsl}");
+        assert!(dsl.contains("eq {"), "eq missing:\n{dsl}");
+        assert!(dsl.contains("compressor {"), "compressor missing:\n{dsl}");
+        assert!(dsl.contains("threshold: -18dB"), "threshold missing:\n{dsl}");
+        assert!(dsl.contains("ratio: 3"), "ratio missing:\n{dsl}");
+    }
+
+    #[test]
     fn emits_reverb_with_model_and_params() {
         use crate::effect::{ReverbModel, ReverbParams};
         let mut p = Project::new(96_000);
@@ -992,36 +1118,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn track_inserts_unsupported_for_now() {
-        use crate::effect::EffectKind;
-        use crate::project::EffectInstance;
-        use std::collections::BTreeMap;
-
-        let mut p = Project::new(96_000);
-        let mut t = Track {
-            id: TrackId(1),
-            name: "T".into(),
-            height: 80.0,
-            mute: false,
-            solo: false,
-            arm: false,
-            gain_db: 0.0,
-            pan: 0.0,
-            inserts: Vec::new(),
-            automation: Vec::new(),
-            clips: Vec::new(),
-        };
-        t.inserts.push(EffectInstance {
-            id: EffectInstanceId(1),
-            kind: EffectKind::Eq,
-            bypass: false,
-            params: BTreeMap::new(),
-        });
-        p.tracks.push(t);
-        let err = project_to_dsl(&p).unwrap_err();
-        assert!(matches!(err, EmitError::Unsupported("track inserts")));
-    }
 
     #[test]
     fn integer_underscores_kick_in_after_four_digits() {

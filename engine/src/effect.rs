@@ -98,3 +98,28 @@ pub struct NrParams {
     pub freq_smoothing: f32,
     pub fft_size: u32,
 }
+
+/// Track and master inserts hold one of these. Each variant carries the
+/// typed parameter record used by the matching destructive op, so an EQ
+/// insert keeps its band list intact and a compressor insert keeps all of
+/// its parameters in one place rather than as loose floats.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum EffectParams {
+    Eq(EqParams),
+    Compressor(CompParams),
+    Limiter(LimitParams),
+    Reverb(ReverbParams),
+    Delay(DelayParams),
+}
+
+impl EffectParams {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Eq(_) => "eq",
+            Self::Compressor(_) => "compressor",
+            Self::Limiter(_) => "limiter",
+            Self::Reverb(_) => "reverb",
+            Self::Delay(_) => "delay",
+        }
+    }
+}

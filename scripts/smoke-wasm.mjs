@@ -224,14 +224,15 @@ for (const needle of expected) {
 }
 console.log("DSL emitter produces expected lines");
 
-// Mixdown: build a project with a single mono clip on one track and verify
-// the resulting WAV has the expected RIFF header and a non-trivial payload.
+// Mixdown: build a project with a single mono clip on one track, route it
+// through a Hall reverb insert, and verify the rendered WAV has tail energy
+// past the clip end.
 const mixEng = new WasmEngine(48000);
-const mixWav = makeWav(new Float32Array(48).fill(0.5));
+const blip = new Float32Array(480);
+blip[0] = 1.0; // 10 ms blip with an impulse at the start
+const mixWav = makeWav(blip);
 const mixSrcId = mixEng.importWav("mix.wav", mixWav, new Date().toISOString());
 
-// Reuse the existing project (which already contains the imported source)
-// and add a track + clip via JSON edit + loadProjectJson round-trip.
 const proj = JSON.parse(mixEng.projectJson());
 proj.tracks.push({
   id: 1,
@@ -242,16 +243,29 @@ proj.tracks.push({
   arm: false,
   gain_db: 0.0,
   pan: 0.0,
-  inserts: [],
+  inserts: [
+    {
+      id: 1,
+      bypass: false,
+      params: {
+        Reverb: {
+          model: "Hall",
+          size: 0.7,
+          damping: 0.3,
+          mix: 1.0,
+        },
+      },
+    },
+  ],
   automation: [],
   clips: [
     {
       id: 1,
       source_id: mixSrcId,
       name: "c",
-      track_position: { start: 0, end: 48 },
+      track_position: { start: 0, end: 24000 }, // half a second
       source_in: 0,
-      source_out: 48,
+      source_out: 480,
       gain_db: 0.0,
       pan: 0.0,
       fade_in: { duration_samples: 0, shape: "Linear" },
@@ -292,12 +306,35 @@ if (dataOffset < 0) {
 }
 const dataChunkSize = new DataView(wavBytes.buffer, wavBytes.byteOffset + dataOffset + 4, 4)
   .getUint32(0, true);
-const expectedDataBytes = 48 * 2 * 4;
+// 24000 stereo frames × 2 channels × 4 bytes = 192_000 bytes of audio.
+const expectedDataBytes = 24000 * 2 * 4;
 if (dataChunkSize !== expectedDataBytes) {
   console.error(`FAIL: data chunk ${dataChunkSize} bytes, expected ${expectedDataBytes}`);
   process.exit(1);
 }
-console.log(`mixdown produces ${wavBytes.length}-byte WAV with ${dataChunkSize} bytes of audio`);
+// Decode the WAV's tail ourselves and assert it isn't silent — that's the
+// reverb insert's tail. Skip headers, read the data section as 32-bit LE
+// floats, and look at the last 25% of the buffer.
+const dataView = new DataView(
+  wavBytes.buffer,
+  wavBytes.byteOffset + dataOffset + 8,
+  dataChunkSize,
+);
+const totalSamples = dataChunkSize / 4;
+const tailStart = (totalSamples / 4) * 3;
+let tailSumSq = 0;
+for (let i = tailStart | 0; i < totalSamples; i++) {
+  const v = dataView.getFloat32(i * 4, true);
+  tailSumSq += v * v;
+}
+const tailRms = Math.sqrt(tailSumSq / (totalSamples - (tailStart | 0)));
+if (tailRms < 1e-4) {
+  console.error(`FAIL: mixdown tail too quiet (rms ${tailRms}); reverb insert not running?`);
+  process.exit(1);
+}
+console.log(
+  `mixdown with reverb insert: ${wavBytes.length}-byte WAV, ${dataChunkSize} bytes audio, tail rms ${tailRms.toFixed(5)}`,
+);
 
 // Compressor end-to-end. Steady -10 dB sine, threshold -20 dB, ratio 4:1
 // → expect static gain reduction of ~7.5 dB after the envelope settles.

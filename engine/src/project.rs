@@ -11,7 +11,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::effect::EffectKind;
+use crate::effect::EffectParams;
 use crate::envelope::{AutomationLane, ClipEnvelope};
 use crate::ids::{ClipId, EffectInstanceId, GroupId, ProfileId, SourceId, TrackId};
 use crate::op::FadeShape;
@@ -92,9 +92,8 @@ impl Fade {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectInstance {
     pub id: EffectInstanceId,
-    pub kind: EffectKind,
     pub bypass: bool,
-    pub params: BTreeMap<String, f32>,
+    pub params: EffectParams,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -554,19 +553,18 @@ mod tests {
 
     #[test]
     fn detects_duplicate_effect_instance_id() {
+        use crate::effect::{EqParams, EffectParams};
         let mut p = Project::new(96_000);
         let mut track = fixture_track(TrackId(1), "T");
         track.inserts.push(EffectInstance {
             id: EffectInstanceId(1),
-            kind: EffectKind::Eq,
             bypass: false,
-            params: BTreeMap::new(),
+            params: EffectParams::Eq(EqParams::default()),
         });
         track.inserts.push(EffectInstance {
             id: EffectInstanceId(1),
-            kind: EffectKind::Compressor,
             bypass: false,
-            params: BTreeMap::new(),
+            params: EffectParams::Eq(EqParams::default()),
         });
         p.tracks.push(track);
 
@@ -621,12 +619,12 @@ mod tests {
         let src_id = src.id.clone();
         p.sources.insert(src_id.clone(), src);
 
+        use crate::effect::{EffectParams, EqParams};
         let mut track = fixture_track(TrackId(1), "Vocal");
         track.inserts.push(EffectInstance {
             id: EffectInstanceId(1),
-            kind: EffectKind::Eq,
             bypass: false,
-            params: BTreeMap::new(),
+            params: EffectParams::Eq(EqParams::default()),
         });
         track.clips.push(fixture_clip(ClipId(1), src_id, 1000));
         p.tracks.push(track);

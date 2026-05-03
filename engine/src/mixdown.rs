@@ -10,14 +10,18 @@
 //! Each of those returns [`MixdownError::Unsupported`] so the caller knows
 //! exactly which feature blocked the render.
 
+use crate::dsp::{self, DspError};
+use crate::effect::EffectParams;
 use crate::engine::{Engine, QueryError};
 use crate::ids::{ClipId, SourceId};
-use crate::op::{FadeDirection, FadeShape};
-use crate::project::{Clip, Fade, Project, Track};
+use crate::op::{FadeDirection, FadeShape, Op};
+use crate::project::{Clip, EffectInstance, Fade, Project, Track};
+use crate::range::SampleRange;
 
 #[derive(Debug)]
 pub enum MixdownError {
     Query(QueryError),
+    Dsp(DspError),
     Unsupported(&'static str),
     SampleRateMismatch {
         clip: ClipId,
@@ -37,6 +41,7 @@ impl std::fmt::Display for MixdownError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Query(e) => write!(f, "{e}"),
+            Self::Dsp(e) => write!(f, "mixdown DSP: {e}"),
             Self::Unsupported(k) => write!(f, "mixdown: feature `{k}` not yet supported"),
             Self::SampleRateMismatch {
                 clip,
@@ -69,6 +74,12 @@ impl From<QueryError> for MixdownError {
     }
 }
 
+impl From<DspError> for MixdownError {
+    fn from(e: DspError) -> Self {
+        Self::Dsp(e)
+    }
+}
+
 /// Render the project to interleaved stereo at the project's sample rate.
 /// Output length is the latest clip end position across every track. A
 /// project with no clips renders to an empty buffer.
@@ -97,6 +108,8 @@ pub fn mixdown_stereo(engine: &Engine) -> Result<Vec<f32>, MixdownError> {
         }
     }
 
+    apply_inserts(&mut master, 2, project.sample_rate(), &project.master.inserts)?;
+
     let mg = db_to_linear(project.master.gain_db);
     if mg != 1.0 {
         for s in &mut master {
@@ -108,13 +121,7 @@ pub fn mixdown_stereo(engine: &Engine) -> Result<Vec<f32>, MixdownError> {
 }
 
 fn check_unsupported(project: &Project) -> Result<(), MixdownError> {
-    if !project.master.inserts.is_empty() {
-        return Err(MixdownError::Unsupported("master inserts"));
-    }
     for track in &project.tracks {
-        if !track.inserts.is_empty() {
-            return Err(MixdownError::Unsupported("track inserts"));
-        }
         if !track.automation.is_empty() {
             return Err(MixdownError::Unsupported("track automation"));
         }
@@ -152,7 +159,54 @@ fn render_track(
     for clip in &track.clips {
         render_clip_into(engine, clip, &mut buf, total_frames)?;
     }
+    apply_inserts(&mut buf, 2, engine.project().sample_rate(), &track.inserts)?;
     Ok(buf)
+}
+
+/// Run a stereo buffer through every (non-bypassed) insert in order. Each
+/// insert is materialised as the matching destructive `Op` and processed
+/// over the full buffer length, so the same DSP code path serves both
+/// destructive editing and live track effects.
+fn apply_inserts(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    sample_rate: u32,
+    inserts: &[EffectInstance],
+) -> Result<(), MixdownError> {
+    if buffer.is_empty() || inserts.is_empty() {
+        return Ok(());
+    }
+    let frames = buffer.len() as u64 / channels as u64;
+    let range = SampleRange::new(0, frames).expect("non-empty buffer");
+    for insert in inserts {
+        if insert.bypass {
+            continue;
+        }
+        let op = match &insert.params {
+            EffectParams::Eq(p) => Op::Eq {
+                range,
+                params: p.clone(),
+            },
+            EffectParams::Compressor(p) => Op::Compress {
+                range,
+                params: *p,
+            },
+            EffectParams::Limiter(p) => Op::Limit {
+                range,
+                params: *p,
+            },
+            EffectParams::Reverb(p) => Op::Reverb {
+                range,
+                params: *p,
+            },
+            EffectParams::Delay(p) => Op::Delay {
+                range,
+                params: *p,
+            },
+        };
+        dsp::apply(&op, buffer, channels, sample_rate)?;
+    }
+    Ok(())
 }
 
 fn render_clip_into(
@@ -472,22 +526,179 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_track_inserts() {
-        use crate::effect::EffectKind;
-        use crate::project::EffectInstance;
-        use std::collections::BTreeMap;
+    fn track_compressor_insert_reduces_peak() {
+        use crate::effect::{CompParams, EffectParams};
+        use crate::ids::EffectInstanceId;
+
+        let sample_rate = 48_000;
+        // Build a -10 dB sine source long enough for the envelope to settle.
+        let frames = sample_rate as usize;
+        let amp = (-10.0_f32 / 20.0 * std::f32::consts::LN_10).exp();
+        let sine: Vec<f32> = (0..frames)
+            .map(|n| amp * (n as f32 / 48.0 * std::f32::consts::TAU).sin())
+            .collect();
+        let dry_peak = sine.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+
+        let mut engine = Engine::new(sample_rate);
+        let bytes = wav::encode_f32(&sine, 1, sample_rate);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+
+        let mut track = empty_track(1, "T");
+        track.clips.push(clip_for(1, id, 0, frames as u64));
+        track.inserts.push(crate::project::EffectInstance {
+            id: EffectInstanceId(1),
+            bypass: false,
+            params: EffectParams::Compressor(CompParams {
+                threshold_db: -20.0,
+                ratio: 4.0,
+                attack_ms: 1.0,
+                release_ms: 100.0,
+                makeup_db: 0.0,
+                knee_db: 0.0,
+            }),
+        });
+        engine.project_mut().tracks.push(track);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        // Look at the second half of the L channel where the compressor has
+        // settled. The output peak should be ~7.5 dB lower than the dry peak.
+        let tail_peak = (frames..frames * 2)
+            .step_by(2)
+            .map(|i| out[i].abs())
+            .fold(0.0_f32, f32::max);
+        let reduction_db = 20.0 * (dry_peak / tail_peak).log10();
+        // pan-law adds ~3 dB attenuation, so the dry/wet ratio is the static
+        // 7.5 dB minus the pan attenuation that affected both sides equally.
+        // Easier: assert tail_peak is below dry_peak after factoring the
+        // ~0.707 pan weight.
+        let _ = reduction_db;
+        assert!(
+            tail_peak < dry_peak * 0.707 * 0.6,
+            "tail_peak {tail_peak} should be well below dry_peak after compression ({dry_peak})"
+        );
+        // Sanity: signal still present.
+        assert!(tail_peak > 0.05);
+    }
+
+    #[test]
+    fn track_reverb_insert_adds_tail_after_clip_ends() {
+        use crate::effect::{EffectParams, ReverbModel, ReverbParams};
+        use crate::ids::EffectInstanceId;
+
+        // Source is a short impulse-like blip; track is twice as long so the
+        // tail extends into the silent half.
+        let sample_rate = 48_000;
+        let blip_frames = sample_rate as usize / 100; // 10 ms
+        let mut blip = vec![0.0_f32; blip_frames];
+        blip[0] = 1.0;
+        let bytes = wav::encode_f32(&blip, 1, sample_rate);
+
+        let mut engine = Engine::new(sample_rate);
+        let id = engine.import_wav("b.wav", &bytes, now()).unwrap();
+
+        // Make the track buffer long enough that the reverb tail has room
+        // to develop. The clip itself is the 10 ms blip; track_position
+        // extends to half a second so the reverb fills the silence after
+        // the clip ends.
+        let mut track = empty_track(1, "T");
+        let mut clip = clip_for(1, id, 0, blip_frames as u64);
+        clip.track_position = SampleRange::new(0, sample_rate as u64 / 2).unwrap();
+        track.clips.push(clip);
+        track.inserts.push(crate::project::EffectInstance {
+            id: EffectInstanceId(1),
+            bypass: false,
+            params: EffectParams::Reverb(ReverbParams {
+                model: ReverbModel::Hall,
+                size: 0.7,
+                damping: 0.3,
+                mix: 1.0,
+            }),
+        });
+        engine.project_mut().tracks.push(track);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        // The mixdown buffer is exactly the clip length (no clip extends
+        // beyond it), so we read the tail energy in the last 25% of the
+        // buffer — that energy is entirely insert output.
+        let frames = out.len() / 2;
+        let tail_start = frames * 3 / 4;
+        let tail_rms = ((tail_start..frames)
+            .map(|f| (out[f * 2] as f64).powi(2) + (out[f * 2 + 1] as f64).powi(2))
+            .sum::<f64>()
+            / (2 * (frames - tail_start)) as f64)
+            .sqrt() as f32;
+        assert!(tail_rms > 1e-4, "expected reverb tail in last quarter, got rms {tail_rms}");
+    }
+
+    #[test]
+    fn bypassed_insert_does_not_change_signal() {
+        use crate::effect::{CompParams, EffectParams};
+        use crate::ids::EffectInstanceId;
 
         let mut engine = Engine::new(48_000);
-        let mut t = empty_track(1, "T");
-        t.inserts.push(EffectInstance {
-            id: crate::ids::EffectInstanceId(1),
-            kind: EffectKind::Eq,
-            bypass: false,
-            params: BTreeMap::new(),
+        let id = engine
+            .import_wav("a.wav", &synth_mono_wav(&[0.5_f32; 32], 48_000), now())
+            .unwrap();
+
+        let mut track = empty_track(1, "T");
+        track.clips.push(clip_for(1, id, 0, 32));
+        track.inserts.push(crate::project::EffectInstance {
+            id: EffectInstanceId(1),
+            bypass: true,
+            params: EffectParams::Compressor(CompParams {
+                threshold_db: -120.0, // would crush everything if active
+                ratio: 100.0,
+                attack_ms: 0.1,
+                release_ms: 50.0,
+                makeup_db: 0.0,
+                knee_db: 0.0,
+            }),
         });
-        engine.project_mut().tracks.push(t);
-        let err = mixdown_stereo(&engine).unwrap_err();
-        assert!(matches!(err, MixdownError::Unsupported("track inserts")));
+        engine.project_mut().tracks.push(track);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        // Centre-panned mono at 0.5 → 0.5 × cos(π/4) ≈ 0.354 per channel.
+        let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        for f in 0..32 {
+            assert!((out[f * 2] - expected).abs() < 5e-3, "L mismatch at frame {f}");
+            assert!((out[f * 2 + 1] - expected).abs() < 5e-3, "R mismatch at frame {f}");
+        }
+    }
+
+    #[test]
+    fn master_inserts_run_after_track_summation() {
+        use crate::effect::{EffectParams, LimitParams};
+        use crate::ids::EffectInstanceId;
+
+        let mut engine = Engine::new(48_000);
+        // Loud dry source; clip gain at 0 dB; pan-law leaves ~0.707.
+        let id = engine
+            .import_wav("a.wav", &synth_mono_wav(&[1.0_f32; 64], 48_000), now())
+            .unwrap();
+
+        let mut track = empty_track(1, "T");
+        track.clips.push(clip_for(1, id, 0, 64));
+        engine.project_mut().tracks.push(track);
+
+        // Master limiter at -6 dB ceiling (linear ~0.5).
+        engine
+            .project_mut()
+            .master
+            .inserts
+            .push(crate::project::EffectInstance {
+                id: EffectInstanceId(1),
+                bypass: false,
+                params: EffectParams::Limiter(LimitParams {
+                    ceiling_db: -6.0,
+                    lookahead_ms: 5.0,
+                    release_ms: 50.0,
+                }),
+            });
+
+        let out = mixdown_stereo(&engine).unwrap();
+        let ceiling = 10.0_f32.powf(-6.0 / 20.0);
+        let peak = out.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+        assert!(peak <= ceiling + 1e-6, "master peak {peak} above ceiling {ceiling}");
     }
 
     #[test]
