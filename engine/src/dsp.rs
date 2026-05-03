@@ -13,7 +13,10 @@
 
 use std::f32::consts::PI;
 
-use crate::effect::{CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams};
+use crate::effect::{
+    CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams, ReverbModel,
+    ReverbParams,
+};
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
@@ -87,11 +90,11 @@ pub fn apply(
         }
         Op::Limit { range, params } => limit(buffer, channels, *range, params, sample_rate),
         Op::Eq { range, params } => eq(buffer, channels, *range, params, sample_rate),
+        Op::Reverb { range, params } => reverb(buffer, channels, *range, params, sample_rate),
 
         Op::Insert { .. } => Err(DspError::Unsupported("Insert")),
         Op::PasteMix { .. } => Err(DspError::Unsupported("PasteMix")),
         Op::PasteOver { .. } => Err(DspError::Unsupported("PasteOver")),
-        Op::Reverb { .. } => Err(DspError::Unsupported("Reverb")),
         Op::TimeStretch { .. } => Err(DspError::Unsupported("TimeStretch")),
         Op::PitchShift { .. } => Err(DspError::Unsupported("PitchShift")),
         Op::NoiseReduce { .. } => Err(DspError::Unsupported("NoiseReduce")),
@@ -577,6 +580,179 @@ impl SinCosSwap for f32 {
     }
 }
 
+/// Algorithmic reverb in the spirit of Jezar Wakefield's Freeverb: a bank of
+/// parallel low-pass-damped comb filters feeds a series of allpass diffusers,
+/// with a slight per-channel delay spread for stereo. Tuned by `model`,
+/// `size`, `damping`, and a wet/dry `mix`.
+///
+/// For destructive ops the reverb processor is created fresh, runs over the
+/// whole range in one pass, and is dropped — the state lives only for the
+/// duration of `apply`.
+fn reverb(
+    buffer: &mut [f32],
+    channels: u16,
+    range: SampleRange,
+    params: &ReverbParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    let s = slice_for(buffer, channels, range)?;
+    let ch = channels as usize;
+    let frames = s.len() / ch;
+    if frames == 0 {
+        return Ok(());
+    }
+    let mix = params.mix.clamp(0.0, 1.0);
+    if mix == 0.0 {
+        return Ok(());
+    }
+    let dry = 1.0 - mix;
+    let wet = mix;
+
+    let (room_offset, room_scale, damp_scale) = match params.model {
+        ReverbModel::Room => (0.65, 0.28, 0.40),
+        ReverbModel::Hall => (0.78, 0.20, 0.30),
+        ReverbModel::Plate => (0.85, 0.13, 0.25),
+    };
+    let size = params.size.clamp(0.0, 1.0);
+    let damping = params.damping.clamp(0.0, 1.0);
+    let feedback = room_offset + size * room_scale;
+    let damp = damping * damp_scale;
+
+    // Freeverb tunings, given at 44.1 kHz; rescale to the actual rate.
+    let scale = sample_rate as f32 / 44_100.0;
+    const COMB_TUNINGS: [usize; 8] =
+        [1116, 1188, 1277, 1356, 1422, 1491, 1557, 1617];
+    const ALLPASS_TUNINGS: [usize; 4] = [556, 441, 341, 225];
+    const STEREO_SPREAD: usize = 23;
+    // Empirically calibrated input gain so the wet level stays in a sensible
+    // range across sample rates and sizes (Freeverb's published constant).
+    const FIXED_GAIN: f32 = 0.015;
+
+    let make_combs = |spread: usize| {
+        COMB_TUNINGS
+            .iter()
+            .map(|&n| {
+                let len = ((n + spread) as f32 * scale) as usize;
+                LowpassComb::new(len.max(1), feedback, damp)
+            })
+            .collect::<Vec<_>>()
+    };
+    let make_allpasses = |spread: usize| {
+        ALLPASS_TUNINGS
+            .iter()
+            .map(|&n| {
+                let len = ((n + spread) as f32 * scale) as usize;
+                Allpass::new(len.max(1), 0.5)
+            })
+            .collect::<Vec<_>>()
+    };
+
+    if ch == 1 {
+        let mut combs = make_combs(0);
+        let mut allpasses = make_allpasses(0);
+        for sample in s.iter_mut() {
+            let input = *sample * FIXED_GAIN;
+            let mut acc = 0.0_f32;
+            for c in combs.iter_mut() {
+                acc += c.process(input);
+            }
+            let mut out = acc;
+            for a in allpasses.iter_mut() {
+                out = a.process(out);
+            }
+            *sample = *sample * dry + out * wet;
+        }
+    } else {
+        let mut combs_l = make_combs(0);
+        let mut combs_r = make_combs(STEREO_SPREAD);
+        let mut allpass_l = make_allpasses(0);
+        let mut allpass_r = make_allpasses(STEREO_SPREAD);
+        for f in 0..frames {
+            let l_in = s[f * 2];
+            let r_in = s[f * 2 + 1];
+            let mono_input = (l_in + r_in) * 0.5 * FIXED_GAIN;
+            let mut acc_l = 0.0_f32;
+            let mut acc_r = 0.0_f32;
+            for c in combs_l.iter_mut() {
+                acc_l += c.process(mono_input);
+            }
+            for c in combs_r.iter_mut() {
+                acc_r += c.process(mono_input);
+            }
+            let mut out_l = acc_l;
+            let mut out_r = acc_r;
+            for a in allpass_l.iter_mut() {
+                out_l = a.process(out_l);
+            }
+            for a in allpass_r.iter_mut() {
+                out_r = a.process(out_r);
+            }
+            s[f * 2] = l_in * dry + out_l * wet;
+            s[f * 2 + 1] = r_in * dry + out_r * wet;
+        }
+    }
+    Ok(())
+}
+
+/// Comb filter with a one-pole low-pass on the feedback path: the low pass
+/// rolls off the highs each time the signal recirculates, which is what
+/// gives reverberant tails their characteristic darkening over time.
+struct LowpassComb {
+    buffer: Vec<f32>,
+    pos: usize,
+    feedback: f32,
+    damp: f32,
+    filter_state: f32,
+}
+
+impl LowpassComb {
+    fn new(size: usize, feedback: f32, damp: f32) -> Self {
+        Self {
+            buffer: vec![0.0; size],
+            pos: 0,
+            feedback,
+            damp,
+            filter_state: 0.0,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.buffer[self.pos];
+        // 1-pole LP: state = output * (1-damp) + state * damp.
+        self.filter_state = output * (1.0 - self.damp) + self.filter_state * self.damp;
+        self.buffer[self.pos] = input + self.filter_state * self.feedback;
+        self.pos = (self.pos + 1) % self.buffer.len();
+        output
+    }
+}
+
+/// Schroeder allpass: gives the diffusion needed after the comb bank without
+/// changing the reverb's overall energy decay. Feedback is fixed at 0.5
+/// (Jezar's choice; well-behaved for cascaded sections).
+struct Allpass {
+    buffer: Vec<f32>,
+    pos: usize,
+    feedback: f32,
+}
+
+impl Allpass {
+    fn new(size: usize, feedback: f32) -> Self {
+        Self {
+            buffer: vec![0.0; size],
+            pos: 0,
+            feedback,
+        }
+    }
+
+    fn process(&mut self, input: f32) -> f32 {
+        let bufout = self.buffer[self.pos];
+        let output = -input + bufout;
+        self.buffer[self.pos] = input + bufout * self.feedback;
+        self.pos = (self.pos + 1) % self.buffer.len();
+        output
+    }
+}
+
 fn db_to_linear(db: f32) -> f32 {
     10.0_f32.powf(db / 20.0)
 }
@@ -924,24 +1100,159 @@ mod tests {
 
     #[test]
     fn unsupported_ops_are_reported() {
-        use crate::effect::{ReverbModel, ReverbParams};
         let mut samples = vec![0.0; 4];
         let err = apply(
-            &Op::Reverb {
+            &Op::TimeStretch {
                 range: r(0, 4),
-                params: ReverbParams {
-                    model: ReverbModel::Hall,
-                    size: 0.5,
-                    damping: 0.5,
-                    mix: 0.5,
-                },
+                ratio: 2.0,
             },
             &mut samples,
             1,
             48_000,
         )
         .unwrap_err();
-        assert!(matches!(err, DspError::Unsupported("Reverb")));
+        assert!(matches!(err, DspError::Unsupported("TimeStretch")));
+    }
+
+    fn reverb_params(model: ReverbModel, size: f32, damping: f32, mix: f32) -> ReverbParams {
+        ReverbParams {
+            model,
+            size,
+            damping,
+            mix,
+        }
+    }
+
+    #[test]
+    fn reverb_mix_zero_is_a_no_op() {
+        let mut samples = vec![0.5_f32, -0.5, 0.25, -0.25];
+        let original = samples.clone();
+        apply(
+            &Op::Reverb {
+                range: r(0, 4),
+                params: reverb_params(ReverbModel::Hall, 0.5, 0.5, 0.0),
+            },
+            &mut samples,
+            1,
+            48_000,
+        )
+        .unwrap();
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn reverb_modifies_signal_at_full_wet() {
+        // An impulse run through the reverb must NOT come back unchanged when
+        // mix is 1.0.
+        let mut samples = vec![0.0_f32; 1024];
+        samples[0] = 1.0;
+        let baseline = samples.clone();
+        apply(
+            &Op::Reverb {
+                range: r(0, 1024),
+                params: reverb_params(ReverbModel::Hall, 0.5, 0.5, 1.0),
+            },
+            &mut samples,
+            1,
+            48_000,
+        )
+        .unwrap();
+        assert_ne!(samples, baseline);
+    }
+
+    #[test]
+    fn reverb_tail_decays_over_time() {
+        // Drive the reverb with a single impulse and check that the energy
+        // in successive time windows is non-increasing — the late tail
+        // should never be louder than an earlier window.
+        let sample_rate = 48_000;
+        let frames = sample_rate as usize;
+        let mut samples = vec![0.0_f32; frames];
+        samples[0] = 1.0;
+        apply(
+            &Op::Reverb {
+                range: r(0, frames as u64),
+                params: reverb_params(ReverbModel::Hall, 0.5, 0.5, 1.0),
+            },
+            &mut samples,
+            1,
+            sample_rate,
+        )
+        .unwrap();
+        // Skip the first ~10 ms so the early reflections are out of the way,
+        // then compare 50-ms windows.
+        let window = sample_rate as usize / 20; // 50 ms
+        let start = sample_rate as usize / 100; // 10 ms
+        let early = rms(&samples[start..start + window]);
+        let mid = rms(&samples[start + window * 4..start + window * 5]);
+        let late = rms(&samples[start + window * 8..start + window * 9]);
+        assert!(early > 0.0, "expected non-silent early window");
+        assert!(mid <= early * 1.0, "mid {mid} not <= early {early}");
+        assert!(late <= mid * 1.0, "late {late} not <= mid {mid}");
+        // The end of the second is much quieter than the beginning.
+        assert!(late < early * 0.5, "tail did not decay enough: early={early} late={late}");
+    }
+
+    #[test]
+    fn reverb_larger_size_produces_louder_late_tail() {
+        let sample_rate = 48_000;
+        let frames = sample_rate as usize;
+        let measure = |size: f32| {
+            let mut samples = vec![0.0_f32; frames];
+            samples[0] = 1.0;
+            apply(
+                &Op::Reverb {
+                    range: r(0, frames as u64),
+                    params: reverb_params(ReverbModel::Hall, size, 0.3, 1.0),
+                },
+                &mut samples,
+                1,
+                sample_rate,
+            )
+            .unwrap();
+            // Late window: 700–900 ms.
+            let start = sample_rate as usize * 7 / 10;
+            let end = sample_rate as usize * 9 / 10;
+            rms(&samples[start..end])
+        };
+        let small = measure(0.0);
+        let large = measure(1.0);
+        assert!(
+            large > small,
+            "size=1 late tail ({large}) should exceed size=0 ({small})"
+        );
+    }
+
+    #[test]
+    fn reverb_processes_stereo_independently() {
+        // Stereo impulse only on the left channel; the right channel input
+        // is silent. With mono summation, both wet outputs will receive
+        // some energy (Freeverb sums L+R as input), but the per-channel
+        // delay spread means L and R are not bit-identical in the tail.
+        let sample_rate = 48_000;
+        let frames = sample_rate as usize / 4;
+        let mut samples = vec![0.0_f32; frames * 2];
+        samples[0] = 1.0; // L impulse
+        apply(
+            &Op::Reverb {
+                range: r(0, frames as u64),
+                params: reverb_params(ReverbModel::Hall, 0.5, 0.5, 1.0),
+            },
+            &mut samples,
+            2,
+            sample_rate,
+        )
+        .unwrap();
+        let mut diff_count = 0;
+        for f in (sample_rate as usize / 100)..frames {
+            if (samples[f * 2] - samples[f * 2 + 1]).abs() > 1e-6 {
+                diff_count += 1;
+            }
+        }
+        assert!(
+            diff_count > 100,
+            "stereo spread should make L and R diverge in the tail (got {diff_count} differing frames)"
+        );
     }
 
     #[test]

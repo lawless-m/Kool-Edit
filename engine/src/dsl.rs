@@ -14,7 +14,10 @@
 //! envelopes, noise profiles) return [`EmitError::Unsupported`] so callers
 //! see exactly what's missing.
 
-use crate::effect::{CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams};
+use crate::effect::{
+    CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams, ReverbModel,
+    ReverbParams,
+};
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
@@ -232,14 +235,16 @@ impl<'a> Emitter<'a> {
                 fmt_limit_params(params)
             )),
             Op::Eq { range, params } => self.emit_eq(*range, params, sample_rate),
+            Op::Reverb { range, params } => self.line(&format!(
+                "{}  reverb {}",
+                fmt_range(*range, sample_rate),
+                fmt_reverb_params(params)
+            )),
 
             Op::Insert { .. }
             | Op::PasteMix { .. }
             | Op::PasteOver { .. } => {
                 return Err(EmitError::Unsupported("clipboard ops"));
-            }
-            Op::Reverb { .. } => {
-                return Err(EmitError::Unsupported("Reverb"));
             }
             Op::NoiseReduce { .. } => return Err(EmitError::Unsupported("noise_reduce")),
             Op::SpectralEdit { .. } => return Err(EmitError::Unsupported("spectral edit")),
@@ -470,6 +475,20 @@ fn eq_band_kind_name(k: EqBandKind) -> &'static str {
         EqBandKind::Peak => "peak",
         EqBandKind::Notch => "notch",
     }
+}
+
+fn fmt_reverb_params(p: &ReverbParams) -> String {
+    let model = match p.model {
+        ReverbModel::Room => "room",
+        ReverbModel::Hall => "hall",
+        ReverbModel::Plate => "plate",
+    };
+    format!(
+        "model:{model} size:{} damping:{} mix:{}",
+        fmt_float(p.size),
+        fmt_float(p.damping),
+        fmt_float(p.mix)
+    )
 }
 
 fn fmt_delay_params(p: &DelayParams) -> String {
@@ -929,21 +948,48 @@ mod tests {
 
     #[test]
     fn unsupported_features_report_clear_errors() {
-        use crate::effect::{ReverbModel, ReverbParams};
+        use crate::effect::NrParams;
+        use crate::ids::ProfileId;
         let mut p = Project::new(96_000);
         let mut s = fixture_source("src_a", 100, 96_000);
-        s.edits.apply(Op::Reverb {
+        s.edits.apply(Op::NoiseReduce {
             range: SampleRange::new(0, 100).unwrap(),
-            params: ReverbParams {
-                model: ReverbModel::Hall,
-                size: 0.5,
-                damping: 0.5,
-                mix: 0.5,
+            profile: ProfileId::new("np_001"),
+            params: NrParams {
+                amount_db: 12.0,
+                floor_db: -40.0,
+                oversubtraction: 1.0,
+                attack_ms: 5.0,
+                release_ms: 50.0,
+                freq_smoothing: 0.5,
+                fft_size: 2048,
             },
         });
         p.sources.insert(s.id.clone(), s);
         let err = project_to_dsl(&p).unwrap_err();
         assert!(matches!(err, EmitError::Unsupported(_)));
+    }
+
+    #[test]
+    fn emits_reverb_with_model_and_params() {
+        use crate::effect::{ReverbModel, ReverbParams};
+        let mut p = Project::new(96_000);
+        let mut s = fixture_source("src_a", 96_000, 96_000);
+        s.edits.apply(Op::Reverb {
+            range: SampleRange::new(0, 96_000).unwrap(),
+            params: ReverbParams {
+                model: ReverbModel::Plate,
+                size: 0.7,
+                damping: 0.4,
+                mix: 0.3,
+            },
+        });
+        p.sources.insert(s.id.clone(), s);
+        let dsl = project_to_dsl(&p).unwrap();
+        assert!(
+            dsl.contains("reverb model:plate size:0.7 damping:0.4 mix:0.3"),
+            "reverb missing\n{dsl}"
+        );
     }
 
     #[test]

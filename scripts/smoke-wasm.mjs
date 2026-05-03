@@ -376,4 +376,34 @@ if (Math.abs(eqGainDb - 6.0) > 0.5) {
 }
 console.log(`EQ peak band measures ${eqGainDb.toFixed(2)} dB at centre (target +6 dB)`);
 
+// Reverb end-to-end: feed an impulse, verify the wet output decays over the
+// course of a second. A real-world reverb tail is loud near the impulse and
+// progressively quieter — measuring two windows is enough to see the curve.
+const revEng = new WasmEngine(48000);
+const revLen = 48000;
+const impulse = new Float32Array(revLen);
+impulse[0] = 1.0;
+const revSrcId = revEng.importWav("rev.wav", makeWav(impulse), new Date().toISOString());
+revEng.applyOp(
+  revSrcId,
+  JSON.stringify({
+    Reverb: {
+      range: { start: 0, end: revLen },
+      params: { model: "Hall", size: 0.5, damping: 0.5, mix: 1.0 },
+    },
+  }),
+  new Date().toISOString(),
+);
+const revOut = revEng.querySamples(revSrcId, 0n, BigInt(revLen));
+const earlyWindow = revOut.slice(2400, 4800); // 50 ms starting at 50 ms
+const lateWindow = revOut.slice(38400, 40800); // 50 ms starting at 800 ms
+const earlyRms = rms(earlyWindow);
+const lateRms = rms(lateWindow);
+if (lateRms >= earlyRms) {
+  console.error(`FAIL: reverb late RMS ${lateRms} not less than early ${earlyRms}`);
+  process.exit(1);
+}
+const ratio = earlyRms / Math.max(lateRms, 1e-9);
+console.log(`reverb tail decays ${ratio.toFixed(1)}× from early to late window`);
+
 console.log("OK");
