@@ -16,6 +16,7 @@ pub mod project;
 pub mod range;
 pub mod source;
 pub mod spectral;
+pub mod storage;
 pub mod wav;
 
 pub const FORMAT_VERSION: u32 = 1;
