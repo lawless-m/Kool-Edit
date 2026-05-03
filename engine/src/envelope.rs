@@ -105,6 +105,52 @@ impl BreakpointSeq {
         self.points.insert(pos, bp);
         Ok(())
     }
+
+    /// Evaluate the breakpoint sequence at `time` (samples). Out-of-range
+    /// times clamp to the first or last breakpoint's value. Returns `None`
+    /// for an empty sequence.
+    pub fn evaluate(&self, time: u64) -> Option<f32> {
+        self.evaluate_mapped(time, |v| v)
+    }
+
+    /// Like [`Self::evaluate`] but applies `map` to each breakpoint's value
+    /// before interpolation. Useful for volume envelopes, where the dB
+    /// values need to be converted to linear gain so a `-inf` endpoint
+    /// interpolates cleanly to silence rather than producing NaN.
+    pub fn evaluate_mapped(
+        &self,
+        time: u64,
+        map: impl Fn(f32) -> f32,
+    ) -> Option<f32> {
+        let pts = &self.points;
+        if pts.is_empty() {
+            return None;
+        }
+        if time <= pts[0].time {
+            return Some(map(pts[0].value));
+        }
+        let last = &pts[pts.len() - 1];
+        if time >= last.time {
+            return Some(map(last.value));
+        }
+        let i = pts.partition_point(|p| p.time <= time) - 1;
+        let a = &pts[i];
+        let b = &pts[i + 1];
+        let t = (time - a.time) as f32 / (b.time - a.time) as f32;
+        let a_v = map(a.value);
+        let b_v = map(b.value);
+        Some(curve_interp(a_v, b_v, t, a.curve))
+    }
+}
+
+fn curve_interp(a: f32, b: f32, t: f32, curve: CurveKind) -> f32 {
+    match curve {
+        CurveKind::Hold => a,
+        CurveKind::Linear => a + (b - a) * t,
+        CurveKind::Exponential => a + (b - a) * t * t,
+        CurveKind::Logarithmic => a + (b - a) * t.sqrt(),
+        CurveKind::SCurve => a + (b - a) * t * t * (3.0 - 2.0 * t),
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -189,5 +235,79 @@ mod tests {
             err,
             BreakpointError::UnsortedOrDuplicateTime { .. }
         ));
+    }
+
+    fn bp_curve(t: u64, v: f32, c: CurveKind) -> Breakpoint {
+        Breakpoint {
+            time: t,
+            value: v,
+            curve: c,
+        }
+    }
+
+    #[test]
+    fn evaluate_returns_none_for_empty() {
+        assert_eq!(BreakpointSeq::empty().evaluate(0), None);
+    }
+
+    #[test]
+    fn evaluate_clamps_outside_range() {
+        let seq = BreakpointSeq::new(vec![bp(100, 0.5), bp(200, 0.8)]).unwrap();
+        assert_eq!(seq.evaluate(50), Some(0.5));
+        assert_eq!(seq.evaluate(500), Some(0.8));
+    }
+
+    #[test]
+    fn evaluate_linear_midpoint() {
+        let seq = BreakpointSeq::new(vec![
+            bp_curve(0, 0.0, CurveKind::Linear),
+            bp_curve(100, 1.0, CurveKind::Linear),
+        ])
+        .unwrap();
+        assert!((seq.evaluate(50).unwrap() - 0.5).abs() < 1e-6);
+        assert!((seq.evaluate(25).unwrap() - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn evaluate_hold_stays_flat_until_next_breakpoint() {
+        let seq = BreakpointSeq::new(vec![
+            bp_curve(0, 0.0, CurveKind::Hold),
+            bp_curve(100, 1.0, CurveKind::Linear),
+        ])
+        .unwrap();
+        // Anywhere inside the [0, 100) segment is the previous value.
+        assert_eq!(seq.evaluate(50), Some(0.0));
+        assert_eq!(seq.evaluate(99), Some(0.0));
+        assert_eq!(seq.evaluate(100), Some(1.0));
+    }
+
+    #[test]
+    fn evaluate_scurve_midpoint_is_half() {
+        let seq = BreakpointSeq::new(vec![
+            bp_curve(0, 0.0, CurveKind::SCurve),
+            bp_curve(100, 1.0, CurveKind::Linear),
+        ])
+        .unwrap();
+        assert!((seq.evaluate(50).unwrap() - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn evaluate_mapped_handles_neg_infinity_via_map() {
+        // Volume envelope: dB values mapped to linear gain. -inf → 0.
+        let seq = BreakpointSeq::new(vec![
+            bp_curve(0, 0.0, CurveKind::Linear),
+            bp_curve(100, f32::NEG_INFINITY, CurveKind::Linear),
+        ])
+        .unwrap();
+        let to_lin = |db: f32| {
+            if db == f32::NEG_INFINITY {
+                0.0_f32
+            } else {
+                10.0_f32.powf(db / 20.0)
+            }
+        };
+        assert!((seq.evaluate_mapped(0, to_lin).unwrap() - 1.0).abs() < 1e-6);
+        assert!((seq.evaluate_mapped(50, to_lin).unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(seq.evaluate_mapped(100, to_lin), Some(0.0));
     }
 }

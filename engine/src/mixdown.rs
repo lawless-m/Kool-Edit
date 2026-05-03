@@ -13,6 +13,7 @@
 use crate::dsp::{self, DspError};
 use crate::effect::EffectParams;
 use crate::engine::{Engine, QueryError};
+use crate::envelope::{AutomationLane, ClipEnvelope, EnvelopeParam};
 use crate::ids::{ClipId, SourceId};
 use crate::op::{FadeDirection, FadeShape, Op};
 use crate::project::{Clip, EffectInstance, Fade, Project, Track};
@@ -98,11 +99,30 @@ pub fn mixdown_stereo(engine: &Engine) -> Result<Vec<f32>, MixdownError> {
         // Track pan on an already-stereo bus uses balance (pan=0 unchanged,
         // pan=-1 zeros R, pan=+1 zeros L). The equal-power law is reserved
         // for placing a mono source into the stereo field at the clip stage.
-        let track_gain = db_to_linear(track.gain_db);
-        let (l_w, r_w) = stereo_balance(track.pan);
+        let static_gain = db_to_linear(track.gain_db);
+        let static_pan = stereo_balance(track.pan);
+        let gain_lane = track_automation_for(track, "track.gain");
+        let pan_lane = track_automation_for(track, "track.pan");
         for f in 0..total_frames as usize {
-            let l = track_buf[f * 2] * track_gain * l_w;
-            let r = track_buf[f * 2 + 1] * track_gain * r_w;
+            let gain = match gain_lane {
+                Some(l) => l
+                    .breakpoints
+                    .evaluate_mapped(f as u64, db_or_zero_lin)
+                    .unwrap_or(static_gain),
+                None => static_gain,
+            };
+            let (l_w, r_w) = match pan_lane {
+                Some(l) => {
+                    let pan = l
+                        .breakpoints
+                        .evaluate(f as u64)
+                        .unwrap_or(track.pan);
+                    stereo_balance(pan)
+                }
+                None => static_pan,
+            };
+            let l = track_buf[f * 2] * gain * l_w;
+            let r = track_buf[f * 2 + 1] * gain * r_w;
             master[f * 2] += l;
             master[f * 2 + 1] += r;
         }
@@ -122,8 +142,14 @@ pub fn mixdown_stereo(engine: &Engine) -> Result<Vec<f32>, MixdownError> {
 
 fn check_unsupported(project: &Project) -> Result<(), MixdownError> {
     for track in &project.tracks {
-        if !track.automation.is_empty() {
-            return Err(MixdownError::Unsupported("track automation"));
+        for lane in &track.automation {
+            // Only track-level gain and pan are supported. Insert-parameter
+            // automation would need to recompute biquad coefficients per
+            // frame and is left for later.
+            match lane.parameter.as_str() {
+                "track.gain" | "track.pan" => {}
+                _ => return Err(MixdownError::Unsupported("automation parameter path")),
+            }
         }
         for clip in &track.clips {
             if clip.time_stretch != 1.0 {
@@ -132,12 +158,38 @@ fn check_unsupported(project: &Project) -> Result<(), MixdownError> {
             if clip.pitch_shift_cents != 0.0 {
                 return Err(MixdownError::Unsupported("clip pitch_shift"));
             }
-            if !clip.envelopes.is_empty() {
-                return Err(MixdownError::Unsupported("clip envelopes"));
+            for env in &clip.envelopes {
+                match env.parameter {
+                    EnvelopeParam::Volume | EnvelopeParam::Pan => {}
+                }
             }
         }
     }
     Ok(())
+}
+
+fn db_or_zero_lin(db: f32) -> f32 {
+    if db == f32::NEG_INFINITY {
+        0.0
+    } else {
+        10.0_f32.powf(db / 20.0)
+    }
+}
+
+fn clip_volume_envelope(envelopes: &[ClipEnvelope]) -> Option<&ClipEnvelope> {
+    envelopes
+        .iter()
+        .find(|e| matches!(e.parameter, EnvelopeParam::Volume))
+}
+
+fn clip_pan_envelope(envelopes: &[ClipEnvelope]) -> Option<&ClipEnvelope> {
+    envelopes
+        .iter()
+        .find(|e| matches!(e.parameter, EnvelopeParam::Pan))
+}
+
+fn track_automation_for<'a>(track: &'a Track, path: &str) -> Option<&'a AutomationLane> {
+    track.automation.iter().find(|l| l.parameter.as_str() == path)
 }
 
 fn project_length_frames(project: &Project) -> u64 {
@@ -247,21 +299,40 @@ fn render_clip_into(
     let ch = source.channel_count as usize;
 
     let clip_gain = db_to_linear(clip.gain_db);
+    let volume_env = clip_volume_envelope(&clip.envelopes);
+    let pan_env = clip_pan_envelope(&clip.envelopes);
     // Mono sources get equal-power-panned into the stereo field (pan=0
     // splits the sample at -3 dB into L and R). Stereo sources are
     // already-stereo: we apply pan as a balance so the centre is unity.
-    let (l_w, r_w) = match ch {
-        1 => mono_pan(clip.pan),
-        2 => stereo_balance(clip.pan),
-        other => return Err(MixdownError::Unsupported(static_chan_name(other))),
+    let pan_law = |pan: f32| match ch {
+        1 => mono_pan(pan),
+        2 => stereo_balance(pan),
+        _ => (1.0, 1.0),
     };
+    let static_pan = pan_law(clip.pan);
 
     let track_pos_start = clip.track_position.start();
     let max_frame = total_frames.min(track_pos_start + frames as u64);
 
     for (i, frame_idx) in (track_pos_start..max_frame).enumerate() {
         let fade_g = fade_envelope(i, frames, clip.fade_in, clip.fade_out);
-        let g = clip_gain * fade_g;
+        // Volume envelope multiplies on top of the static gain. Per doc 03
+        // §"Per-clip envelopes", "Envelope rides on top of clip gain".
+        let env_gain = volume_env
+            .and_then(|e| e.breakpoints.evaluate_mapped(i as u64, db_or_zero_lin))
+            .unwrap_or(1.0);
+        let g = clip_gain * fade_g * env_gain;
+        // Pan envelope, if any, replaces the static pan for this frame.
+        let (l_w, r_w) = match pan_env {
+            Some(e) => {
+                let p = e
+                    .breakpoints
+                    .evaluate(i as u64)
+                    .unwrap_or(clip.pan);
+                pan_law(p)
+            }
+            None => static_pan,
+        };
         let (left, right) = match ch {
             1 => {
                 let s = samples[i] * g;
@@ -272,7 +343,7 @@ fn render_clip_into(
                 let r = samples[i * 2 + 1] * g * r_w;
                 (l, r)
             }
-            _ => unreachable!("checked above"),
+            other => return Err(MixdownError::Unsupported(static_chan_name(other))),
         };
         let dest = frame_idx as usize * 2;
         track_buf[dest] += left;
@@ -699,6 +770,155 @@ mod tests {
         let ceiling = 10.0_f32.powf(-6.0 / 20.0);
         let peak = out.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
         assert!(peak <= ceiling + 1e-6, "master peak {peak} above ceiling {ceiling}");
+    }
+
+    #[test]
+    fn clip_volume_envelope_fades_to_silence() {
+        use crate::envelope::{Breakpoint, BreakpointSeq, ClipEnvelope, CurveKind, EnvelopeParam};
+
+        let mut engine = Engine::new(48_000);
+        let id = engine
+            .import_wav("a.wav", &synth_mono_wav(&[1.0_f32; 100], 48_000), now())
+            .unwrap();
+
+        let mut track = empty_track(1, "T");
+        let mut clip = clip_for(1, id, 0, 100);
+        clip.envelopes.push(ClipEnvelope {
+            parameter: EnvelopeParam::Volume,
+            breakpoints: BreakpointSeq::new(vec![
+                Breakpoint {
+                    time: 0,
+                    value: 0.0,
+                    curve: CurveKind::Linear,
+                },
+                Breakpoint {
+                    time: 99,
+                    value: f32::NEG_INFINITY,
+                    curve: CurveKind::Linear,
+                },
+            ])
+            .unwrap(),
+        });
+        track.clips.push(clip);
+        engine.project_mut().tracks.push(track);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        // First frame: full gain × pan-law (~0.707).
+        let expected_first = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((out[0] - expected_first).abs() < 1e-3);
+        // Last frame: -inf dB → silence.
+        assert!(out[(99) * 2].abs() < 1e-3);
+        // Middle: somewhere between (the envelope is linear in linear gain
+        // because the mapping converts dB to linear before interpolation).
+        let mid = out[50 * 2];
+        assert!(mid > 0.0 && mid < expected_first, "mid {mid}");
+    }
+
+    #[test]
+    fn clip_pan_envelope_sweeps_left_to_right() {
+        use crate::envelope::{Breakpoint, BreakpointSeq, ClipEnvelope, CurveKind, EnvelopeParam};
+
+        let mut engine = Engine::new(48_000);
+        let id = engine
+            .import_wav("a.wav", &synth_mono_wav(&[0.5_f32; 100], 48_000), now())
+            .unwrap();
+
+        let mut track = empty_track(1, "T");
+        let mut clip = clip_for(1, id, 0, 100);
+        clip.envelopes.push(ClipEnvelope {
+            parameter: EnvelopeParam::Pan,
+            breakpoints: BreakpointSeq::new(vec![
+                Breakpoint {
+                    time: 0,
+                    value: -1.0,
+                    curve: CurveKind::Linear,
+                },
+                Breakpoint {
+                    time: 99,
+                    value: 1.0,
+                    curve: CurveKind::Linear,
+                },
+            ])
+            .unwrap(),
+        });
+        track.clips.push(clip);
+        engine.project_mut().tracks.push(track);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        // At pan=-1 (frame 0): all energy on L, R is silent.
+        assert!(out[0] > 0.49 && out[1].abs() < 1e-3);
+        // At pan=+1 (frame 99): mirror.
+        assert!(out[99 * 2].abs() < 1e-3 && out[99 * 2 + 1] > 0.49);
+    }
+
+    #[test]
+    fn track_gain_automation_attenuates_over_time() {
+        use crate::envelope::{
+            AutomationLane, Breakpoint, BreakpointSeq, CurveKind, ParamPath,
+        };
+
+        let mut engine = Engine::new(48_000);
+        let id = engine
+            .import_wav("a.wav", &synth_mono_wav(&[1.0_f32; 100], 48_000), now())
+            .unwrap();
+
+        let mut track = empty_track(1, "T");
+        track.clips.push(clip_for(1, id, 0, 100));
+        track.automation.push(AutomationLane {
+            parameter: ParamPath::new("track.gain"),
+            breakpoints: BreakpointSeq::new(vec![
+                Breakpoint {
+                    time: 0,
+                    value: 0.0,
+                    curve: CurveKind::Linear,
+                },
+                Breakpoint {
+                    time: 99,
+                    value: f32::NEG_INFINITY,
+                    curve: CurveKind::Linear,
+                },
+            ])
+            .unwrap(),
+        });
+        engine.project_mut().tracks.push(track);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        let first = out[0].abs();
+        let mid = out[50 * 2].abs();
+        let last = out[99 * 2].abs();
+        assert!(first > 0.49, "first {first}");
+        assert!(mid < first, "mid {mid} should be < first {first}");
+        assert!(last < 1e-3, "last {last} should be ~zero");
+    }
+
+    #[test]
+    fn unsupported_automation_path_errors_cleanly() {
+        use crate::envelope::{
+            AutomationLane, Breakpoint, BreakpointSeq, CurveKind, ParamPath,
+        };
+
+        let mut engine = Engine::new(48_000);
+        let id = engine
+            .import_wav("a.wav", &synth_mono_wav(&[0.5_f32; 8], 48_000), now())
+            .unwrap();
+
+        let mut track = empty_track(1, "T");
+        track.clips.push(clip_for(1, id, 0, 8));
+        track.automation.push(AutomationLane {
+            parameter: ParamPath::new("insert.1.threshold"),
+            breakpoints: BreakpointSeq::new(vec![Breakpoint {
+                time: 0,
+                value: -18.0,
+                curve: CurveKind::Linear,
+            }])
+            .unwrap(),
+        });
+        engine.project_mut().tracks.push(track);
+        let err = mixdown_stereo(&engine).unwrap_err();
+        assert!(matches!(
+            err,
+            MixdownError::Unsupported("automation parameter path")
+        ));
     }
 
     #[test]

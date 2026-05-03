@@ -21,6 +21,9 @@ use crate::effect::{
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
+use crate::envelope::{
+    AutomationLane, Breakpoint, ClipEnvelope, CurveKind, EnvelopeParam,
+};
 use crate::project::{Clip, EffectInstance, MasterBus, Project, Track};
 use crate::range::SampleRange;
 use crate::source::Source;
@@ -333,7 +336,8 @@ impl<'a> Emitter<'a> {
             self.emit_inserts(&track.inserts);
         }
         if !track.automation.is_empty() {
-            return Err(EmitError::Unsupported("track automation"));
+            self.out.push('\n');
+            self.emit_automation(&track.automation, self.project.sample_rate());
         }
 
         if !track.clips.is_empty() {
@@ -392,11 +396,86 @@ impl<'a> Emitter<'a> {
             self.line("locked: true");
         }
         if !clip.envelopes.is_empty() {
-            return Err(EmitError::Unsupported("clip envelopes"));
+            self.out.push('\n');
+            for env in &clip.envelopes {
+                self.emit_clip_envelope(env);
+            }
         }
         self.close();
         Ok(())
     }
+
+    fn emit_clip_envelope(&mut self, env: &ClipEnvelope) {
+        let kind = match env.parameter {
+            EnvelopeParam::Volume => "volume",
+            EnvelopeParam::Pan => "pan",
+        };
+        let sr = self.project.sample_rate();
+        self.open(&format!("envelope {kind}"));
+        for bp in env.breakpoints.points() {
+            self.line(&fmt_breakpoint(bp, env.parameter, sr));
+        }
+        self.close();
+    }
+
+    fn emit_automation(&mut self, lanes: &[AutomationLane], sample_rate: u32) {
+        for lane in lanes {
+            self.open(&format!(
+                "automation lane on:{}",
+                quote(lane.parameter.as_str())
+            ));
+            // Volume-flavoured automation paths are emitted in dB; everything
+            // else in raw float. The path string is the source of truth.
+            let is_db_path = lane.parameter.as_str().ends_with(".gain")
+                || lane.parameter.as_str().ends_with(".threshold")
+                || lane.parameter.as_str().ends_with(".makeup")
+                || lane.parameter.as_str().ends_with(".ceiling");
+            for bp in lane.breakpoints.points() {
+                let value = if is_db_path {
+                    fmt_db(bp.value)
+                } else {
+                    fmt_float(bp.value)
+                };
+                self.line(&format!(
+                    "{}  {} {}",
+                    fmt_at(bp.time, sample_rate),
+                    value,
+                    curve_name(bp.curve)
+                ));
+            }
+            self.close();
+        }
+    }
+}
+
+fn fmt_breakpoint(bp: &Breakpoint, parameter: EnvelopeParam, sample_rate: u32) -> String {
+    let value = match parameter {
+        EnvelopeParam::Volume => fmt_db(bp.value),
+        EnvelopeParam::Pan => fmt_float(bp.value),
+    };
+    format!(
+        "{}  {} {}",
+        fmt_at(bp.time, sample_rate),
+        value,
+        curve_name(bp.curve)
+    )
+}
+
+fn curve_name(c: CurveKind) -> &'static str {
+    match c {
+        CurveKind::Linear => "linear",
+        CurveKind::Exponential => "exp",
+        CurveKind::Logarithmic => "log",
+        CurveKind::Hold => "hold",
+        CurveKind::SCurve => "scurve",
+    }
+}
+
+// Re-attach helper-free emitter methods that don't fit inside the impl block.
+#[allow(dead_code)]
+fn _emit_helpers_marker() {}
+
+impl Emitter<'_> {
 
     fn emit_master(&mut self) -> Result<(), EmitError> {
         let MasterBus { gain_db, inserts } = &self.project.master;
@@ -1038,6 +1117,92 @@ mod tests {
         p.sources.insert(s.id.clone(), s);
         let err = project_to_dsl(&p).unwrap_err();
         assert!(matches!(err, EmitError::Unsupported(_)));
+    }
+
+    #[test]
+    fn emits_clip_envelopes_and_track_automation() {
+        use crate::envelope::{
+            AutomationLane, Breakpoint, BreakpointSeq, ClipEnvelope, CurveKind,
+            EnvelopeParam, ParamPath,
+        };
+
+        let mut p = Project::new(96_000);
+        let s = fixture_source("src_a", 96_000 * 5, 96_000);
+        let src_id = s.id.clone();
+        p.sources.insert(src_id.clone(), s);
+
+        let mut clip = Clip {
+            id: ClipId(1),
+            source_id: src_id,
+            name: "Take 1".into(),
+            track_position: SampleRange::new(0, 96_000 * 4).unwrap(),
+            source_in: 0,
+            source_out: 96_000 * 4,
+            gain_db: 0.0,
+            pan: 0.0,
+            fade_in: Fade::none(),
+            fade_out: Fade::none(),
+            time_stretch: 1.0,
+            pitch_shift_cents: 0.0,
+            envelopes: Vec::new(),
+            locked: false,
+            group: None,
+        };
+        clip.envelopes.push(ClipEnvelope {
+            parameter: EnvelopeParam::Volume,
+            breakpoints: BreakpointSeq::new(vec![
+                Breakpoint {
+                    time: 0,
+                    value: 0.0,
+                    curve: CurveKind::Linear,
+                },
+                Breakpoint {
+                    time: 96_000 * 4 - 1,
+                    value: f32::NEG_INFINITY,
+                    curve: CurveKind::Linear,
+                },
+            ])
+            .unwrap(),
+        });
+
+        let track = Track {
+            id: TrackId(1),
+            name: "Vocal".into(),
+            height: 80.0,
+            mute: false,
+            solo: false,
+            arm: false,
+            gain_db: 0.0,
+            pan: 0.0,
+            inserts: Vec::new(),
+            automation: vec![AutomationLane {
+                parameter: ParamPath::new("track.gain"),
+                breakpoints: BreakpointSeq::new(vec![
+                    Breakpoint {
+                        time: 0,
+                        value: 0.0,
+                        curve: CurveKind::Linear,
+                    },
+                    Breakpoint {
+                        time: 96_000 * 2,
+                        value: -6.0,
+                        curve: CurveKind::Linear,
+                    },
+                ])
+                .unwrap(),
+            }],
+            clips: vec![clip],
+        };
+        p.tracks.push(track);
+        let dsl = project_to_dsl(&p).unwrap();
+        assert!(dsl.contains("envelope volume"), "envelope missing:\n{dsl}");
+        assert!(dsl.contains("@00:00:00.000  0dB linear"), "first bp missing:\n{dsl}");
+        assert!(dsl.contains("-inf linear"), "-inf bp missing:\n{dsl}");
+        assert!(
+            dsl.contains("automation lane on:\"track.gain\""),
+            "automation lane missing:\n{dsl}"
+        );
+        assert!(dsl.contains("@00:00:02.000  -6dB linear"), "second bp missing:\n{dsl}");
     }
 
     #[test]
