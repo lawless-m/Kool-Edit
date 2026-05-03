@@ -1,0 +1,20 @@
+[package]
+name = "kool-edit-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kool-Edit audio engine: project state, edit list, DSP. Compiles to native (tests) and Wasm (browser)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable when building for the browser. Pulls in wasm-bindgen and exposes a JS-callable surface.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+wasm-bindgen = { version = "0.2", optional = true }
+
+[dev-dependencies]
