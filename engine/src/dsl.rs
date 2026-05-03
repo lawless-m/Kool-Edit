@@ -14,7 +14,7 @@
 //! envelopes, noise profiles) return [`EmitError::Unsupported`] so callers
 //! see exactly what's missing.
 
-use crate::effect::{CompParams, DelayParams, LimitParams};
+use crate::effect::{CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams};
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
@@ -231,19 +231,35 @@ impl<'a> Emitter<'a> {
                 fmt_range(*range, sample_rate),
                 fmt_limit_params(params)
             )),
+            Op::Eq { range, params } => self.emit_eq(*range, params, sample_rate),
 
             Op::Insert { .. }
             | Op::PasteMix { .. }
             | Op::PasteOver { .. } => {
                 return Err(EmitError::Unsupported("clipboard ops"));
             }
-            Op::Eq { .. } | Op::Reverb { .. } => {
-                return Err(EmitError::Unsupported("effect param blocks"));
+            Op::Reverb { .. } => {
+                return Err(EmitError::Unsupported("Reverb"));
             }
             Op::NoiseReduce { .. } => return Err(EmitError::Unsupported("noise_reduce")),
             Op::SpectralEdit { .. } => return Err(EmitError::Unsupported("spectral edit")),
         }
         Ok(())
+    }
+
+    fn emit_eq(&mut self, range: SampleRange, params: &EqParams, sample_rate: u32) {
+        let r = fmt_range(range, sample_rate);
+        if params.bands.is_empty() {
+            self.line(&format!("{r}  eq {{}}"));
+            return;
+        }
+        self.line(&format!("{r}  eq {{"));
+        self.indent += 1;
+        for (i, band) in params.bands.iter().enumerate() {
+            self.line(&fmt_eq_band(i + 1, band));
+        }
+        self.indent -= 1;
+        self.line("}");
     }
 
     fn emit_generate(
@@ -421,6 +437,38 @@ impl<'a> Emitter<'a> {
             }
         ));
         self.close();
+    }
+}
+
+fn fmt_eq_band(index: usize, band: &EqBand) -> String {
+    let kind = eq_band_kind_name(band.kind);
+    let mut parts = vec![
+        format!("freq:{}", fmt_float(band.frequency_hz)),
+        format!("type:{kind}"),
+    ];
+    if matches!(
+        band.kind,
+        EqBandKind::Peak | EqBandKind::Lowshelf | EqBandKind::Highshelf
+    ) {
+        parts.push(format!("gain:{}", fmt_db(band.gain_db)));
+    }
+    if !matches!(band.kind, EqBandKind::Lowshelf | EqBandKind::Highshelf) {
+        parts.push(format!("q:{}", fmt_float(band.q)));
+    }
+    if !band.enabled {
+        parts.push("enabled:false".into());
+    }
+    format!("band {index} {{ {} }}", parts.join(", "))
+}
+
+fn eq_band_kind_name(k: EqBandKind) -> &'static str {
+    match k {
+        EqBandKind::Highpass => "highpass",
+        EqBandKind::Lowpass => "lowpass",
+        EqBandKind::Lowshelf => "lowshelf",
+        EqBandKind::Highshelf => "highshelf",
+        EqBandKind::Peak => "peak",
+        EqBandKind::Notch => "notch",
     }
 }
 
@@ -830,13 +878,68 @@ mod tests {
     }
 
     #[test]
+    fn emits_eq_with_band_list() {
+        use crate::effect::{EqBand, EqBandKind, EqParams};
+        let mut p = Project::new(96_000);
+        let mut s = fixture_source("src_a", 96_000, 96_000);
+        s.edits.apply(Op::Eq {
+            range: SampleRange::new(0, 96_000).unwrap(),
+            params: EqParams {
+                bands: vec![
+                    EqBand {
+                        kind: EqBandKind::Highpass,
+                        frequency_hz: 80.0,
+                        gain_db: 0.0,
+                        q: 0.7,
+                        enabled: true,
+                    },
+                    EqBand {
+                        kind: EqBandKind::Peak,
+                        frequency_hz: 3000.0,
+                        gain_db: 2.0,
+                        q: 1.0,
+                        enabled: true,
+                    },
+                    EqBand {
+                        kind: EqBandKind::Highshelf,
+                        frequency_hz: 12_000.0,
+                        gain_db: 1.0,
+                        q: 0.7,
+                        enabled: false,
+                    },
+                ],
+            },
+        });
+        p.sources.insert(s.id.clone(), s);
+        let dsl = project_to_dsl(&p).unwrap();
+        assert!(dsl.contains("eq {"), "no eq block:\n{dsl}");
+        assert!(
+            dsl.contains("band 1 { freq:80, type:highpass, q:0.7 }"),
+            "band 1 wrong:\n{dsl}"
+        );
+        assert!(
+            dsl.contains("band 2 { freq:3000, type:peak, gain:+2dB, q:1 }"),
+            "band 2 wrong:\n{dsl}"
+        );
+        assert!(
+            dsl.contains("band 3 { freq:12000, type:highshelf, gain:+1dB, enabled:false }"),
+            "band 3 wrong:\n{dsl}"
+        );
+    }
+
+    #[test]
     fn unsupported_features_report_clear_errors() {
-        use crate::effect::EqParams;
+        use crate::effect::{ReverbModel, ReverbParams};
         let mut p = Project::new(96_000);
         let mut s = fixture_source("src_a", 100, 96_000);
-        s.edits.apply(Op::Eq {
+        s.edits.apply(Op::Reverb {
             range: SampleRange::new(0, 100).unwrap(),
-            params: EqParams::default(),
+            params: ReverbParams {
+                model: ReverbModel::Hall,
+                size: 0.5,
+                damping: 0.5,
+                mix: 0.5,
+            },
         });
         p.sources.insert(s.id.clone(), s);
         let err = project_to_dsl(&p).unwrap_err();

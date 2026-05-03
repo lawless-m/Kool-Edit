@@ -13,7 +13,7 @@
 
 use std::f32::consts::PI;
 
-use crate::effect::{CompParams, DelayParams, LimitParams};
+use crate::effect::{CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams};
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
@@ -86,11 +86,11 @@ pub fn apply(
             compress(buffer, channels, *range, params, sample_rate)
         }
         Op::Limit { range, params } => limit(buffer, channels, *range, params, sample_rate),
+        Op::Eq { range, params } => eq(buffer, channels, *range, params, sample_rate),
 
         Op::Insert { .. } => Err(DspError::Unsupported("Insert")),
         Op::PasteMix { .. } => Err(DspError::Unsupported("PasteMix")),
         Op::PasteOver { .. } => Err(DspError::Unsupported("PasteOver")),
-        Op::Eq { .. } => Err(DspError::Unsupported("Eq")),
         Op::Reverb { .. } => Err(DspError::Unsupported("Reverb")),
         Op::TimeStretch { .. } => Err(DspError::Unsupported("TimeStretch")),
         Op::PitchShift { .. } => Err(DspError::Unsupported("PitchShift")),
@@ -361,6 +361,220 @@ fn xorshift32(state: &mut u32) -> u32 {
     x ^= x << 5;
     *state = x;
     x
+}
+
+fn eq(
+    buffer: &mut [f32],
+    channels: u16,
+    range: SampleRange,
+    params: &EqParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    let s = slice_for(buffer, channels, range)?;
+    let ch = channels as usize;
+    let frames = s.len() / ch;
+    if frames == 0 {
+        return Ok(());
+    }
+    // Build coefficients once for every enabled band; disabled bands are
+    // simply skipped in the chain so they have no effect on the signal.
+    let coefs: Vec<BiquadCoefs> = params
+        .bands
+        .iter()
+        .filter(|b| b.enabled)
+        .map(|b| BiquadCoefs::for_band(b, sample_rate as f32))
+        .collect();
+    if coefs.is_empty() {
+        return Ok(());
+    }
+    // One filter chain per channel so the biquad state doesn't bleed between
+    // channels of a stereo source.
+    let mut chains: Vec<Vec<Biquad>> = (0..ch)
+        .map(|_| {
+            coefs
+                .iter()
+                .copied()
+                .map(|c| Biquad {
+                    coefs: c,
+                    z1: 0.0,
+                    z2: 0.0,
+                })
+                .collect()
+        })
+        .collect();
+    for f in 0..frames {
+        for c in 0..ch {
+            let mut x = s[f * ch + c];
+            for biquad in &mut chains[c] {
+                x = biquad.process(x);
+            }
+            s[f * ch + c] = x;
+        }
+    }
+    Ok(())
+}
+
+/// Direct-form-II-transposed biquad. State (`z1`, `z2`) is per-instance so a
+/// stereo chain holds two of these per band.
+#[derive(Copy, Clone, Debug)]
+struct Biquad {
+    coefs: BiquadCoefs,
+    z1: f32,
+    z2: f32,
+}
+
+impl Biquad {
+    fn process(&mut self, x: f32) -> f32 {
+        let y = self.coefs.b0 * x + self.z1;
+        self.z1 = self.coefs.b1 * x - self.coefs.a1 * y + self.z2;
+        self.z2 = self.coefs.b2 * x - self.coefs.a2 * y;
+        y
+    }
+}
+
+/// Normalised biquad coefficients (a0 already divided out). Computed via the
+/// RBJ Audio EQ Cookbook formulas, then divided through by `a0` so the
+/// runtime path is just five multiplies and adds per sample.
+#[derive(Copy, Clone, Debug)]
+struct BiquadCoefs {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+impl BiquadCoefs {
+    fn for_band(band: &EqBand, sample_rate: f32) -> Self {
+        // Clamp frequency below Nyquist; a band tuned at fs/2 produces NaNs
+        // because alpha collapses to zero, so we leave a small headroom.
+        let nyq = sample_rate * 0.499;
+        let freq = band.frequency_hz.clamp(1.0, nyq);
+        let q = band.q.max(0.0001);
+        let gain_db = band.gain_db;
+        match band.kind {
+            EqBandKind::Peak => Self::peak(freq, q, gain_db, sample_rate),
+            EqBandKind::Lowshelf => Self::low_shelf(freq, q, gain_db, sample_rate),
+            EqBandKind::Highshelf => Self::high_shelf(freq, q, gain_db, sample_rate),
+            EqBandKind::Highpass => Self::highpass(freq, q, sample_rate),
+            EqBandKind::Lowpass => Self::lowpass(freq, q, sample_rate),
+            EqBandKind::Notch => Self::notch(freq, q, sample_rate),
+        }
+    }
+
+    fn peak(freq: f32, q: f32, gain_db: f32, fs: f32) -> Self {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let (cos_w, sin_w) = (2.0 * PI * freq / fs).sin_cos_swapped();
+        let alpha = sin_w / (2.0 * q);
+        let a0 = 1.0 + alpha / a;
+        Self::norm(
+            a0,
+            1.0 + alpha * a,
+            -2.0 * cos_w,
+            1.0 - alpha * a,
+            -2.0 * cos_w,
+            1.0 - alpha / a,
+        )
+    }
+
+    fn low_shelf(freq: f32, q: f32, gain_db: f32, fs: f32) -> Self {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let (cos_w, sin_w) = (2.0 * PI * freq / fs).sin_cos_swapped();
+        let alpha = sin_w / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let ap = a + 1.0;
+        let am = a - 1.0;
+        let a0 = ap + am * cos_w + two_sqrt_a_alpha;
+        let b0 = a * (ap - am * cos_w + two_sqrt_a_alpha);
+        let b1 = 2.0 * a * (am - ap * cos_w);
+        let b2 = a * (ap - am * cos_w - two_sqrt_a_alpha);
+        let a1 = -2.0 * (am + ap * cos_w);
+        let a2 = ap + am * cos_w - two_sqrt_a_alpha;
+        Self::norm(a0, b0, b1, b2, a1, a2)
+    }
+
+    fn high_shelf(freq: f32, q: f32, gain_db: f32, fs: f32) -> Self {
+        let a = 10.0_f32.powf(gain_db / 40.0);
+        let (cos_w, sin_w) = (2.0 * PI * freq / fs).sin_cos_swapped();
+        let alpha = sin_w / (2.0 * q);
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+        let ap = a + 1.0;
+        let am = a - 1.0;
+        let a0 = ap - am * cos_w + two_sqrt_a_alpha;
+        let b0 = a * (ap + am * cos_w + two_sqrt_a_alpha);
+        let b1 = -2.0 * a * (am + ap * cos_w);
+        let b2 = a * (ap + am * cos_w - two_sqrt_a_alpha);
+        let a1 = 2.0 * (am - ap * cos_w);
+        let a2 = ap - am * cos_w - two_sqrt_a_alpha;
+        Self::norm(a0, b0, b1, b2, a1, a2)
+    }
+
+    fn highpass(freq: f32, q: f32, fs: f32) -> Self {
+        let (cos_w, sin_w) = (2.0 * PI * freq / fs).sin_cos_swapped();
+        let alpha = sin_w / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let one_plus_cos = 1.0 + cos_w;
+        Self::norm(
+            a0,
+            one_plus_cos * 0.5,
+            -one_plus_cos,
+            one_plus_cos * 0.5,
+            -2.0 * cos_w,
+            1.0 - alpha,
+        )
+    }
+
+    fn lowpass(freq: f32, q: f32, fs: f32) -> Self {
+        let (cos_w, sin_w) = (2.0 * PI * freq / fs).sin_cos_swapped();
+        let alpha = sin_w / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        let one_minus_cos = 1.0 - cos_w;
+        Self::norm(
+            a0,
+            one_minus_cos * 0.5,
+            one_minus_cos,
+            one_minus_cos * 0.5,
+            -2.0 * cos_w,
+            1.0 - alpha,
+        )
+    }
+
+    fn notch(freq: f32, q: f32, fs: f32) -> Self {
+        let (cos_w, sin_w) = (2.0 * PI * freq / fs).sin_cos_swapped();
+        let alpha = sin_w / (2.0 * q);
+        let a0 = 1.0 + alpha;
+        Self::norm(
+            a0,
+            1.0,
+            -2.0 * cos_w,
+            1.0,
+            -2.0 * cos_w,
+            1.0 - alpha,
+        )
+    }
+
+    fn norm(a0: f32, b0: f32, b1: f32, b2: f32, a1: f32, a2: f32) -> Self {
+        let inv = 1.0 / a0;
+        Self {
+            b0: b0 * inv,
+            b1: b1 * inv,
+            b2: b2 * inv,
+            a1: a1 * inv,
+            a2: a2 * inv,
+        }
+    }
+}
+
+/// Helper that returns `(cos, sin)` to keep the biquad call sites readable.
+trait SinCosSwap {
+    fn sin_cos_swapped(self) -> (f32, f32);
+}
+
+impl SinCosSwap for f32 {
+    fn sin_cos_swapped(self) -> (f32, f32) {
+        let (s, c) = self.sin_cos();
+        (c, s)
+    }
 }
 
 fn db_to_linear(db: f32) -> f32 {
@@ -710,19 +924,24 @@ mod tests {
 
     #[test]
     fn unsupported_ops_are_reported() {
-        use crate::effect::EqParams;
+        use crate::effect::{ReverbModel, ReverbParams};
         let mut samples = vec![0.0; 4];
         let err = apply(
-            &Op::Eq {
+            &Op::Reverb {
                 range: r(0, 4),
-                params: EqParams::default(),
+                params: ReverbParams {
+                    model: ReverbModel::Hall,
+                    size: 0.5,
+                    damping: 0.5,
+                    mix: 0.5,
+                },
             },
             &mut samples,
             1,
             48_000,
         )
         .unwrap_err();
-        assert!(matches!(err, DspError::Unsupported("Eq")));
+        assert!(matches!(err, DspError::Unsupported("Reverb")));
     }
 
     #[test]
@@ -1163,6 +1382,238 @@ mod tests {
         assert!((upper - 2.0 * (1.0 - inv_ratio)).abs() < 1e-6);
         // Mid (knee centre) should sit between the two.
         assert!(mid > lower && mid < upper);
+    }
+
+    fn sine_at(freq_hz: f32, sample_rate: u32, frames: usize, amp_db: f32) -> Vec<f32> {
+        let amp = db_to_linear(amp_db);
+        let dt = 1.0 / sample_rate as f32;
+        (0..frames)
+            .map(|n| amp * (2.0 * PI * freq_hz * n as f32 * dt).sin())
+            .collect()
+    }
+
+    fn rms(samples: &[f32]) -> f32 {
+        if samples.is_empty() {
+            return 0.0;
+        }
+        let sum_sq: f64 = samples.iter().map(|&x| (x as f64).powi(2)).sum();
+        (sum_sq / samples.len() as f64).sqrt() as f32
+    }
+
+    fn rms_ratio_db(out: &[f32], inp: &[f32]) -> f32 {
+        let r_out = rms(out);
+        let r_in = rms(inp);
+        if r_out <= 0.0 || r_in <= 0.0 {
+            return -120.0;
+        }
+        20.0 * (r_out / r_in).log10()
+    }
+
+    fn eq_band(kind: EqBandKind, freq: f32, gain_db: f32, q: f32) -> EqBand {
+        EqBand {
+            kind,
+            frequency_hz: freq,
+            gain_db,
+            q,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn peak_eq_band_boosts_at_centre_frequency() {
+        let fs = 48_000;
+        let frames = 8192;
+        let input = sine_at(1000.0, fs, frames, -12.0);
+        let mut samples = input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![eq_band(EqBandKind::Peak, 1_000.0, 6.0, 1.0)],
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let tail_in = &input[frames / 2..];
+        let tail_out = &samples[frames / 2..];
+        let gain_db = rms_ratio_db(tail_out, tail_in);
+        assert!((gain_db - 6.0).abs() < 0.5, "got {gain_db} dB, expected ~+6");
+    }
+
+    #[test]
+    fn peak_eq_far_from_centre_is_near_unity() {
+        let fs = 48_000;
+        let frames = 8192;
+        // Boost +12 dB at 100 Hz; check the response at 8 kHz, ~6 octaves up.
+        let input = sine_at(8_000.0, fs, frames, -12.0);
+        let mut samples = input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![eq_band(EqBandKind::Peak, 100.0, 12.0, 1.0)],
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let gain_db = rms_ratio_db(&samples[frames / 2..], &input[frames / 2..]);
+        assert!(gain_db.abs() < 0.5, "got {gain_db} dB, expected ~0");
+    }
+
+    #[test]
+    fn highpass_attenuates_below_cutoff_and_passes_above() {
+        let fs = 48_000;
+        let frames = 16_384;
+        // Highpass at 1 kHz, Q ≈ Butterworth.
+        let band = eq_band(EqBandKind::Highpass, 1_000.0, 0.0, 0.707);
+
+        let low_input = sine_at(100.0, fs, frames, -6.0);
+        let mut low = low_input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![band],
+                },
+            },
+            &mut low,
+            1,
+            fs,
+        )
+        .unwrap();
+        let low_db = rms_ratio_db(&low[frames / 2..], &low_input[frames / 2..]);
+        assert!(low_db < -20.0, "100 Hz should be heavily attenuated, got {low_db} dB");
+
+        let high_input = sine_at(10_000.0, fs, frames, -6.0);
+        let mut high = high_input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![band],
+                },
+            },
+            &mut high,
+            1,
+            fs,
+        )
+        .unwrap();
+        let high_db = rms_ratio_db(&high[frames / 2..], &high_input[frames / 2..]);
+        assert!(high_db.abs() < 1.0, "10 kHz should pass, got {high_db} dB");
+    }
+
+    #[test]
+    fn lowshelf_boosts_below_corner_only() {
+        let fs = 48_000;
+        let frames = 16_384;
+        let band = eq_band(EqBandKind::Lowshelf, 200.0, 6.0, 0.707);
+
+        let low_input = sine_at(50.0, fs, frames, -12.0);
+        let mut low = low_input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![band],
+                },
+            },
+            &mut low,
+            1,
+            fs,
+        )
+        .unwrap();
+        let low_db = rms_ratio_db(&low[frames / 2..], &low_input[frames / 2..]);
+        assert!((low_db - 6.0).abs() < 1.0, "50 Hz expected +6 dB, got {low_db}");
+
+        let high_input = sine_at(5_000.0, fs, frames, -12.0);
+        let mut high = high_input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![band],
+                },
+            },
+            &mut high,
+            1,
+            fs,
+        )
+        .unwrap();
+        let high_db = rms_ratio_db(&high[frames / 2..], &high_input[frames / 2..]);
+        assert!(high_db.abs() < 0.5, "5 kHz expected ~0 dB, got {high_db}");
+    }
+
+    #[test]
+    fn disabled_band_is_a_no_op() {
+        let fs = 48_000;
+        let frames = 4096;
+        let input = sine_at(1_000.0, fs, frames, -12.0);
+        let mut samples = input.clone();
+        let mut band = eq_band(EqBandKind::Peak, 1_000.0, 12.0, 2.0);
+        band.enabled = false;
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: vec![band],
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        // Bit-equal: chain is empty, no biquad runs at all.
+        assert_eq!(samples, input);
+    }
+
+    #[test]
+    fn two_bands_compose_into_one_response() {
+        // Cut at 200 Hz with -6 dB peak, boost at 4 kHz with +6 dB peak.
+        let fs = 48_000;
+        let frames = 16_384;
+        let bands = vec![
+            eq_band(EqBandKind::Peak, 200.0, -6.0, 1.0),
+            eq_band(EqBandKind::Peak, 4_000.0, 6.0, 1.0),
+        ];
+
+        let low_input = sine_at(200.0, fs, frames, -12.0);
+        let mut low = low_input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams {
+                    bands: bands.clone(),
+                },
+            },
+            &mut low,
+            1,
+            fs,
+        )
+        .unwrap();
+        let low_db = rms_ratio_db(&low[frames / 2..], &low_input[frames / 2..]);
+        assert!((low_db + 6.0).abs() < 1.0, "200 Hz expected -6 dB, got {low_db}");
+
+        let high_input = sine_at(4_000.0, fs, frames, -12.0);
+        let mut high = high_input.clone();
+        apply(
+            &Op::Eq {
+                range: r(0, frames as u64),
+                params: EqParams { bands },
+            },
+            &mut high,
+            1,
+            fs,
+        )
+        .unwrap();
+        let high_db = rms_ratio_db(&high[frames / 2..], &high_input[frames / 2..]);
+        assert!((high_db - 6.0).abs() < 1.0, "4 kHz expected +6 dB, got {high_db}");
     }
 
     #[test]

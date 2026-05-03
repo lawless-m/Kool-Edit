@@ -335,4 +335,45 @@ if (Math.abs(tailDb + 17.5) > 1.0) {
 }
 console.log(`compressor settles at ${tailDb.toFixed(2)} dB (target -17.5 dB)`);
 
+// EQ end-to-end: peak band at 1 kHz with +6 dB and Q=1, fed a 1 kHz sine.
+// Steady-state ratio should match the band's gain.
+const eqEng = new WasmEngine(48000);
+const eqLen = 8192;
+const eqInput = new Float32Array(eqLen);
+const eqAmp = Math.pow(10, -12 / 20);
+for (let n = 0; n < eqLen; n++) {
+  eqInput[n] = eqAmp * Math.sin((n / 48) * 2 * Math.PI);
+}
+const eqWavBytes = makeWav(eqInput);
+const eqSrcId = eqEng.importWav("eq.wav", eqWavBytes, new Date().toISOString());
+eqEng.applyOp(
+  eqSrcId,
+  JSON.stringify({
+    Eq: {
+      range: { start: 0, end: eqLen },
+      params: {
+        bands: [
+          {
+            kind: "Peak",
+            frequency_hz: 1000.0,
+            gain_db: 6.0,
+            q: 1.0,
+            enabled: true,
+          },
+        ],
+      },
+    },
+  }),
+  new Date().toISOString(),
+);
+const eqOut = eqEng.querySamples(eqSrcId, BigInt(eqLen / 2), BigInt(eqLen));
+const rms = (arr) => Math.sqrt(arr.reduce((s, x) => s + x * x, 0) / arr.length);
+const inputTail = eqInput.slice(eqLen / 2);
+const eqGainDb = 20 * Math.log10(rms(eqOut) / rms(inputTail));
+if (Math.abs(eqGainDb - 6.0) > 0.5) {
+  console.error(`FAIL: EQ peak band gain ${eqGainDb.toFixed(2)} dB, expected ~+6`);
+  process.exit(1);
+}
+console.log(`EQ peak band measures ${eqGainDb.toFixed(2)} dB at centre (target +6 dB)`);
+
 console.log("OK");
