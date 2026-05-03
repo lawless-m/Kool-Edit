@@ -15,6 +15,13 @@ default = []
 wasm = ["dep:wasm-bindgen"]
 
 [dependencies]
+hound = "3.5"
 wasm-bindgen = { version = "0.2", optional = true }
 
 [dev-dependencies]
+
+[package.metadata.wasm-pack.profile.release]
+# Disable wasm-opt for now: wasm-pack downloads binaryen on first run, which
+# fails offline / behind firewalls. Build the wasm by hand with `wasm-opt`
+# afterwards if size matters.
+wasm-opt = false

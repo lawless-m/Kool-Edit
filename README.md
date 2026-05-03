@@ -33,6 +33,7 @@ Start with `CONTENTS.md`.
 | Install + build UI bundle  | `make ui`                        |
 | Dev server (engine + UI)   | `make engine && make dev`        |
 | Full production build      | `make build`                     |
+| Smoke-test the wasm bridge | `make smoke-wasm`                |
 | Clean all artifacts        | `make clean`                     |
 
 The dev server sets the COOP/COEP headers required for `SharedArrayBuffer`,
@@ -40,6 +41,15 @@ which the engine ↔ AudioWorklet path will need (see `02-architecture.md`).
 
 ## Status
 
-Scaffold only. The engine exposes a `banner()` function that the UI fetches
-through the worker bridge as a smoke test. No audio processing yet — see the
-design docs for what's coming.
+First vertical slice: a user can pick a WAV file in the browser and the engine
+(Rust → wasm, in a Worker) decodes it, builds a peak cache, and the UI draws
+the waveform on a canvas. Playback isn't wired yet (AudioWorklet + ring
+buffers come next).
+
+Verified:
+- `cargo test` — 44 tests, covers the data model and the WAV/peak/engine
+  modules.
+- `make smoke-wasm` — exercises the wasm-bindgen surface end-to-end from
+  Node: build engine, decode a synthetic WAV, query peaks.
+- `npm run build` — production bundle includes both the JS shim and the
+  emitted `.wasm`.
