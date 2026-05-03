@@ -185,4 +185,43 @@ if (Math.abs(normPeak - 0.5) > 1e-2) {
 }
 console.log(`normalize-peak scales to target (peak ${normPeak.toFixed(3)})`);
 
+// DSL emit: build a fresh project, import a small WAV, apply a couple of
+// ops, then verify the DSL surface contains the expected lines.
+const dslEng = new WasmEngine(96000);
+const dslWav = makeWav(new Float32Array(96000).fill(0.5));
+const dslId = dslEng.importWav("dsl.wav", dslWav, new Date().toISOString());
+dslEng.applyOp(
+  dslId,
+  JSON.stringify({ Silence: { range: { start: 9600, end: 19200 } } }),
+  new Date().toISOString(),
+);
+dslEng.applyOp(
+  dslId,
+  JSON.stringify({
+    Generate: {
+      at: 0,
+      length: 4800,
+      params: { Tone: { shape: "Sine", frequency_hz: 440.0, amplitude_db: -6.0 } },
+    },
+  }),
+  new Date().toISOString(),
+);
+const dsl = dslEng.projectDsl();
+const expected = [
+  "project \"\"",
+  "format_version: 1",
+  "sample_rate: 96_000",
+  `${dslId} "dsl.wav"`,
+  "silence",
+  "kind:tone shape:sine freq:440 amplitude:-6dB",
+];
+for (const needle of expected) {
+  if (!dsl.includes(needle)) {
+    console.error(`FAIL: dsl missing ${JSON.stringify(needle)}`);
+    console.error(dsl);
+    process.exit(1);
+  }
+}
+console.log("DSL emitter produces expected lines");
+
 console.log("OK");

@@ -5,6 +5,7 @@
 //! model from doc 03: sources with edit lists, and the multitrack project
 //! hierarchy. DSP, storage, and serialisation come in later slices.
 
+pub mod dsl;
 pub mod dsp;
 pub mod edit_list;
 pub mod effect;
@@ -167,6 +168,15 @@ mod wasm_api {
             self.inner
                 .project()
                 .to_json()
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Render the project as DSL text per `04-dsl-grammar.md`. Returns
+        /// an error for projects that use features the emitter doesn't yet
+        /// cover (effect param blocks, clipboard ops, spectral edits, etc.).
+        #[wasm_bindgen(js_name = projectDsl)]
+        pub fn project_dsl(&self) -> Result<String, JsError> {
+            crate::dsl::project_to_dsl(self.inner.project())
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
