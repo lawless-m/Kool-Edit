@@ -5,6 +5,7 @@
 //! model from doc 03: sources with edit lists, and the multitrack project
 //! hierarchy. DSP, storage, and serialisation come in later slices.
 
+pub mod dsp;
 pub mod edit_list;
 pub mod effect;
 pub mod engine;
@@ -38,6 +39,9 @@ mod wasm_api {
 
     use crate::engine::Engine;
     use crate::ids::SourceId;
+    use crate::op::Op;
+    use crate::project::Project;
+    use crate::range::SampleRange;
     use crate::source::Timestamp;
 
     #[wasm_bindgen]
@@ -100,6 +104,77 @@ mod wasm_api {
         #[wasm_bindgen(js_name = sourceFrameCount)]
         pub fn source_frame_count(&self, source_id: &str) -> Option<u64> {
             self.inner.source_frame_count(&SourceId::new(source_id))
+        }
+
+        /// Apply a destructive op to a source. The op is passed as JSON to
+        /// keep the bridge surface small; `op_json` matches the same shape
+        /// produced by `Project::to_json`.
+        #[wasm_bindgen(js_name = applyOp)]
+        pub fn apply_op(
+            &mut self,
+            source_id: &str,
+            op_json: &str,
+            now_iso8601: &str,
+        ) -> Result<(), JsError> {
+            let op: Op = serde_json::from_str(op_json)
+                .map_err(|e| JsError::new(&format!("op parse: {e}")))?;
+            self.inner
+                .apply_op(&SourceId::new(source_id), op, Timestamp(now_iso8601.into()))
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        #[wasm_bindgen(js_name = undo)]
+        pub fn undo(&mut self, source_id: &str) -> Result<bool, JsError> {
+            self.inner
+                .undo(&SourceId::new(source_id))
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        #[wasm_bindgen(js_name = redo)]
+        pub fn redo(&mut self, source_id: &str) -> Result<bool, JsError> {
+            self.inner
+                .redo(&SourceId::new(source_id))
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Render samples for the given frame range, replaying the active
+        /// edit list. Returned as a flat Float32Array of interleaved samples.
+        #[wasm_bindgen(js_name = querySamples)]
+        pub fn query_samples(
+            &self,
+            source_id: &str,
+            start_frame: u64,
+            end_frame: u64,
+        ) -> Result<Box<[f32]>, JsError> {
+            let range = SampleRange::new(start_frame, end_frame)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let samples = self
+                .inner
+                .query_samples(&SourceId::new(source_id), range)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            Ok(samples.into_boxed_slice())
+        }
+
+        #[wasm_bindgen(js_name = flatten)]
+        pub fn flatten(&mut self, source_id: &str, now_iso8601: &str) -> Result<(), JsError> {
+            self.inner
+                .flatten(&SourceId::new(source_id), Timestamp(now_iso8601.into()))
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        #[wasm_bindgen(js_name = projectJson)]
+        pub fn project_json(&self) -> Result<String, JsError> {
+            self.inner
+                .project()
+                .to_json()
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        #[wasm_bindgen(js_name = loadProjectJson)]
+        pub fn load_project_json(&mut self, json: &str) -> Result<(), JsError> {
+            let project = Project::from_json(json).map_err(|e| JsError::new(&e.to_string()))?;
+            self.inner.replace_project(project);
+            Ok(())
         }
     }
 }

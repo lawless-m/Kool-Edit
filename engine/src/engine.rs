@@ -10,7 +10,9 @@ use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
 
+use crate::dsp::{self, DspError};
 use crate::ids::SourceId;
+use crate::op::Op;
 use crate::peaks::{DEFAULT_DECIMATION, MinMax, PeakCache};
 use crate::project::Project;
 use crate::range::SampleRange;
@@ -51,6 +53,7 @@ impl From<StorageError> for ImportError {
 pub enum QueryError {
     UnknownSource(SourceId),
     Storage(StorageError),
+    Dsp(DspError),
 }
 
 impl std::fmt::Display for QueryError {
@@ -58,6 +61,7 @@ impl std::fmt::Display for QueryError {
         match self {
             Self::UnknownSource(id) => write!(f, "unknown source: {id}"),
             Self::Storage(e) => write!(f, "{e}"),
+            Self::Dsp(e) => write!(f, "{e}"),
         }
     }
 }
@@ -67,6 +71,12 @@ impl std::error::Error for QueryError {}
 impl From<StorageError> for QueryError {
     fn from(e: StorageError) -> Self {
         Self::Storage(e)
+    }
+}
+
+impl From<DspError> for QueryError {
+    fn from(e: DspError) -> Self {
+        Self::Dsp(e)
     }
 }
 
@@ -94,6 +104,14 @@ impl Engine {
 
     pub fn project(&self) -> &Project {
         &self.project
+    }
+
+    /// Replace the in-memory project, e.g. after loading from JSON. The
+    /// caller is responsible for ensuring the storage backend already
+    /// contains every base file the new project references.
+    pub fn replace_project(&mut self, project: Project) {
+        self.project = project;
+        self.peaks.clear();
     }
 
     /// Decode WAV `bytes`, write samples to storage, register a source, and
@@ -155,6 +173,90 @@ impl Engine {
     /// Renderer-friendly: one pair per pixel column.
     pub fn peak_summary(&self, id: &SourceId, columns: usize) -> Option<Vec<MinMax>> {
         self.peaks.get(id).map(|c| c.summarize(columns))
+    }
+
+    /// Append an op to the source's edit list. Truncates any redo branch.
+    pub fn apply_op(&mut self, id: &SourceId, op: Op, now: Timestamp) -> Result<(), QueryError> {
+        let source = self
+            .project
+            .sources
+            .get_mut(id)
+            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+        source.apply(op, now);
+        Ok(())
+    }
+
+    pub fn undo(&mut self, id: &SourceId) -> Result<bool, QueryError> {
+        let source = self
+            .project
+            .sources
+            .get_mut(id)
+            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+        Ok(source.edits.undo().is_some())
+    }
+
+    pub fn redo(&mut self, id: &SourceId) -> Result<bool, QueryError> {
+        let source = self
+            .project
+            .sources
+            .get_mut(id)
+            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+        Ok(source.edits.redo().is_some())
+    }
+
+    /// Read base samples and replay every active op in `range`'s source's
+    /// edit list. The current implementation renders the whole source and
+    /// then slices; once Cut/Insert land it'll need to walk ops in order to
+    /// keep range arithmetic correct anyway, so this is a fine starting
+    /// point.
+    pub fn query_samples(
+        &self,
+        id: &SourceId,
+        range: SampleRange,
+    ) -> Result<Vec<f32>, QueryError> {
+        let source = self
+            .project
+            .sources
+            .get(id)
+            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+        let full = SampleRange::new(0, source.base_length).expect("base_length valid range");
+        let mut buf = self.read_base_samples(id, full)?;
+        for op in source.edits.active() {
+            dsp::apply(op, &mut buf, source.channel_count)?;
+        }
+        let ch = source.channel_count as u64;
+        let start = (range.start() * ch) as usize;
+        let end = (range.end() * ch) as usize;
+        Ok(buf[start.min(buf.len())..end.min(buf.len())].to_vec())
+    }
+
+    /// Doc 03 §Flattening: render the current state to a new base file and
+    /// clear the edit list. Regenerates the peak cache from the freshly
+    /// rendered samples.
+    pub fn flatten(&mut self, id: &SourceId, now: Timestamp) -> Result<(), QueryError> {
+        let (path, base_length, channel_count) = {
+            let source = self
+                .project
+                .sources
+                .get(id)
+                .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+            (
+                source.base_file.as_str().to_owned(),
+                source.base_length,
+                source.channel_count,
+            )
+        };
+        let full = SampleRange::new(0, base_length).expect("base_length valid range");
+        let rendered = self.query_samples(id, full)?;
+        self.storage.write_all(&path, &rendered)?;
+
+        let new_peaks = PeakCache::from_samples(&rendered, channel_count, DEFAULT_DECIMATION);
+        self.peaks.insert(id.clone(), new_peaks);
+
+        let source = self.project.sources.get_mut(id).expect("checked above");
+        source.edits.truncate_history();
+        source.modified_at = now;
+        Ok(())
     }
 }
 
@@ -291,6 +393,152 @@ mod tests {
             .unwrap();
         assert_eq!(read.len(), 4);
         assert!((read[2] - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn query_samples_with_no_ops_matches_base() {
+        let bytes = synth_mono_wav(&[0.1, 0.2, 0.3, 0.4, 0.5], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        let q = engine
+            .query_samples(&id, SampleRange::new(1, 4).unwrap())
+            .unwrap();
+        assert_eq!(q.len(), 3);
+        assert!((q[0] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn query_samples_replays_silence_op() {
+        let bytes = synth_mono_wav(&[0.5, 0.5, 0.5, 0.5, 0.5], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Silence {
+                    range: SampleRange::new(1, 4).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        let q = engine
+            .query_samples(&id, SampleRange::new(0, 5).unwrap())
+            .unwrap();
+        assert_eq!(q, vec![0.5, 0.0, 0.0, 0.0, 0.5]);
+    }
+
+    #[test]
+    fn query_samples_chains_ops_in_order() {
+        // gain -6dB then silence the middle: middle should still be zero, edges
+        // should be halved (within tolerance).
+        let bytes = synth_mono_wav(&[1.0, 1.0, 1.0, 1.0, 1.0], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Gain {
+                    range: SampleRange::new(0, 5).unwrap(),
+                    db: -6.0206,
+                },
+                now(),
+            )
+            .unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Silence {
+                    range: SampleRange::new(1, 4).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        let q = engine
+            .query_samples(&id, SampleRange::new(0, 5).unwrap())
+            .unwrap();
+        assert!((q[0] - 0.5).abs() < 1e-3);
+        assert_eq!(q[1], 0.0);
+        assert_eq!(q[3], 0.0);
+        assert!((q[4] - 0.5).abs() < 1e-3);
+    }
+
+    #[test]
+    fn undo_then_query_returns_pre_op_samples() {
+        let bytes = synth_mono_wav(&[0.5; 4], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Silence {
+                    range: SampleRange::new(0, 4).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .query_samples(&id, SampleRange::new(0, 4).unwrap())
+                .unwrap(),
+            vec![0.0; 4]
+        );
+        assert!(engine.undo(&id).unwrap());
+        let q = engine
+            .query_samples(&id, SampleRange::new(0, 4).unwrap())
+            .unwrap();
+        for s in &q {
+            assert!((s - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn flatten_clears_edit_list_and_writes_new_base() {
+        let bytes = synth_mono_wav(&[1.0, 1.0, 1.0, 1.0], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Silence {
+                    range: SampleRange::new(0, 2).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        engine.flatten(&id, now()).unwrap();
+
+        let source = engine.project().sources.get(&id).unwrap();
+        assert_eq!(source.edits.len(), 0);
+        assert!(!source.edits.can_undo());
+
+        // Reading the base directly should now reflect the silenced range.
+        let base = engine
+            .read_base_samples(&id, SampleRange::new(0, 4).unwrap())
+            .unwrap();
+        assert_eq!(base, vec![0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn flatten_regenerates_peak_cache() {
+        let bytes = synth_mono_wav(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        engine
+            .apply_op(
+                &id,
+                Op::Silence {
+                    range: SampleRange::new(0, 8).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        engine.flatten(&id, now()).unwrap();
+
+        let summary = engine.peak_summary(&id, 4).unwrap();
+        for p in summary {
+            assert_eq!(p.min, 0.0);
+            assert_eq!(p.max, 0.0);
+        }
     }
 
     #[test]

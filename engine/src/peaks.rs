@@ -56,8 +56,15 @@ pub const DEFAULT_DECIMATION: u32 = 64;
 
 impl PeakCache {
     pub fn from_decoded(decoded: &DecodedWav, samples_per_pair: u32) -> Self {
+        Self::from_samples(&decoded.samples, decoded.channel_count, samples_per_pair)
+    }
+
+    /// Build a peak cache directly from interleaved samples. Used after
+    /// flatten, when the engine has rendered a new base buffer and needs
+    /// peaks regenerated.
+    pub fn from_samples(interleaved: &[f32], channels: u16, samples_per_pair: u32) -> Self {
         assert!(samples_per_pair > 0);
-        let mono = mono_sum(&decoded.samples, decoded.channel_count);
+        let mono = mono_sum(interleaved, channels);
         let pairs = build_pairs(&mono, samples_per_pair as usize);
         Self {
             samples_per_pair,

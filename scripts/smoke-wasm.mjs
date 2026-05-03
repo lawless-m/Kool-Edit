@@ -79,4 +79,49 @@ if (Math.abs(max - 1) > 0.05 || Math.abs(min + 1) > 0.05) {
   console.error("FAIL: peaks did not span [-1, 1]");
   process.exit(1);
 }
+
+// Apply a destructive silence on the middle half, then query and check.
+const silenceOp = JSON.stringify({
+  Silence: { range: { start: 512, end: 1536 } },
+});
+eng.applyOp(id, silenceOp, new Date().toISOString());
+const middle = eng.querySamples(id, 800n, 1200n);
+const middleMax = Math.max(...middle.map(Math.abs));
+if (middleMax !== 0) {
+  console.error(`FAIL: silenced range still has signal (max abs ${middleMax})`);
+  process.exit(1);
+}
+console.log("apply_op + query_samples: silenced range is zero");
+
+// Undo restores the original middle.
+eng.undo(id);
+const middleAfterUndo = eng.querySamples(id, 800n, 1200n);
+const undoMax = Math.max(...middleAfterUndo.map(Math.abs));
+if (undoMax < 0.5) {
+  console.error(`FAIL: undo did not restore signal (max abs ${undoMax})`);
+  process.exit(1);
+}
+console.log("undo restores pre-op samples");
+
+// Flatten then verify edit list is empty in the saved project JSON.
+eng.applyOp(id, silenceOp, new Date().toISOString());
+eng.flatten(id, new Date().toISOString());
+const json = JSON.parse(eng.projectJson());
+const editList = json.sources[id].edits.ops ?? [];
+if (editList.length !== 0) {
+  console.error(`FAIL: flatten left ${editList.length} ops in the journal`);
+  process.exit(1);
+}
+console.log("flatten clears the edit journal");
+
+// Reload the same JSON into a fresh engine and verify the source comes back.
+const eng2 = new WasmEngine(96000);
+eng2.loadProjectJson(eng.projectJson());
+const reload = JSON.parse(eng2.projectJson());
+if (!reload.sources[id]) {
+  console.error("FAIL: reloaded project missing source");
+  process.exit(1);
+}
+console.log("project json round-trip preserves sources");
+
 console.log("OK");
