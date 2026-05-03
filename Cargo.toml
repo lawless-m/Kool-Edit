@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["engine"]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/lawless-m/Kool-Edit"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1

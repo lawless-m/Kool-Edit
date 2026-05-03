@@ -1,0 +1,32 @@
+[package]
+name = "kool-edit-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Kool-Edit audio engine: project state, edit list, DSP. Compiles to native (tests) and Wasm (browser)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+# Enable when building for the browser. Pulls in wasm-bindgen and exposes a JS-callable surface.
+wasm = ["dep:wasm-bindgen"]
+
+[dependencies]
+hound = "3.5"
+rustfft = "6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = { version = "0.2", optional = true }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.wasm-pack.profile.release]
+# Disable wasm-opt for now: wasm-pack downloads binaryen on first run, which
+# fails offline / behind firewalls. Build the wasm by hand with `wasm-opt`
+# afterwards if size matters.
+wasm-opt = false
