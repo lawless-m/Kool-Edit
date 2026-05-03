@@ -8,9 +8,12 @@
 
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 macro_rules! string_id {
     ($name:ident, $prefix:literal) => {
-        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+        #[derive(Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize)]
+        #[serde(transparent)]
         pub struct $name(String);
 
         impl $name {
@@ -36,7 +39,10 @@ macro_rules! string_id {
 
 macro_rules! numeric_id {
     ($name:ident, $prefix:literal) => {
-        #[derive(Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+        #[derive(
+            Copy, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Debug, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
         pub struct $name(pub u64);
 
         impl $name {

@@ -2,10 +2,35 @@
 
 use std::fmt;
 
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(try_from = "SampleRangeRaw", into = "SampleRangeRaw")]
 pub struct SampleRange {
     start: u64,
     end: u64,
+}
+
+#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+struct SampleRangeRaw {
+    start: u64,
+    end: u64,
+}
+
+impl TryFrom<SampleRangeRaw> for SampleRange {
+    type Error = RangeError;
+    fn try_from(raw: SampleRangeRaw) -> Result<Self, Self::Error> {
+        SampleRange::new(raw.start, raw.end)
+    }
+}
+
+impl From<SampleRange> for SampleRangeRaw {
+    fn from(r: SampleRange) -> Self {
+        Self {
+            start: r.start,
+            end: r.end,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]

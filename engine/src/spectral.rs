@@ -2,16 +2,18 @@
 //! bake on apply (no re-editable spectral layer in v1), so these types are
 //! purely the description of an edit applied to STFT bins.
 
+use serde::{Deserialize, Serialize};
+
 use crate::range::SampleRange;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WindowKind {
     Hann,
     Hamming,
     Blackman,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StftParams {
     pub fft_size: u32,
     pub hop_size: u32,
@@ -30,7 +32,7 @@ impl StftParams {
 /// Time-frequency selection. Time is in sample frames; frequency in hertz.
 /// Lasso and wand selections aren't yet expressible — only rectangular for now;
 /// the doc 03 type is intentionally extensible so the variant will grow.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum TimeFreqRegion {
     Rect {
         time: SampleRange,
@@ -39,7 +41,7 @@ pub enum TimeFreqRegion {
     },
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum SpectralOp {
     Attenuate { db: f32 },
     Amplify { db: f32 },

@@ -4,6 +4,8 @@
 //! Operations are pure data: they describe an edit, they don't perform it.
 //! The DSP module turns an `Op` into samples; the engine core just stores them.
 
+use serde::{Deserialize, Serialize};
+
 use crate::effect::{
     CompParams, DelayParams, EqParams, LimitParams, NrParams, ReverbParams,
 };
@@ -11,7 +13,7 @@ use crate::ids::{ClipboardRef, ProfileId};
 use crate::range::SampleRange;
 use crate::spectral::{SpectralOp, StftParams, TimeFreqRegion};
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FadeShape {
     Linear,
     Logarithmic,
@@ -19,27 +21,27 @@ pub enum FadeShape {
     SCurve,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum FadeDirection {
     In,
     Out,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NormTarget {
     Peak,
     Rms,
     LufsIntegrated,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum NoiseColor {
     White,
     Pink,
     Brown,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ToneShape {
     Sine,
     Square,
@@ -47,7 +49,7 @@ pub enum ToneShape {
     Triangle,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GeneratorParams {
     Silence,
     Tone {
@@ -69,7 +71,7 @@ pub enum GeneratorParams {
     },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Op {
     Silence {
         range: SampleRange,

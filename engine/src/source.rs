@@ -4,6 +4,8 @@
 //! are referenced by `base_file`. The actual reads happen via the storage
 //! layer; this struct only owns the descriptor and the operation journal.
 
+use serde::{Deserialize, Serialize};
+
 use crate::edit_list::EditList;
 use crate::ids::SourceId;
 use crate::op::Op;
@@ -11,7 +13,8 @@ use crate::op::Op;
 /// Path to a chunk of audio in the storage layer (OPFS or native filesystem).
 /// Stored as a string so it round-trips through the JSON project file
 /// unchanged (per `03-data-model.md` §Persistence).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct StoragePath(pub String);
 
 impl StoragePath {
@@ -26,10 +29,11 @@ impl StoragePath {
 
 /// Wall-clock timestamp (RFC 3339 string for now). Will likely become a typed
 /// instant once the persistence layer lands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct Timestamp(pub String);
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Source {
     pub id: SourceId,
     pub name: String,

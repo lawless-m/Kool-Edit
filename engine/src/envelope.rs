@@ -6,7 +6,9 @@
 
 use std::fmt;
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum CurveKind {
     Linear,
     Exponential,
@@ -15,7 +17,7 @@ pub enum CurveKind {
     SCurve,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Breakpoint {
     pub time: u64,
     pub value: f32,
@@ -40,9 +42,23 @@ impl fmt::Display for BreakpointError {
 
 impl std::error::Error for BreakpointError {}
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(try_from = "Vec<Breakpoint>", into = "Vec<Breakpoint>")]
 pub struct BreakpointSeq {
     points: Vec<Breakpoint>,
+}
+
+impl TryFrom<Vec<Breakpoint>> for BreakpointSeq {
+    type Error = BreakpointError;
+    fn try_from(points: Vec<Breakpoint>) -> Result<Self, Self::Error> {
+        Self::new(points)
+    }
+}
+
+impl From<BreakpointSeq> for Vec<Breakpoint> {
+    fn from(seq: BreakpointSeq) -> Self {
+        seq.points
+    }
 }
 
 impl BreakpointSeq {
@@ -91,13 +107,13 @@ impl BreakpointSeq {
     }
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EnvelopeParam {
     Volume,
     Pan,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipEnvelope {
     pub parameter: EnvelopeParam,
     pub breakpoints: BreakpointSeq,
@@ -106,7 +122,7 @@ pub struct ClipEnvelope {
 /// Dotted path identifying which parameter an automation lane drives, e.g.
 /// `"track.gain"`, `"insert.1.threshold"`. Free-form for now; the DSL parser
 /// will validate against the actual parameter graph when it lands.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ParamPath(pub String);
 
 impl ParamPath {
@@ -119,7 +135,7 @@ impl ParamPath {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct AutomationLane {
     pub parameter: ParamPath,
     pub breakpoints: BreakpointSeq,

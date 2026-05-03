@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::fmt;
 
+use serde::{Deserialize, Serialize};
+
 use crate::effect::EffectKind;
 use crate::envelope::{AutomationLane, ClipEnvelope};
 use crate::ids::{ClipId, EffectInstanceId, GroupId, ProfileId, SourceId, TrackId};
@@ -19,28 +21,28 @@ use crate::source::Source;
 /// Default project sample rate per `01-feature-spec.md`.
 pub const DEFAULT_SAMPLE_RATE: u32 = 96_000;
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ProjectMetadata {
     pub name: String,
     pub created_at: Option<String>,
     pub modified_at: Option<String>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct TransportState {
     pub playhead: u64,
     pub looping: bool,
     pub loop_range: Option<SampleRange>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq, Default)]
+#[derive(Copy, Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub enum ActiveView {
     #[default]
     Waveform,
     Spectral,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ViewState {
     pub zoom: f32,
     pub scroll_samples: u64,
@@ -57,13 +59,13 @@ impl Default for ViewState {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Marker {
     pub name: String,
     pub time: u64,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NoiseProfile {
     pub id: ProfileId,
     pub name: String,
@@ -72,7 +74,7 @@ pub struct NoiseProfile {
     pub magnitudes: Vec<f32>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Fade {
     pub duration_samples: u64,
     pub shape: FadeShape,
@@ -87,7 +89,7 @@ impl Fade {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EffectInstance {
     pub id: EffectInstanceId,
     pub kind: EffectKind,
@@ -95,7 +97,7 @@ pub struct EffectInstance {
     pub params: BTreeMap<String, f32>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Clip {
     pub id: ClipId,
     pub source_id: SourceId,
@@ -114,7 +116,7 @@ pub struct Clip {
     pub group: Option<GroupId>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Track {
     pub id: TrackId,
     pub name: String,
@@ -129,7 +131,7 @@ pub struct Track {
     pub clips: Vec<Clip>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MasterBus {
     pub gain_db: f32,
     pub inserts: Vec<EffectInstance>,
@@ -144,7 +146,7 @@ impl Default for MasterBus {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     /// JSON `format_version`. Pinned at construction; migration runs at load.
     pub format_version: u32,
@@ -179,6 +181,34 @@ impl Project {
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Pretty-print the project as JSON. Doc 03 §Persistence: the JSON is the
+    /// canonical form; sample data lives in the storage layer and is
+    /// referenced by path.
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// Parse a JSON project. Rejects unknown `format_version`s before
+    /// attempting full deserialisation, so the user gets a clean message
+    /// rather than an arbitrary serde error.
+    pub fn from_json(s: &str) -> Result<Self, ProjectLoadError> {
+        // Peek at format_version first; deserialising into Value is cheap and
+        // gives us a clean failure mode for old/new files.
+        let head: serde_json::Value =
+            serde_json::from_str(s).map_err(ProjectLoadError::Parse)?;
+        let v = head
+            .get("format_version")
+            .and_then(|v| v.as_u64())
+            .ok_or(ProjectLoadError::MissingFormatVersion)?;
+        if v != crate::FORMAT_VERSION as u64 {
+            return Err(ProjectLoadError::UnsupportedFormatVersion {
+                found: v,
+                supported: crate::FORMAT_VERSION,
+            });
+        }
+        serde_json::from_value(head).map_err(ProjectLoadError::Parse)
     }
 
     /// Find a track by id without exposing internal storage.
@@ -288,6 +318,30 @@ impl Project {
         Ok(())
     }
 }
+
+#[derive(Debug)]
+pub enum ProjectLoadError {
+    Parse(serde_json::Error),
+    MissingFormatVersion,
+    UnsupportedFormatVersion { found: u64, supported: u32 },
+}
+
+impl fmt::Display for ProjectLoadError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(e) => write!(f, "json parse error: {e}"),
+            Self::MissingFormatVersion => {
+                write!(f, "missing `format_version` at the top level")
+            }
+            Self::UnsupportedFormatVersion { found, supported } => write!(
+                f,
+                "unsupported format_version {found} (this build supports {supported})"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ProjectLoadError {}
 
 #[derive(Debug, PartialEq)]
 pub enum ProjectInvariantError {
@@ -537,6 +591,99 @@ mod tests {
             err,
             ProjectInvariantError::ClipReferencesMissingSource { .. }
         ));
+    }
+
+    #[test]
+    fn empty_project_round_trips_through_json() {
+        let p = Project::new(96_000);
+        let s = p.to_json().unwrap();
+        let p2 = Project::from_json(&s).unwrap();
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn populated_project_round_trips_through_json() {
+        use crate::edit_list::EditList;
+        use crate::ids::EffectInstanceId;
+        use crate::op::Op;
+
+        let mut p = Project::new(96_000);
+        p.metadata.name = "Session 1".into();
+        let mut src = fixture_source("src_a", 10_000);
+        src.edits = EditList::new();
+        src.edits.apply(Op::Silence {
+            range: SampleRange::new(100, 200).unwrap(),
+        });
+        src.edits.apply(Op::Gain {
+            range: SampleRange::new(300, 500).unwrap(),
+            db: -3.0,
+        });
+        let src_id = src.id.clone();
+        p.sources.insert(src_id.clone(), src);
+
+        let mut track = fixture_track(TrackId(1), "Vocal");
+        track.inserts.push(EffectInstance {
+            id: EffectInstanceId(1),
+            kind: EffectKind::Eq,
+            bypass: false,
+            params: BTreeMap::new(),
+        });
+        track.clips.push(fixture_clip(ClipId(1), src_id, 1000));
+        p.tracks.push(track);
+        p.markers.push(Marker {
+            name: "Verse 1".into(),
+            time: 0,
+        });
+
+        let s = p.to_json().unwrap();
+        let p2 = Project::from_json(&s).unwrap();
+        assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn rejects_missing_format_version() {
+        let err = Project::from_json("{}").unwrap_err();
+        assert!(matches!(err, ProjectLoadError::MissingFormatVersion));
+    }
+
+    #[test]
+    fn rejects_unsupported_format_version() {
+        let err = Project::from_json(r#"{"format_version": 999}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            ProjectLoadError::UnsupportedFormatVersion { found: 999, supported: 1 }
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_breakpoint_ordering_in_json() {
+        // Embed a clip envelope with out-of-order breakpoints; the BreakpointSeq
+        // try_from validator should reject it during deserialisation.
+        let bad = r#"{
+            "format_version": 1,
+            "metadata": {"name": "", "created_at": null, "modified_at": null},
+            "sample_rate": 96000,
+            "sources": {},
+            "tracks": [{
+                "id": 1, "name": "T", "height": 80.0, "mute": false, "solo": false,
+                "arm": false, "gain_db": 0.0, "pan": 0.0, "inserts": [],
+                "automation": [{
+                    "parameter": "track.gain",
+                    "breakpoints": [
+                        {"time": 100, "value": 0.0, "curve": "Linear"},
+                        {"time": 50,  "value": 0.0, "curve": "Linear"}
+                    ]
+                }],
+                "clips": []
+            }],
+            "master": {"gain_db": 0.0, "inserts": []},
+            "markers": [],
+            "transport": {"playhead": 0, "looping": false, "loop_range": null},
+            "view": {"zoom": 1.0, "scroll_samples": 0, "active_view": "Waveform"},
+            "noise_profiles": {}
+        }"#;
+        let err = Project::from_json(bad).unwrap_err();
+        assert!(matches!(err, ProjectLoadError::Parse(_)));
     }
 
     #[test]

@@ -11,7 +11,9 @@
 //!   for actually rendering samples — this struct just owns the operation
 //!   journal.
 
-#[derive(Clone, Debug)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EditList<Op> {
     ops: Vec<Op>,
     pointer: usize,

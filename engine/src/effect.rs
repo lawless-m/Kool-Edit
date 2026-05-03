@@ -7,7 +7,9 @@
 //! live in a separate module that will be built when audio processing is
 //! wired up; the engine core just owns the data.
 
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+use serde::{Deserialize, Serialize};
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EffectKind {
     Eq,
     Compressor,
@@ -21,7 +23,7 @@ pub enum EffectKind {
     Reverse,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum EqBandKind {
     Highpass,
     Lowpass,
@@ -31,7 +33,7 @@ pub enum EqBandKind {
     Notch,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EqBand {
     pub kind: EqBandKind,
     pub frequency_hz: f32,
@@ -40,12 +42,12 @@ pub struct EqBand {
     pub enabled: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct EqParams {
     pub bands: Vec<EqBand>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CompParams {
     pub threshold_db: f32,
     pub ratio: f32,
@@ -55,21 +57,21 @@ pub struct CompParams {
     pub knee_db: f32,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LimitParams {
     pub ceiling_db: f32,
     pub lookahead_ms: f32,
     pub release_ms: f32,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ReverbModel {
     Room,
     Hall,
     Plate,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ReverbParams {
     pub model: ReverbModel,
     pub size: f32,
@@ -77,7 +79,7 @@ pub struct ReverbParams {
     pub mix: f32,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DelayParams {
     pub time_ms: f32,
     pub feedback: f32,
@@ -86,7 +88,7 @@ pub struct DelayParams {
     pub feedback_lp_hz: Option<f32>,
 }
 
-#[derive(Copy, Clone, Debug, PartialEq)]
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NrParams {
     pub amount_db: f32,
     pub floor_db: f32,
