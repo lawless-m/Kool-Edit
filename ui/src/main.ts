@@ -1,5 +1,19 @@
 import { EngineClient, EngineUnavailable } from "./engine/client";
 import { drawWaveform } from "./waveform";
+import { Playback } from "./audio/playback";
+
+interface Selection {
+  inFrame: number; // source-native frames
+  outFrame: number;
+}
+
+interface Viewport {
+  startFrame: number; // source-native frames, inclusive
+  endFrame: number; // source-native frames, exclusive
+}
+
+const TRIM_NUDGE_MS = 10;
+const MIN_VIEWPORT_FRAMES = 64; // peak cache decimation; finer than this is wasted
 
 async function main(): Promise<void> {
   const root = document.querySelector<HTMLDivElement>("#app");
@@ -17,35 +31,522 @@ async function main(): Promise<void> {
       ui.status.textContent = `boot failed: ${String(e)}`;
     }
     ui.fileInput.disabled = true;
+    ui.playBtn.disabled = true;
+    ui.stopBtn.disabled = true;
     return;
   }
 
   ui.status.textContent = await client.banner();
+  const playback = new Playback(client);
+  let currentSourceId: string | null = null;
+  let sourceFrameCount = 0;
+  let sourceSampleRate = 0;
+  let selection: Selection | null = null;
+  let viewport: Viewport = { startFrame: 0, endFrame: 0 };
+  let playheadRaf: number | null = null;
+  let pendingPeakRequest = 0; // race guard for in-flight peakSummary calls
+
+  // ---- selection helpers ------------------------------------------------
+
+  const formatSeconds = (seconds: number): string => {
+    if (!Number.isFinite(seconds)) return "0.000";
+    return seconds.toFixed(3);
+  };
+
+  const framesToSeconds = (frames: number): number =>
+    sourceSampleRate > 0 ? frames / sourceSampleRate : 0;
+
+  const secondsToFrames = (seconds: number): number =>
+    sourceSampleRate > 0 ? Math.round(seconds * sourceSampleRate) : 0;
+
+  const clampFrame = (f: number): number =>
+    Math.max(0, Math.min(sourceFrameCount, Math.round(f)));
+
+  const setSelection = (s: Selection | null): void => {
+    if (s) {
+      const lo = Math.min(s.inFrame, s.outFrame);
+      const hi = Math.max(s.inFrame, s.outFrame);
+      selection = { inFrame: clampFrame(lo), outFrame: clampFrame(hi) };
+      if (selection.outFrame === selection.inFrame) {
+        // A click without drag — leave the in/out markers coincident; that
+        // means "no usable region" so treat it as cleared.
+        selection = null;
+      }
+    } else {
+      selection = null;
+    }
+    syncSelectionInputs();
+    syncZoomButtons();
+    redrawOverlay();
+  };
+
+  const syncSelectionInputs = (): void => {
+    if (selection) {
+      ui.inInput.value = formatSeconds(framesToSeconds(selection.inFrame));
+      ui.outInput.value = formatSeconds(framesToSeconds(selection.outFrame));
+    } else {
+      ui.inInput.value = "";
+      ui.outInput.value = "";
+    }
+    const trimEnabled = selection !== null;
+    for (const b of [ui.inMinus, ui.inPlus, ui.outMinus, ui.outPlus]) {
+      b.disabled = !trimEnabled;
+    }
+    ui.inInput.disabled = sourceFrameCount === 0;
+    ui.outInput.disabled = sourceFrameCount === 0;
+  };
+
+  const trim = (which: "in" | "out", deltaMs: number): void => {
+    if (!selection) return;
+    const deltaFrames = Math.round((deltaMs / 1000) * sourceSampleRate);
+    const next: Selection =
+      which === "in"
+        ? { inFrame: selection.inFrame + deltaFrames, outFrame: selection.outFrame }
+        : { inFrame: selection.inFrame, outFrame: selection.outFrame + deltaFrames };
+    // Don't let the bounds cross.
+    if (which === "in" && next.inFrame >= next.outFrame) return;
+    if (which === "out" && next.outFrame <= next.inFrame) return;
+    setSelection(next);
+  };
+
+  // ---- viewport / zoom --------------------------------------------------
+
+  const viewportLength = (): number =>
+    Math.max(1, viewport.endFrame - viewport.startFrame);
+
+  const setViewport = (start: number, end: number): void => {
+    if (sourceFrameCount === 0) {
+      viewport = { startFrame: 0, endFrame: 0 };
+      return;
+    }
+    let s = Math.max(0, Math.floor(start));
+    let e = Math.min(sourceFrameCount, Math.ceil(end));
+    if (e - s < MIN_VIEWPORT_FRAMES) {
+      const mid = Math.floor((s + e) / 2);
+      s = Math.max(0, mid - Math.floor(MIN_VIEWPORT_FRAMES / 2));
+      e = Math.min(sourceFrameCount, s + MIN_VIEWPORT_FRAMES);
+    }
+    if (e <= s) {
+      s = 0;
+      e = sourceFrameCount;
+    }
+    viewport = { startFrame: s, endFrame: e };
+    syncScrollbar();
+    redrawOverlay();
+    void redrawWaveform();
+    syncZoomButtons();
+  };
+
+  const zoomBy = (factor: number, pivotFrame: number): void => {
+    const len = viewportLength();
+    const newLen = Math.max(MIN_VIEWPORT_FRAMES, Math.min(sourceFrameCount, len * factor));
+    if (Math.abs(newLen - len) < 1) return;
+    const fracAtPivot = (pivotFrame - viewport.startFrame) / len;
+    const newStart = pivotFrame - fracAtPivot * newLen;
+    setViewport(newStart, newStart + newLen);
+  };
+
+  const zoomFull = (): void => setViewport(0, sourceFrameCount);
+  const zoomToSelection = (): void => {
+    if (!selection) return;
+    setViewport(selection.inFrame, selection.outFrame);
+  };
+
+  const syncZoomButtons = (): void => {
+    const enabled = sourceFrameCount > 0;
+    ui.zoomInBtn.disabled = !enabled || viewportLength() <= MIN_VIEWPORT_FRAMES;
+    ui.zoomOutBtn.disabled = !enabled || viewportLength() >= sourceFrameCount;
+    ui.zoomFullBtn.disabled = !enabled || viewportLength() >= sourceFrameCount;
+    ui.zoomSelBtn.disabled = !enabled || !selection;
+  };
+
+  const syncScrollbar = (): void => {
+    const len = viewportLength();
+    const max = Math.max(0, sourceFrameCount - len);
+    ui.scrollbar.disabled = sourceFrameCount === 0 || max === 0;
+    ui.scrollbar.min = "0";
+    ui.scrollbar.max = String(max);
+    ui.scrollbar.step = String(Math.max(1, Math.floor(len / 100)));
+    ui.scrollbar.value = String(viewport.startFrame);
+  };
+
+  const redrawWaveform = async (): Promise<void> => {
+    if (!currentSourceId || sourceFrameCount === 0) return;
+    const reqId = ++pendingPeakRequest;
+    const peaks = await client.peakSummary(
+      currentSourceId,
+      ui.canvas.width,
+      viewport.startFrame,
+      viewport.endFrame,
+    );
+    // Discard if a newer request superseded this one mid-flight.
+    if (reqId !== pendingPeakRequest) return;
+    drawWaveform(ui.canvas, peaks);
+  };
+
+  // ---- canvas drawing ---------------------------------------------------
+
+  const redrawOverlay = (): void => {
+    const ctx = ui.playhead.getContext("2d");
+    if (!ctx) return;
+    const w = ui.playhead.width;
+    const h = ui.playhead.height;
+    ctx.clearRect(0, 0, w, h);
+    if (sourceFrameCount === 0) return;
+    const vLen = viewportLength();
+
+    if (selection) {
+      // Clip the selection to the viewport in source-frames first, then map.
+      const lo = Math.max(selection.inFrame, viewport.startFrame);
+      const hi = Math.min(selection.outFrame, viewport.endFrame);
+      if (hi > lo) {
+        const x0 = ((lo - viewport.startFrame) / vLen) * w;
+        const x1 = ((hi - viewport.startFrame) / vLen) * w;
+        ctx.fillStyle = "rgba(124, 209, 124, 0.18)";
+        ctx.fillRect(x0, 0, Math.max(1, x1 - x0), h);
+        ctx.fillStyle = "#7cd17c";
+        // Only draw the boundary line if the actual selection edge is in view.
+        if (selection.inFrame >= viewport.startFrame && selection.inFrame <= viewport.endFrame) {
+          ctx.fillRect(Math.floor(x0), 0, 1, h);
+        }
+        if (selection.outFrame >= viewport.startFrame && selection.outFrame <= viewport.endFrame) {
+          ctx.fillRect(Math.max(0, Math.floor(x1) - 1), 0, 1, h);
+        }
+      }
+    }
+
+    const pos = playback.position();
+    if (pos && pos.sourceLength > 0) {
+      // pos.sourceFrame is in source-OUTPUT-frames; convert via the same
+      // ratio the playback used (sourceFrameCount / sourceLength).
+      const sourceFrame = (pos.sourceFrame / pos.sourceLength) * sourceFrameCount;
+      if (sourceFrame >= viewport.startFrame && sourceFrame <= viewport.endFrame) {
+        const x = ((sourceFrame - viewport.startFrame) / vLen) * w;
+        ctx.fillStyle = "#e6e6e6";
+        ctx.fillRect(Math.floor(Math.min(w - 1, x)), 0, 1, h);
+      }
+    }
+  };
+
+  const startPlayheadLoop = (): void => {
+    const tick = (): void => {
+      redrawOverlay();
+      if (playback.isPlaying()) {
+        playheadRaf = requestAnimationFrame(tick);
+      } else {
+        playheadRaf = null;
+      }
+    };
+    if (playheadRaf === null) playheadRaf = requestAnimationFrame(tick);
+  };
+
+  const haltPlayheadLoop = (): void => {
+    if (playheadRaf !== null) cancelAnimationFrame(playheadRaf);
+    playheadRaf = null;
+  };
+
+  const stopPlayheadLoop = (): void => {
+    haltPlayheadLoop();
+    redrawOverlay(); // keep selection visible after playback ends
+  };
+
+  // ---- transport helpers ------------------------------------------------
+
+  const refreshTransport = (canPlay: boolean): void => {
+    const active = playback.isPlaying();
+    const looping = playback.isLooping();
+    const playing = active && !playback.isPaused();
+    ui.playBtn.disabled = !canPlay;
+    ui.loopBtn.disabled = !canPlay;
+    ui.playBtn.textContent = active && !looping && playing ? "Pause" : "Play";
+    ui.loopBtn.textContent = active && looping && playing ? "Pause" : "Loop";
+    ui.stopBtn.disabled = !active;
+  };
+  const setTransportEnabled = (canPlay: boolean): void => refreshTransport(canPlay);
+
+  const togglePauseResume = async (): Promise<void> => {
+    if (playback.isPaused()) {
+      await playback.resume();
+      ui.status.textContent = "playing…";
+      startPlayheadLoop();
+    } else {
+      await playback.pause();
+      ui.status.textContent = "paused";
+      haltPlayheadLoop();
+    }
+    refreshTransport(currentSourceId !== null);
+  };
+
+  const startPlay = async (loop: boolean, fromFrame: number): Promise<void> => {
+    if (!currentSourceId) return;
+    playback.setLoop(loop);
+    setTransportEnabled(false);
+    try {
+      await playback.play(
+        currentSourceId,
+        () => {
+          ui.status.textContent = "playback ended";
+          stopPlayheadLoop();
+          refreshTransport(currentSourceId !== null);
+        },
+        {
+          startSourceFrame: fromFrame,
+          loopStartSourceFrame: selection ? selection.inFrame : 0,
+          loopEndSourceFrame: selection ? selection.outFrame : 0,
+          sourceSampleRate,
+        },
+      );
+      ui.status.textContent = loop ? "looping…" : "playing…";
+      refreshTransport(currentSourceId !== null);
+      startPlayheadLoop();
+    } catch (err) {
+      ui.status.textContent = `playback failed: ${String(err)}`;
+      refreshTransport(currentSourceId !== null);
+    }
+  };
+
+  /** Where Play/Loop should start when no session is active: at the
+   *  selection's in-point if there is one, else 0. While paused/playing,
+   *  callers use the current playhead position. */
+  const idleStartFrameSrc = (): number => (selection ? selection.inFrame : 0);
+
+  /** Apply a just-changed selection to active playback. While actively
+   *  playing (not paused) we restart from the new in-point in the same
+   *  mode so the user hears the change without pressing Stop. */
+  const commitSelectionToPlayback = (): void => {
+    if (!selection) return;
+    if (!playback.isPlaying() || playback.isPaused()) return;
+    void startPlay(playback.isLooping(), selection.inFrame);
+  };
+
+  // Convert playback position (source-output-frames) back to source-frames
+  // for the next play() call after a mode switch.
+  const currentSourceFrame = (): number => {
+    const pos = playback.position();
+    const outSr = playback.outputSampleRate();
+    if (!pos || !outSr || sourceSampleRate === 0) return idleStartFrameSrc();
+    return Math.round((pos.sourceFrame * sourceSampleRate) / outSr);
+  };
+
+  // ---- canvas drag interaction -----------------------------------------
+
+  const clientXToFrame = (clientX: number): number => {
+    const rect = ui.playhead.getBoundingClientRect();
+    const fraction = (clientX - rect.left) / rect.width;
+    return clampFrame(viewport.startFrame + fraction * viewportLength());
+  };
+
+  let dragAnchor: number | null = null;
+  let panAnchor: { clientX: number; startFrame: number } | null = null;
+
+  ui.playhead.addEventListener("mousedown", (ev) => {
+    if (sourceFrameCount === 0) return;
+    if (ev.button === 0) {
+      ev.preventDefault();
+      const frame = clientXToFrame(ev.clientX);
+      dragAnchor = frame;
+      setSelection({ inFrame: frame, outFrame: frame });
+    } else if (ev.button === 1) {
+      // Middle click: pan. Suppress the browser's autoscroll affordance.
+      ev.preventDefault();
+      panAnchor = { clientX: ev.clientX, startFrame: viewport.startFrame };
+      ui.playhead.style.cursor = "grabbing";
+    }
+  });
+  window.addEventListener("mousemove", (ev) => {
+    if (panAnchor !== null) {
+      const rect = ui.playhead.getBoundingClientRect();
+      const deltaPx = ev.clientX - panAnchor.clientX;
+      const len = viewportLength();
+      const deltaFrames = -(deltaPx / rect.width) * len;
+      const newStart = Math.max(
+        0,
+        Math.min(sourceFrameCount - len, Math.round(panAnchor.startFrame + deltaFrames)),
+      );
+      setViewport(newStart, newStart + len);
+      return;
+    }
+    if (dragAnchor === null) return;
+    const frame = clientXToFrame(ev.clientX);
+    setSelection({ inFrame: dragAnchor, outFrame: frame });
+  });
+  window.addEventListener("mouseup", (ev) => {
+    if (panAnchor !== null && (ev.button === 1 || ev.button === undefined)) {
+      panAnchor = null;
+      ui.playhead.style.cursor = "crosshair";
+      return;
+    }
+    const wasDragging = dragAnchor !== null;
+    dragAnchor = null;
+    if (!wasDragging) return;
+    commitSelectionToPlayback();
+  });
+  // Suppress the default middle-click action (page autoscroll) while the
+  // pointer is on the canvas.
+  ui.playhead.addEventListener("auxclick", (ev) => {
+    if (ev.button === 1) ev.preventDefault();
+  });
+
+  // ---- file load -------------------------------------------------------
 
   ui.fileInput.addEventListener("change", async () => {
     const file = ui.fileInput.files?.[0];
     if (!file) return;
+    await playback.stop();
+    stopPlayheadLoop();
+    currentSourceId = null;
+    sourceFrameCount = 0;
+    sourceSampleRate = 0;
+    viewport = { startFrame: 0, endFrame: 0 };
+    setSelection(null);
+    setTransportEnabled(false);
     ui.status.textContent = `decoding ${file.name}…`;
     try {
       const buf = await file.arrayBuffer();
-      const { sourceId, frames } = await client.importWav(
-        file.name,
-        new Uint8Array(buf),
-      );
-      const peaks = await client.peakSummary(sourceId, ui.canvas.width);
-      drawWaveform(ui.canvas, peaks);
-      ui.status.textContent = `${file.name} · ${sourceId} · ${frames.toLocaleString()} frames`;
+      const imp = await client.importWav(file.name, new Uint8Array(buf));
+      currentSourceId = imp.sourceId;
+      sourceFrameCount = imp.frames;
+      sourceSampleRate = imp.sampleRate;
+      viewport = { startFrame: 0, endFrame: imp.frames };
+      ui.status.textContent = `${file.name} · ${imp.sourceId} · ${imp.frames.toLocaleString()} frames @ ${imp.sampleRate} Hz`;
+      syncSelectionInputs();
+      syncScrollbar();
+      syncZoomButtons();
+      setTransportEnabled(true);
+      await redrawWaveform();
+      redrawOverlay();
     } catch (err) {
       ui.status.textContent = `import failed: ${String(err)}`;
     }
   });
+
+  // ---- transport buttons -----------------------------------------------
+
+  ui.playBtn.addEventListener("click", async () => {
+    if (playback.isPlaying()) {
+      if (!playback.isLooping()) {
+        await togglePauseResume();
+        return;
+      }
+      // Active loop session → switch to non-loop, continue from current line.
+      await startPlay(false, currentSourceFrame());
+      return;
+    }
+    await startPlay(false, idleStartFrameSrc());
+  });
+
+  ui.loopBtn.addEventListener("click", async () => {
+    if (playback.isPlaying()) {
+      if (playback.isLooping()) {
+        await togglePauseResume();
+        return;
+      }
+      await startPlay(true, currentSourceFrame());
+      return;
+    }
+    await startPlay(true, idleStartFrameSrc());
+  });
+
+  ui.stopBtn.addEventListener("click", async () => {
+    await playback.stop();
+    stopPlayheadLoop();
+    ui.status.textContent = "stopped";
+    setTransportEnabled(true);
+  });
+
+  // ---- selection inputs / trim buttons ----------------------------------
+
+  const onTimeInputChange = (which: "in" | "out") => (): void => {
+    if (!selection || sourceSampleRate === 0) return;
+    const input = which === "in" ? ui.inInput : ui.outInput;
+    const seconds = parseFloat(input.value);
+    if (!Number.isFinite(seconds)) {
+      syncSelectionInputs();
+      return;
+    }
+    const frame = secondsToFrames(seconds);
+    const next: Selection =
+      which === "in"
+        ? { inFrame: frame, outFrame: selection.outFrame }
+        : { inFrame: selection.inFrame, outFrame: frame };
+    if (which === "in" && next.inFrame >= next.outFrame) {
+      next.inFrame = Math.max(0, next.outFrame - 1);
+    }
+    if (which === "out" && next.outFrame <= next.inFrame) {
+      next.outFrame = Math.min(sourceFrameCount, next.inFrame + 1);
+    }
+    setSelection(next);
+  };
+
+  const wrapCommit = (fn: () => void) => (): void => {
+    fn();
+    commitSelectionToPlayback();
+  };
+  ui.inInput.addEventListener("change", wrapCommit(onTimeInputChange("in")));
+  ui.outInput.addEventListener("change", wrapCommit(onTimeInputChange("out")));
+  ui.inMinus.addEventListener("click", wrapCommit(() => trim("in", -TRIM_NUDGE_MS)));
+  ui.inPlus.addEventListener("click", wrapCommit(() => trim("in", +TRIM_NUDGE_MS)));
+  ui.outMinus.addEventListener("click", wrapCommit(() => trim("out", -TRIM_NUDGE_MS)));
+  ui.outPlus.addEventListener("click", wrapCommit(() => trim("out", +TRIM_NUDGE_MS)));
+
+  // ---- zoom controls ---------------------------------------------------
+
+  ui.zoomInBtn.addEventListener("click", () => {
+    if (sourceFrameCount === 0) return;
+    const mid = (viewport.startFrame + viewport.endFrame) / 2;
+    zoomBy(0.5, mid);
+  });
+  ui.zoomOutBtn.addEventListener("click", () => {
+    if (sourceFrameCount === 0) return;
+    const mid = (viewport.startFrame + viewport.endFrame) / 2;
+    zoomBy(2, mid);
+  });
+  ui.zoomFullBtn.addEventListener("click", () => zoomFull());
+  ui.zoomSelBtn.addEventListener("click", () => zoomToSelection());
+
+  ui.playhead.addEventListener("wheel", (ev) => {
+    if (sourceFrameCount === 0) return;
+    ev.preventDefault();
+    const factor = ev.deltaY > 0 ? 1.25 : 0.8;
+    const pivot = clientXToFrame(ev.clientX);
+    zoomBy(factor, pivot);
+  });
+
+  ui.scrollbar.addEventListener("input", () => {
+    if (sourceFrameCount === 0) return;
+    const start = parseInt(ui.scrollbar.value, 10);
+    if (!Number.isFinite(start)) return;
+    const len = viewportLength();
+    setViewport(start, start + len);
+  });
+
+  syncSelectionInputs();
+  syncZoomButtons();
+  syncScrollbar();
 }
 
-function buildUi(root: HTMLElement): {
+interface UiHandles {
   fileInput: HTMLInputElement;
   canvas: HTMLCanvasElement;
+  playhead: HTMLCanvasElement;
   status: HTMLElement;
-} {
+  playBtn: HTMLButtonElement;
+  stopBtn: HTMLButtonElement;
+  loopBtn: HTMLButtonElement;
+  inInput: HTMLInputElement;
+  outInput: HTMLInputElement;
+  inMinus: HTMLButtonElement;
+  inPlus: HTMLButtonElement;
+  outMinus: HTMLButtonElement;
+  outPlus: HTMLButtonElement;
+  zoomInBtn: HTMLButtonElement;
+  zoomOutBtn: HTMLButtonElement;
+  zoomFullBtn: HTMLButtonElement;
+  zoomSelBtn: HTMLButtonElement;
+  scrollbar: HTMLInputElement;
+}
+
+function buildUi(root: HTMLElement): UiHandles {
   root.innerHTML = "";
   Object.assign(root.style, {
     display: "flex",
@@ -76,16 +577,169 @@ function buildUi(root: HTMLElement): {
   fileRow.appendChild(fileInput);
   root.appendChild(fileRow);
 
+  const transport = document.createElement("div");
+  transport.style.display = "flex";
+  transport.style.gap = "8px";
+  const playBtn = document.createElement("button");
+  playBtn.textContent = "Play";
+  playBtn.disabled = true;
+  const stopBtn = document.createElement("button");
+  stopBtn.textContent = "Stop";
+  stopBtn.disabled = true;
+  const loopBtn = document.createElement("button");
+  loopBtn.textContent = "Loop";
+  loopBtn.disabled = true;
+  loopBtn.type = "button";
+  for (const b of [playBtn, stopBtn, loopBtn]) {
+    Object.assign(b.style, btnStyle());
+  }
+  transport.appendChild(playBtn);
+  transport.appendChild(loopBtn);
+  transport.appendChild(stopBtn);
+  root.appendChild(transport);
+
+  const canvasWrap = document.createElement("div");
+  Object.assign(canvasWrap.style, {
+    position: "relative",
+    width: "100%",
+    height: "200px",
+  } satisfies Partial<CSSStyleDeclaration>);
   const canvas = document.createElement("canvas");
   canvas.width = 1024;
   canvas.height = 200;
   Object.assign(canvas.style, {
+    position: "absolute",
+    inset: "0",
     width: "100%",
-    height: "200px",
+    height: "100%",
     background: "#0c0c0c",
     border: "1px solid #2a2a2a",
+    boxSizing: "border-box",
   } satisfies Partial<CSSStyleDeclaration>);
-  root.appendChild(canvas);
+  const playhead = document.createElement("canvas");
+  playhead.width = 1024;
+  playhead.height = 200;
+  Object.assign(playhead.style, {
+    position: "absolute",
+    inset: "0",
+    width: "100%",
+    height: "100%",
+    cursor: "crosshair",
+  } satisfies Partial<CSSStyleDeclaration>);
+  canvasWrap.appendChild(canvas);
+  canvasWrap.appendChild(playhead);
+  root.appendChild(canvasWrap);
+
+  // Pan scrollbar (visible only when zoomed in — disabled when whole source fits).
+  const scrollbar = document.createElement("input");
+  scrollbar.type = "range";
+  scrollbar.disabled = true;
+  Object.assign(scrollbar.style, {
+    width: "100%",
+    margin: "0",
+  } satisfies Partial<CSSStyleDeclaration>);
+  root.appendChild(scrollbar);
+
+  // Zoom row.
+  const zoomRow = document.createElement("div");
+  Object.assign(zoomRow.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    fontSize: "13px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const zoomLabel = document.createElement("span");
+  zoomLabel.textContent = "Zoom:";
+  const zoomInBtn = document.createElement("button");
+  zoomInBtn.textContent = "In";
+  const zoomOutBtn = document.createElement("button");
+  zoomOutBtn.textContent = "Out";
+  const zoomFullBtn = document.createElement("button");
+  zoomFullBtn.textContent = "Full";
+  const zoomSelBtn = document.createElement("button");
+  zoomSelBtn.textContent = "Selection";
+  for (const b of [zoomInBtn, zoomOutBtn, zoomFullBtn, zoomSelBtn]) {
+    Object.assign(b.style, btnStyle(), {
+      padding: "4px 10px",
+    } satisfies Partial<CSSStyleDeclaration>);
+    b.type = "button";
+    b.disabled = true;
+  }
+  const wheelHint = document.createElement("span");
+  wheelHint.textContent = "(scroll on waveform to zoom around cursor)";
+  wheelHint.style.color = "#9a9a9a";
+  zoomRow.appendChild(zoomLabel);
+  zoomRow.appendChild(zoomInBtn);
+  zoomRow.appendChild(zoomOutBtn);
+  zoomRow.appendChild(zoomFullBtn);
+  zoomRow.appendChild(zoomSelBtn);
+  zoomRow.appendChild(wheelHint);
+  root.appendChild(zoomRow);
+
+  // Selection row.
+  const selRow = document.createElement("div");
+  Object.assign(selRow.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "12px",
+    fontSize: "13px",
+    flexWrap: "wrap",
+  } satisfies Partial<CSSStyleDeclaration>);
+
+  const makeNudgeBtn = (label: string): HTMLButtonElement => {
+    const b = document.createElement("button");
+    b.textContent = label;
+    b.type = "button";
+    b.disabled = true;
+    Object.assign(b.style, btnStyle(), {
+      padding: "4px 8px",
+      minWidth: "32px",
+    } satisfies Partial<CSSStyleDeclaration>);
+    return b;
+  };
+
+  const makeTimeInput = (): HTMLInputElement => {
+    const i = document.createElement("input");
+    i.type = "number";
+    i.step = "0.001";
+    i.min = "0";
+    i.disabled = true;
+    Object.assign(i.style, {
+      width: "100px",
+      padding: "4px 6px",
+      background: "#0c0c0c",
+      color: "#d8d8d8",
+      border: "1px solid #3a3a3a",
+      fontFamily: "ui-monospace, monospace",
+      fontSize: "13px",
+    } satisfies Partial<CSSStyleDeclaration>);
+    return i;
+  };
+
+  const inLabel = document.createElement("span");
+  inLabel.textContent = "In:";
+  const inInput = makeTimeInput();
+  const inMinus = makeNudgeBtn("◀");
+  const inPlus = makeNudgeBtn("▶");
+  const outLabel = document.createElement("span");
+  outLabel.textContent = "Out:";
+  const outInput = makeTimeInput();
+  const outMinus = makeNudgeBtn("◀");
+  const outPlus = makeNudgeBtn("▶");
+  const unitsLabel = document.createElement("span");
+  unitsLabel.textContent = "(seconds, ±10 ms nudge)";
+  unitsLabel.style.color = "#9a9a9a";
+
+  selRow.appendChild(inLabel);
+  selRow.appendChild(inInput);
+  selRow.appendChild(inMinus);
+  selRow.appendChild(inPlus);
+  selRow.appendChild(outLabel);
+  selRow.appendChild(outInput);
+  selRow.appendChild(outMinus);
+  selRow.appendChild(outPlus);
+  selRow.appendChild(unitsLabel);
+  root.appendChild(selRow);
 
   const status = document.createElement("div");
   status.textContent = "booting…";
@@ -94,7 +748,37 @@ function buildUi(root: HTMLElement): {
   status.style.fontFamily = "ui-monospace, monospace";
   root.appendChild(status);
 
-  return { fileInput, canvas, status };
+  return {
+    fileInput,
+    canvas,
+    playhead,
+    status,
+    playBtn,
+    stopBtn,
+    loopBtn,
+    inInput,
+    outInput,
+    inMinus,
+    inPlus,
+    outMinus,
+    outPlus,
+    zoomInBtn,
+    zoomOutBtn,
+    zoomFullBtn,
+    zoomSelBtn,
+    scrollbar,
+  };
+}
+
+function btnStyle(): Partial<CSSStyleDeclaration> {
+  return {
+    padding: "6px 14px",
+    background: "#2a2a2a",
+    color: "#d8d8d8",
+    border: "1px solid #3a3a3a",
+    cursor: "pointer",
+    fontFamily: "inherit",
+  };
 }
 
 main().catch((err) => {

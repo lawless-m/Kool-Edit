@@ -81,15 +81,40 @@ impl PeakCache {
     /// has fewer pairs than requested, the result is padded with zeros so the
     /// caller always gets a fixed-size buffer.
     pub fn summarize(&self, columns: usize) -> Vec<MinMax> {
-        if columns == 0 || self.pairs.is_empty() {
+        let frames = self.frame_count();
+        self.summarize_range(0, frames, columns)
+    }
+
+    /// Range-aware summary: bin the pairs covering `[start_frame, end_frame)`
+    /// into `columns` columns. Used by the zoom renderer. The boundary frames
+    /// are snapped outward to the nearest pair boundary, since the cache's
+    /// resolution is `samples_per_pair`; sub-pair zoom won't reveal new detail.
+    pub fn summarize_range(
+        &self,
+        start_frame: u64,
+        end_frame: u64,
+        columns: usize,
+    ) -> Vec<MinMax> {
+        if columns == 0 || self.pairs.is_empty() || end_frame <= start_frame {
             return vec![MinMax::default(); columns];
         }
+        let spp = self.samples_per_pair as u64;
+        let total_pairs = self.pairs.len();
+        let pair_start = (start_frame / spp) as usize;
+        let pair_end_excl = end_frame.div_ceil(spp) as usize;
+        let pair_start = pair_start.min(total_pairs);
+        let pair_end_excl = pair_end_excl.min(total_pairs).max(pair_start);
+        if pair_start == pair_end_excl {
+            return vec![MinMax::default(); columns];
+        }
+        let span = pair_end_excl - pair_start;
         let mut out = Vec::with_capacity(columns);
-        let total = self.pairs.len();
         for col in 0..columns {
-            let start = col * total / columns;
-            let end = ((col + 1) * total / columns).max(start + 1).min(total);
-            let bucket = &self.pairs[start..end];
+            let s = pair_start + col * span / columns;
+            let e = (pair_start + (col + 1) * span / columns)
+                .max(s + 1)
+                .min(pair_end_excl);
+            let bucket = &self.pairs[s..e];
             let merged = bucket
                 .iter()
                 .copied()

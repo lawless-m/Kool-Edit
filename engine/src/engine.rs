@@ -161,6 +161,14 @@ impl Engine {
         self.project.sources.get(id).map(|s| s.base_length)
     }
 
+    pub fn source_sample_rate(&self, id: &SourceId) -> Option<u32> {
+        self.project.sources.get(id).map(|s| s.sample_rate)
+    }
+
+    pub fn source_channel_count(&self, id: &SourceId) -> Option<u16> {
+        self.project.sources.get(id).map(|s| s.channel_count)
+    }
+
     /// Read interleaved samples for the given frame range from the source's
     /// current base file. This is the "no edits to apply" version of
     /// [`Self::query_samples`]; once DSP lands, query_samples will replay the
@@ -185,6 +193,20 @@ impl Engine {
     /// Renderer-friendly: one pair per pixel column.
     pub fn peak_summary(&self, id: &SourceId, columns: usize) -> Option<Vec<MinMax>> {
         self.peaks.get(id).map(|c| c.summarize(columns))
+    }
+
+    /// Range-aware peak summary: bin the cache covering `[start_frame, end_frame)`
+    /// into `columns` columns. Used by the zoomed waveform renderer.
+    pub fn peak_summary_range(
+        &self,
+        id: &SourceId,
+        start_frame: u64,
+        end_frame: u64,
+        columns: usize,
+    ) -> Option<Vec<MinMax>> {
+        self.peaks
+            .get(id)
+            .map(|c| c.summarize_range(start_frame, end_frame, columns))
     }
 
     /// Append an op to the source's edit list. Truncates any redo branch.

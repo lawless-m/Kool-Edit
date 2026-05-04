@@ -106,9 +106,41 @@ mod wasm_api {
             Some(flat.into_boxed_slice())
         }
 
+        #[wasm_bindgen(js_name = peakSummaryRange)]
+        pub fn peak_summary_range(
+            &self,
+            source_id: &str,
+            start_frame: u64,
+            end_frame: u64,
+            columns: u32,
+        ) -> Option<Box<[f32]>> {
+            let id = SourceId::new(source_id);
+            let pairs = self
+                .inner
+                .peak_summary_range(&id, start_frame, end_frame, columns as usize)?;
+            let mut flat = Vec::with_capacity(pairs.len() * 2);
+            for p in pairs {
+                flat.push(p.min);
+                flat.push(p.max);
+            }
+            Some(flat.into_boxed_slice())
+        }
+
         #[wasm_bindgen(js_name = sourceFrameCount)]
         pub fn source_frame_count(&self, source_id: &str) -> Option<u64> {
             self.inner.source_frame_count(&SourceId::new(source_id))
+        }
+
+        #[wasm_bindgen(js_name = sourceSampleRate)]
+        pub fn source_sample_rate(&self, source_id: &str) -> Option<u32> {
+            self.inner.source_sample_rate(&SourceId::new(source_id))
+        }
+
+        #[wasm_bindgen(js_name = sourceChannelCount)]
+        pub fn source_channel_count(&self, source_id: &str) -> Option<u32> {
+            self.inner
+                .source_channel_count(&SourceId::new(source_id))
+                .map(|c| c as u32)
         }
 
         /// Apply a destructive op to a source. The op is passed as JSON to

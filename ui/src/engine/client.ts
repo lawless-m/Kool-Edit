@@ -1,4 +1,5 @@
 import type { EngineCommand, EngineEvent, RequestId } from "./protocol";
+import type { RingBufferLayout } from "../audio/ring-buffer";
 
 type Pending = (ev: EngineEvent) => void;
 
@@ -61,21 +62,71 @@ export class EngineClient {
   async importWav(
     name: string,
     bytes: Uint8Array,
-  ): Promise<{ sourceId: string; frames: number }> {
+  ): Promise<{
+    sourceId: string;
+    frames: number;
+    sampleRate: number;
+    channelCount: number;
+  }> {
     const nowIso = new Date().toISOString();
     const ev = await this.request<EngineCommand & { kind: "import_wav" }>(
       (req) => ({ kind: "import_wav", req, name, bytes, nowIso }),
     );
     if (ev.kind !== "import_wav_ok") throw new Error("unexpected event");
-    return { sourceId: ev.sourceId, frames: ev.frames };
+    return {
+      sourceId: ev.sourceId,
+      frames: ev.frames,
+      sampleRate: ev.sampleRate,
+      channelCount: ev.channelCount,
+    };
   }
 
-  async peakSummary(sourceId: string, columns: number): Promise<Float32Array> {
+  async peakSummary(
+    sourceId: string,
+    columns: number,
+    startFrame = 0,
+    endFrame = 0,
+  ): Promise<Float32Array> {
     const ev = await this.request<EngineCommand & { kind: "peak_summary" }>(
-      (req) => ({ kind: "peak_summary", req, sourceId, columns }),
+      (req) => ({ kind: "peak_summary", req, sourceId, columns, startFrame, endFrame }),
     );
     if (ev.kind !== "peak_summary_ok") throw new Error("unexpected event");
     return ev.peaks;
+  }
+
+  async startPlayback(
+    sourceId: string,
+    outputSampleRate: number,
+    outputChannels: number,
+    loop: boolean,
+    startFrame: number,
+    loopStartFrame: number,
+    loopEndFrame: number,
+    ring: RingBufferLayout,
+  ): Promise<{ totalOutputFrames: number }> {
+    const ev = await this.request<EngineCommand & { kind: "start_playback" }>(
+      (req) => ({
+        kind: "start_playback",
+        req,
+        sourceId,
+        outputSampleRate,
+        outputChannels,
+        loop,
+        startFrame,
+        loopStartFrame,
+        loopEndFrame,
+        ring,
+      }),
+    );
+    if (ev.kind !== "start_playback_ok") throw new Error("unexpected event");
+    return { totalOutputFrames: ev.totalOutputFrames };
+  }
+
+  async stopPlayback(): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "stop_playback" }>(
+      (req) => ({ kind: "stop_playback", req }),
+    );
+    if (ev.kind !== "stop_playback_ok") throw new Error("unexpected event");
   }
 
   terminate(): void {
