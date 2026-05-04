@@ -3,8 +3,13 @@ import type { EngineCommand, EngineEvent } from "./protocol";
 import {
   attachRingBuffer,
   freeFrames,
+  loopEnd as ringLoopEnd,
+  loopStart as ringLoopStart,
   resetRingBuffer,
+  setLoopRange,
   setProducerEnd,
+  setWorkerNextSourceFrame,
+  writeFrame as ringWriteFrame,
   writeFrames,
   type RingBufferView,
 } from "../audio/ring-buffer";
@@ -29,6 +34,9 @@ type WasmEngine = {
   sourceSampleRate: (sourceId: string) => number | undefined;
   sourceChannelCount: (sourceId: string) => number | undefined;
   querySamples: (sourceId: string, startFrame: bigint, endFrame: bigint) => Float32Array;
+  applyOp: (sourceId: string, opJson: string, nowIso: string) => void;
+  undo: (sourceId: string) => boolean;
+  redo: (sourceId: string) => boolean;
 };
 
 type EngineModule = {
@@ -68,10 +76,11 @@ interface PlaybackState {
   sourceSampleRate: number;
   outputChannels: number; // always 2 for v1
   sourceLength: number; // full source length in output frames
-  sessionStartFrame: number; // source-output-frame where this session began
-  loopStartFrame: number; // loop region in (source-output-frames, inclusive)
-  loopEndFrame: number; // loop region out (source-output-frames, exclusive)
-  framesEmitted: number; // frames pushed since session start
+  // Loop bounds live in the SAB header so the main thread can update them
+  // live. The worker holds nothing about them except what it reads each tick.
+  // workerNextSourceFrame is the source-output-frame the worker will emit
+  // next; we mirror the SAB slot here as a JS-side cursor.
+  workerNextSourceFrame: number;
   loop: boolean;
   ratio: number; // sourceSampleRate / outputSampleRate
   timer: ReturnType<typeof setTimeout> | null;
@@ -163,11 +172,10 @@ let playback: PlaybackState | null = null;
             Math.max(loopStart, Math.floor(cmd.startFrame)),
             Math.max(loopStart, loopEnd - 1),
           );
-          const firstIterFrames = loopEnd - sessionStart;
-          // Non-loop: producer emits firstIterFrames then stops. Loop: producer
-          // never ends; main thread tracks loop bounds separately for the
-          // playhead modulo.
-          if (!cmd.loop) setProducerEnd(ring, firstIterFrames);
+          // Publish the initial loop bounds and worker cursor to the SAB so
+          // the main thread can both observe them and update them live.
+          setLoopRange(ring, loopStart, loopEnd);
+          setWorkerNextSourceFrame(ring, sessionStart);
 
           playback = {
             ring,
@@ -177,10 +185,7 @@ let playback: PlaybackState | null = null;
             sourceSampleRate: sourceSr,
             outputChannels: cmd.outputChannels,
             sourceLength,
-            sessionStartFrame: sessionStart,
-            loopStartFrame: loopStart,
-            loopEndFrame: loopEnd,
-            framesEmitted: 0,
+            workerNextSourceFrame: sessionStart,
             loop: cmd.loop,
             ratio,
             timer: null,
@@ -193,6 +198,24 @@ let playback: PlaybackState | null = null;
         case "stop_playback": {
           stopPlayback();
           send({ kind: "stop_playback_ok", req: cmd.req });
+          return;
+        }
+
+        case "apply_op": {
+          engine.applyOp(cmd.sourceId, cmd.opJson, cmd.nowIso);
+          send({ kind: "apply_op_ok", req: cmd.req });
+          return;
+        }
+
+        case "undo": {
+          const didUndo = engine.undo(cmd.sourceId);
+          send({ kind: "undo_ok", req: cmd.req, didUndo });
+          return;
+        }
+
+        case "redo": {
+          const didRedo = engine.redo(cmd.sourceId);
+          send({ kind: "redo_ok", req: cmd.req, didRedo });
           return;
         }
       }
@@ -225,29 +248,39 @@ function fillTick(): void {
     scheduleFill();
     return;
   }
-  const firstIter = p.loopEndFrame - p.sessionStartFrame;
-  const loopLen = p.loopEndFrame - p.loopStartFrame;
-  if (p.framesEmitted >= firstIter && !p.loop) {
-    // Reached the end of a non-loop session; let the consumer drain.
-    stopPlayback();
+  // Read live loop bounds from the SAB. The main thread updates them on
+  // selection drag/trim/numerical input.
+  const loopStartF = ringLoopStart(p.ring);
+  const loopEndF = ringLoopEnd(p.ring);
+  if (loopEndF <= loopStartF) {
+    // Bounds collapsed (shouldn't happen with main-thread guards, but defend).
+    scheduleFill();
     return;
   }
-  // Map ring-frames-emitted to a source-output-frame and the contiguous run
-  // remaining in this segment (first iteration runs from sessionStart..end;
-  // subsequent loop iterations run from loopStart..end).
-  let sourceOutputFrame: number;
-  let remaining: number;
-  if (p.framesEmitted < firstIter) {
-    sourceOutputFrame = p.sessionStartFrame + p.framesEmitted;
-    remaining = firstIter - p.framesEmitted;
-  } else {
-    sourceOutputFrame = p.loopStartFrame + ((p.framesEmitted - firstIter) % loopLen);
-    remaining = p.loopEndFrame - sourceOutputFrame;
+
+  // If the cursor sits outside the current loop region — either because the
+  // user shrank the bounds past it, or this is a fresh wrap — snap into the
+  // region (or end the session if non-loop).
+  if (p.workerNextSourceFrame >= loopEndF) {
+    if (!p.loop) {
+      // Mark the producer as done at the current ring write head; the
+      // consumer drains and the main thread's end-watcher fires.
+      setProducerEnd(p.ring, ringWriteFrame(p.ring));
+      stopPlayback();
+      return;
+    }
+    p.workerNextSourceFrame = loopStartF;
+  } else if (p.workerNextSourceFrame < loopStartF) {
+    p.workerNextSourceFrame = loopStartF;
   }
+
+  const sourceOutputFrame = p.workerNextSourceFrame;
+  const remaining = loopEndF - sourceOutputFrame;
   const chunkFrames = Math.min(free, remaining, 4096);
   const out = renderChunk(p, sourceOutputFrame, chunkFrames);
   const written = writeFrames(p.ring, out);
-  p.framesEmitted += written;
+  p.workerNextSourceFrame = sourceOutputFrame + written;
+  setWorkerNextSourceFrame(p.ring, p.workerNextSourceFrame);
   scheduleFill();
 }
 

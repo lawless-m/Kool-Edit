@@ -143,6 +143,27 @@ fn mono_sum(interleaved: &[f32], channel_count: u16) -> Vec<f32> {
     mono
 }
 
+/// Bin raw interleaved samples into `columns` min/max pairs after mono-summing.
+/// Used for the zoom path when the requested resolution is finer than the
+/// peak cache's decimation. `samples` is `frames * channels` long.
+pub fn bin_raw_samples(samples: &[f32], channels: u16, columns: usize) -> Vec<MinMax> {
+    if columns == 0 {
+        return Vec::new();
+    }
+    let mono = mono_sum(samples, channels);
+    if mono.is_empty() {
+        return vec![MinMax::default(); columns];
+    }
+    let total = mono.len();
+    let mut out = Vec::with_capacity(columns);
+    for col in 0..columns {
+        let s = col * total / columns;
+        let e = ((col + 1) * total / columns).max(s + 1).min(total);
+        out.push(MinMax::from_slice(&mono[s..e]));
+    }
+    out
+}
+
 fn build_pairs(mono: &[f32], samples_per_pair: usize) -> Vec<MinMax> {
     if mono.is_empty() {
         return Vec::new();

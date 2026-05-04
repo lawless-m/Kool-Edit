@@ -197,6 +197,10 @@ impl Engine {
 
     /// Range-aware peak summary: bin the cache covering `[start_frame, end_frame)`
     /// into `columns` columns. Used by the zoomed waveform renderer.
+    /// When the requested resolution is finer than the cache's decimation
+    /// (i.e. fewer than `samples_per_pair` frames per column), reads raw
+    /// samples for the range and bins them directly so high-zoom views show
+    /// real detail rather than stretched cache pairs.
     pub fn peak_summary_range(
         &self,
         id: &SourceId,
@@ -204,38 +208,96 @@ impl Engine {
         end_frame: u64,
         columns: usize,
     ) -> Option<Vec<MinMax>> {
-        self.peaks
-            .get(id)
-            .map(|c| c.summarize_range(start_frame, end_frame, columns))
+        let cache = self.peaks.get(id)?;
+        if columns == 0 || end_frame <= start_frame {
+            return Some(vec![MinMax::default(); columns]);
+        }
+        let range_frames = end_frame - start_frame;
+        let frames_per_column = range_frames / columns as u64;
+        if frames_per_column >= cache.samples_per_pair as u64 {
+            return Some(cache.summarize_range(start_frame, end_frame, columns));
+        }
+        // Raw-sample path: pull interleaved samples for the range and bin
+        // them. Errors degrade gracefully to a zero summary so the renderer
+        // doesn't blank out.
+        let source = self.project.sources.get(id)?;
+        // Use query_samples so the render reflects the active edit list. For
+        // sources with no edits this is the same as read_base_samples; for
+        // edited sources it includes silence/gain/etc.
+        let effective_len = self.effective_frame_count(id).ok()?;
+        let clamped_end = end_frame.min(effective_len);
+        if clamped_end <= start_frame {
+            return Some(vec![MinMax::default(); columns]);
+        }
+        let range = SampleRange::new(start_frame, clamped_end).ok()?;
+        let samples = self.query_samples(id, range).ok()?;
+        Some(crate::peaks::bin_raw_samples(
+            &samples,
+            source.channel_count,
+            columns,
+        ))
     }
 
     /// Append an op to the source's edit list. Truncates any redo branch.
+    /// Regenerates the peak cache so renderers (which read peaks) reflect
+    /// the post-op state.
     pub fn apply_op(&mut self, id: &SourceId, op: Op, now: Timestamp) -> Result<(), QueryError> {
-        let source = self
-            .project
-            .sources
-            .get_mut(id)
-            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
-        source.apply(op, now);
-        Ok(())
+        {
+            let source = self
+                .project
+                .sources
+                .get_mut(id)
+                .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+            source.apply(op, now);
+        }
+        self.regenerate_peaks(id)
     }
 
     pub fn undo(&mut self, id: &SourceId) -> Result<bool, QueryError> {
-        let source = self
-            .project
-            .sources
-            .get_mut(id)
-            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
-        Ok(source.edits.undo().is_some())
+        let did = {
+            let source = self
+                .project
+                .sources
+                .get_mut(id)
+                .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+            source.edits.undo().is_some()
+        };
+        if did {
+            self.regenerate_peaks(id)?;
+        }
+        Ok(did)
     }
 
     pub fn redo(&mut self, id: &SourceId) -> Result<bool, QueryError> {
-        let source = self
+        let did = {
+            let source = self
+                .project
+                .sources
+                .get_mut(id)
+                .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+            source.edits.redo().is_some()
+        };
+        if did {
+            self.regenerate_peaks(id)?;
+        }
+        Ok(did)
+    }
+
+    /// Render the source's current state and rebuild its peak cache from the
+    /// result. Called after any op or undo/redo so the waveform display
+    /// reflects the active edit list. Cheap on short sources; on long ones
+    /// the cost is one render_full per op.
+    fn regenerate_peaks(&mut self, id: &SourceId) -> Result<(), QueryError> {
+        let rendered = self.render_full(id)?;
+        let channels = self
             .project
             .sources
-            .get_mut(id)
-            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
-        Ok(source.edits.redo().is_some())
+            .get(id)
+            .expect("verified by render_full")
+            .channel_count;
+        let cache = PeakCache::from_samples(&rendered, channels, DEFAULT_DECIMATION);
+        self.peaks.insert(id.clone(), cache);
+        Ok(())
     }
 
     /// Render the source's full effective buffer (base + all active ops),

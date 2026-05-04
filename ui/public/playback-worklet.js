@@ -2,10 +2,14 @@
 // engine Worker. Underruns (producer can't keep up) emit silence.
 //
 // Ring layout must match ring-buffer.ts:
-//   header Int32Array length 4: [writeFrame, readFrame, producerEnd, _]
+//   header Int32Array length 8 (writeFrame, readFrame, producerEnd, _,
+//   loopStart, loopEnd, workerNextSourceFrame, _) — the worklet only needs
+//   writeFrame and readFrame. The other slots coordinate between the engine
+//   Worker and the main thread.
 //   data Float32Array, capacity * channels samples, interleaved.
 
-const HEADER_BYTES = 16;
+const HEADER_BYTES = 32;
+const HEADER_LEN = 8;
 const WRITE_IDX = 0;
 const READ_IDX = 1;
 
@@ -21,7 +25,7 @@ class PlaybackProcessor extends AudioWorkletProcessor {
         this.ring = {
           capacity,
           channels,
-          header: new Int32Array(sab, 0, 4),
+          header: new Int32Array(sab, 0, HEADER_LEN),
           data: new Float32Array(sab, HEADER_BYTES, capacity * channels),
         };
         this.underruns = 0;

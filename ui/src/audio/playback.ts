@@ -5,8 +5,13 @@
 import {
   attachRingBuffer,
   createRingBuffer,
+  loopEnd as ringLoopEnd,
+  loopStart as ringLoopStart,
   producerEnd,
   readFrame as ringReadFrame,
+  setLoopRange,
+  workerNextSourceFrame as ringWorkerNextSourceFrame,
+  writeFrame as ringWriteFrame,
   type RingBufferView,
 } from "./ring-buffer";
 import type { EngineClient } from "../engine/client";
@@ -24,9 +29,6 @@ export class Playback {
   private paused = false;
   private loop = false;
   private sourceLength = 0; // total source length in output frames
-  private sessionStartFrame = 0; // source-output-frame this session began at
-  private loopStartFrame = 0; // active loop region in (source-output-frames)
-  private loopEndFrame = 0; // active loop region out (source-output-frames)
 
   constructor(client: EngineClient) {
     this.client = client;
@@ -57,16 +59,28 @@ export class Playback {
   }
 
   /** Current source-output-frame the consumer is reading, plus the source
-   *  length. Null when no session is active. */
+   *  length. Null when no session is active.
+   *
+   *  Computed by reading the worker's "next frame to emit" cursor from the
+   *  SAB and stepping back by the current buffer fill (= what the consumer
+   *  hasn't drained yet). When that step crosses the loop start it wraps
+   *  back to loopEnd minus the overshoot, so live-trim playhead stays
+   *  approximately right across loop wraps. */
   position(): { sourceFrame: number; sourceLength: number } | null {
     if (!this.ringView || this.sourceLength <= 0) return null;
+    const writeF = ringWriteFrame(this.ringView);
     const readF = ringReadFrame(this.ringView);
-    const firstIter = this.loopEndFrame - this.sessionStartFrame;
-    const loopLen = this.loopEndFrame - this.loopStartFrame;
-    const sourceFrame =
-      readF < firstIter || loopLen <= 0
-        ? this.sessionStartFrame + readF
-        : this.loopStartFrame + ((readF - firstIter) % loopLen);
+    const buffered = Math.max(0, writeF - readF);
+    const workerNext = ringWorkerNextSourceFrame(this.ringView);
+    const ls = ringLoopStart(this.ringView);
+    const le = ringLoopEnd(this.ringView);
+    const loopLen = Math.max(1, le - ls);
+    let sourceFrame = workerNext - buffered;
+    if (sourceFrame < ls) {
+      // Most likely the consumer is still draining audio rendered before the
+      // last loop wrap; map back into the previous iteration.
+      sourceFrame = le - ((ls - sourceFrame) % loopLen);
+    }
     return { sourceFrame, sourceLength: this.sourceLength };
   }
 
@@ -154,12 +168,8 @@ export class Playback {
       ring,
     );
     this.sourceLength = totalOutputFrames;
-    this.loopStartFrame = Math.min(loopStartOut, Math.max(0, totalOutputFrames));
-    this.loopEndFrame = Math.min(loopEndOut, totalOutputFrames);
-    this.sessionStartFrame = Math.min(
-      Math.max(this.loopStartFrame, startOut),
-      Math.max(this.loopStartFrame, this.loopEndFrame - 1),
-    );
+    // Loop bounds and worker cursor live in the SAB now; the worker initialises
+    // them from the start_playback command. Local mirrors are no longer kept.
 
     this.playing = true;
     this.endWatcher = setInterval(() => {
@@ -194,8 +204,21 @@ export class Playback {
     this.playing = false;
     this.paused = false;
     this.sourceLength = 0;
-    this.sessionStartFrame = 0;
-    this.loopStartFrame = 0;
-    this.loopEndFrame = 0;
+  }
+
+  /** Live-update the loop region during an active session. Bounds are
+   *  given in source-native frames (matching how the UI tracks selection)
+   *  and converted to source-output-frames via the AudioContext's SR.
+   *  No-op when nothing is playing. */
+  updateLoopRange(
+    startSourceFrame: number,
+    endSourceFrame: number,
+    sourceSampleRate: number,
+  ): void {
+    if (!this.ringView || !this.audioCtx) return;
+    const ratio = this.audioCtx.sampleRate / sourceSampleRate;
+    const startOut = Math.max(0, Math.floor(startSourceFrame * ratio));
+    const endOut = Math.max(startOut + 1, Math.ceil(endSourceFrame * ratio));
+    setLoopRange(this.ringView, startOut, endOut);
   }
 }

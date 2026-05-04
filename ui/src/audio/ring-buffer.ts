@@ -5,14 +5,27 @@
 // at 48 kHz) would overflow — outside v1's concerns.
 //
 // Layout:
-//   header: Int32Array, 4 entries
+//   header: Int32Array, 8 entries
 //     [0] writeFrame  — atomic, monotonic, advanced by producer
 //     [1] readFrame   — atomic, monotonic, advanced by consumer
 //     [2] producerEndFrame — atomic; 0 means "still producing", otherwise the
 //         total frame count the producer will ever write. Lets the consumer
 //         (and any observer on the main thread) detect end-of-stream.
 //     [3] reserved
+//     [4] loopStartFrame — source-output-frame; the producer reads this each
+//         fill tick, the main thread writes it for live trim.
+//     [5] loopEndFrame — source-output-frame; same. Loop region is half-open
+//         [loopStart, loopEnd). The worker wraps (loop) or ends (non-loop)
+//         when its next emit reaches loopEnd.
+//     [6] workerNextSourceFrame — source-output-frame the producer will emit
+//         next. The main thread reads it and subtracts the current buffer
+//         fill (writeFrame - readFrame) to compute the consumer's playhead.
+//     [7] reserved
 //   data: Float32Array, capacity * channels samples, interleaved.
+//
+// IMPORTANT: the AudioWorklet processor only reads slots [0] and [1], but its
+// data offset must match HEADER_BYTES below. Keep playback-worklet.js's
+// constant in sync.
 
 export interface RingBufferLayout {
   sab: SharedArrayBuffer;
@@ -27,11 +40,14 @@ export interface RingBufferView {
   data: Float32Array;
 }
 
-const HEADER_BYTES = 16;
-const HEADER_LEN = 4;
+const HEADER_BYTES = 32;
+const HEADER_LEN = 8;
 const WRITE_IDX = 0;
 const READ_IDX = 1;
 const END_IDX = 2;
+const LOOP_START_IDX = 4;
+const LOOP_END_IDX = 5;
+const WORKER_NEXT_SRC_IDX = 6;
 
 export function createRingBuffer(capacity: number, channels: number): RingBufferLayout {
   const sab = new SharedArrayBuffer(HEADER_BYTES + capacity * channels * 4);
@@ -120,4 +136,29 @@ export function setProducerEnd(view: RingBufferView, totalFrames: number): void 
 
 export function producerEnd(view: RingBufferView): number {
   return Atomics.load(view.header, END_IDX);
+}
+
+export function setLoopRange(
+  view: RingBufferView,
+  loopStartFrame: number,
+  loopEndFrame: number,
+): void {
+  Atomics.store(view.header, LOOP_START_IDX, Math.max(0, Math.floor(loopStartFrame)));
+  Atomics.store(view.header, LOOP_END_IDX, Math.max(1, Math.floor(loopEndFrame)));
+}
+
+export function loopStart(view: RingBufferView): number {
+  return Atomics.load(view.header, LOOP_START_IDX);
+}
+
+export function loopEnd(view: RingBufferView): number {
+  return Atomics.load(view.header, LOOP_END_IDX);
+}
+
+export function setWorkerNextSourceFrame(view: RingBufferView, frame: number): void {
+  Atomics.store(view.header, WORKER_NEXT_SRC_IDX, Math.max(0, Math.floor(frame)));
+}
+
+export function workerNextSourceFrame(view: RingBufferView): number {
+  return Atomics.load(view.header, WORKER_NEXT_SRC_IDX);
 }

@@ -33,7 +33,16 @@ export type EngineCommand =
       loopEndFrame: number;
       ring: RingBufferLayout;
     }
-  | { kind: "stop_playback"; req: RequestId };
+  | { kind: "stop_playback"; req: RequestId }
+  | {
+      kind: "apply_op";
+      req: RequestId;
+      sourceId: string;
+      opJson: string;
+      nowIso: string;
+    }
+  | { kind: "undo"; req: RequestId; sourceId: string }
+  | { kind: "redo"; req: RequestId; sourceId: string };
 
 export type EngineEvent =
   | { kind: "ready" }
@@ -50,4 +59,7 @@ export type EngineEvent =
   | { kind: "peak_summary_ok"; req: RequestId; peaks: Float32Array }
   | { kind: "start_playback_ok"; req: RequestId; totalOutputFrames: number }
   | { kind: "stop_playback_ok"; req: RequestId }
+  | { kind: "apply_op_ok"; req: RequestId }
+  | { kind: "undo_ok"; req: RequestId; didUndo: boolean }
+  | { kind: "redo_ok"; req: RequestId; didRedo: boolean }
   | { kind: "error"; req: RequestId; reason: string };

@@ -45,6 +45,7 @@ async function main(): Promise<void> {
   let viewport: Viewport = { startFrame: 0, endFrame: 0 };
   let playheadRaf: number | null = null;
   let pendingPeakRequest = 0; // race guard for in-flight peakSummary calls
+  let cachedPeaks: Float32Array | null = null;
 
   // ---- selection helpers ------------------------------------------------
 
@@ -78,6 +79,7 @@ async function main(): Promise<void> {
     syncSelectionInputs();
     syncZoomButtons();
     redrawOverlay();
+    drawCachedWaveform();
   };
 
   const syncSelectionInputs = (): void => {
@@ -94,6 +96,8 @@ async function main(): Promise<void> {
     }
     ui.inInput.disabled = sourceFrameCount === 0;
     ui.outInput.disabled = sourceFrameCount === 0;
+    ui.gainSlider.disabled = !trimEnabled;
+    ui.gainApplyBtn.disabled = !trimEnabled;
   };
 
   const trim = (which: "in" | "out", deltaMs: number): void => {
@@ -181,7 +185,38 @@ async function main(): Promise<void> {
     );
     // Discard if a newer request superseded this one mid-flight.
     if (reqId !== pendingPeakRequest) return;
-    drawWaveform(ui.canvas, peaks);
+    cachedPeaks = peaks;
+    drawCachedWaveform();
+  };
+
+  /** Redraw the waveform with the slider's gain preview overlaid on the
+   *  selection columns. Multiplicative on `cachedPeaks` — what you see is
+   *  what an Apply at the current slider value would give you. */
+  const drawCachedWaveform = (): void => {
+    if (!cachedPeaks) return;
+    const percent = parseFloat(ui.gainSlider.value);
+    const gainLin = Number.isFinite(percent) ? percent / 100 : 1;
+    if (gainLin === 1 || !selection || sourceFrameCount === 0) {
+      drawWaveform(ui.canvas, cachedPeaks);
+      return;
+    }
+    const w = ui.canvas.width;
+    const vLen = Math.max(1, viewport.endFrame - viewport.startFrame);
+    const colFromFrame = (f: number): number =>
+      Math.max(0, Math.min(w, Math.round(((f - viewport.startFrame) / vLen) * w)));
+    const colIn = colFromFrame(selection.inFrame);
+    const colOut = colFromFrame(selection.outFrame);
+    if (colOut <= colIn) {
+      drawWaveform(ui.canvas, cachedPeaks);
+      return;
+    }
+    const previewed = cachedPeaks.slice();
+    for (let col = colIn; col < colOut; col++) {
+      const i = col * 2;
+      previewed[i] = Math.max(-1, Math.min(1, cachedPeaks[i] * gainLin));
+      previewed[i + 1] = Math.max(-1, Math.min(1, cachedPeaks[i + 1] * gainLin));
+    }
+    drawWaveform(ui.canvas, previewed);
   };
 
   // ---- canvas drawing ---------------------------------------------------
@@ -310,13 +345,13 @@ async function main(): Promise<void> {
    *  callers use the current playhead position. */
   const idleStartFrameSrc = (): number => (selection ? selection.inFrame : 0);
 
-  /** Apply a just-changed selection to active playback. While actively
-   *  playing (not paused) we restart from the new in-point in the same
-   *  mode so the user hears the change without pressing Stop. */
+  /** Apply a just-changed selection to active playback. While playing/looping,
+   *  push the new bounds atomically into the SAB so the worker picks them up
+   *  on its next fill tick — no session restart, no audio glitch. */
   const commitSelectionToPlayback = (): void => {
     if (!selection) return;
-    if (!playback.isPlaying() || playback.isPaused()) return;
-    void startPlay(playback.isLooping(), selection.inFrame);
+    if (!playback.isPlaying()) return;
+    playback.updateLoopRange(selection.inFrame, selection.outFrame, sourceSampleRate);
   };
 
   // Convert playback position (source-output-frames) back to source-frames
@@ -398,6 +433,9 @@ async function main(): Promise<void> {
     sourceFrameCount = 0;
     sourceSampleRate = 0;
     viewport = { startFrame: 0, endFrame: 0 };
+    cachedPeaks = null;
+    ui.gainSlider.value = "100";
+    ui.gainLabel.textContent = "100%";
     setSelection(null);
     setTransportEnabled(false);
     ui.status.textContent = `decoding ${file.name}…`;
@@ -413,6 +451,8 @@ async function main(): Promise<void> {
       syncScrollbar();
       syncZoomButtons();
       setTransportEnabled(true);
+      ui.undoBtn.disabled = false;
+      ui.redoBtn.disabled = false;
       await redrawWaveform();
       redrawOverlay();
     } catch (err) {
@@ -520,6 +560,91 @@ async function main(): Promise<void> {
     setViewport(start, start + len);
   });
 
+  // ---- effects --------------------------------------------------------
+
+  /** Convert 0..200% scale to dB. 100% → 0 dB; 0% maps to a deeply
+   *  attenuated value (-120 dB) since true -∞ doesn't serialise cleanly
+   *  and -120 dB is silent for any practical purpose. */
+  const percentToDb = (percent: number): number => {
+    if (percent <= 0) return -120;
+    return 20 * Math.log10(percent / 100);
+  };
+
+  ui.gainSlider.addEventListener("input", () => {
+    ui.gainLabel.textContent = `${ui.gainSlider.value}%`;
+    drawCachedWaveform();
+  });
+
+  const refreshAfterEdit = async (): Promise<void> => {
+    await redrawWaveform();
+    redrawOverlay();
+    if (playback.isPlaying()) {
+      const fromFrame =
+        playback.isPaused() && selection ? selection.inFrame : currentSourceFrame();
+      await startPlay(playback.isLooping(), fromFrame);
+    }
+  };
+
+  ui.undoBtn.addEventListener("click", async () => {
+    if (!currentSourceId) return;
+    ui.undoBtn.disabled = true;
+    try {
+      const did = await client.undo(currentSourceId);
+      ui.status.textContent = did ? "undone" : "nothing to undo";
+      await refreshAfterEdit();
+    } catch (err) {
+      ui.status.textContent = `undo failed: ${String(err)}`;
+    } finally {
+      ui.undoBtn.disabled = currentSourceId === null;
+    }
+  });
+
+  ui.redoBtn.addEventListener("click", async () => {
+    if (!currentSourceId) return;
+    ui.redoBtn.disabled = true;
+    try {
+      const did = await client.redo(currentSourceId);
+      ui.status.textContent = did ? "redone" : "nothing to redo";
+      await refreshAfterEdit();
+    } catch (err) {
+      ui.status.textContent = `redo failed: ${String(err)}`;
+    } finally {
+      ui.redoBtn.disabled = currentSourceId === null;
+    }
+  });
+
+  ui.gainApplyBtn.addEventListener("click", async () => {
+    if (!currentSourceId || !selection) return;
+    const percent = parseFloat(ui.gainSlider.value);
+    if (!Number.isFinite(percent)) return;
+    const db = percentToDb(percent);
+    const opJson = JSON.stringify({
+      Gain: { range: { start: selection.inFrame, end: selection.outFrame }, db },
+    });
+    ui.gainApplyBtn.disabled = true;
+    try {
+      // Each Apply stacks a new Gain op on the edit list — multiple applies
+      // compound multiplicatively. Use Undo to back one off.
+      await client.applyOp(currentSourceId, opJson);
+      ui.gainSlider.value = "100";
+      ui.gainLabel.textContent = "100%";
+      await redrawWaveform();
+      redrawOverlay();
+      // The engine worker cached its rendered samples at start_playback, so a
+      // running session would still hear the original audio. Restart it so
+      // the worker re-fetches the now-edited render.
+      if (playback.isPlaying()) {
+        const fromFrame = playback.isPaused() ? selection.inFrame : currentSourceFrame();
+        await startPlay(playback.isLooping(), fromFrame);
+      }
+      ui.status.textContent = `gain ${percent}% (${db.toFixed(2)} dB) applied`;
+    } catch (err) {
+      ui.status.textContent = `gain failed: ${String(err)}`;
+    } finally {
+      ui.gainApplyBtn.disabled = selection === null;
+    }
+  });
+
   syncSelectionInputs();
   syncZoomButtons();
   syncScrollbar();
@@ -544,6 +669,11 @@ interface UiHandles {
   zoomFullBtn: HTMLButtonElement;
   zoomSelBtn: HTMLButtonElement;
   scrollbar: HTMLInputElement;
+  gainSlider: HTMLInputElement;
+  gainLabel: HTMLElement;
+  gainApplyBtn: HTMLButtonElement;
+  undoBtn: HTMLButtonElement;
+  redoBtn: HTMLButtonElement;
 }
 
 function buildUi(root: HTMLElement): UiHandles {
@@ -676,6 +806,68 @@ function buildUi(root: HTMLElement): UiHandles {
   zoomRow.appendChild(wheelHint);
   root.appendChild(zoomRow);
 
+  // Effects row.
+  const fxRow = document.createElement("div");
+  Object.assign(fxRow.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    fontSize: "13px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const fxLabel = document.createElement("span");
+  fxLabel.textContent = "Amplify:";
+  const gainSlider = document.createElement("input");
+  gainSlider.type = "range";
+  gainSlider.min = "0";
+  gainSlider.max = "200";
+  gainSlider.step = "1";
+  gainSlider.value = "100";
+  gainSlider.disabled = true;
+  Object.assign(gainSlider.style, {
+    flex: "1",
+    maxWidth: "300px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const gainLabel = document.createElement("span");
+  gainLabel.textContent = "100%";
+  Object.assign(gainLabel.style, {
+    fontFamily: "ui-monospace, monospace",
+    minWidth: "70px",
+    textAlign: "right",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const gainApplyBtn = document.createElement("button");
+  gainApplyBtn.textContent = "Apply to selection";
+  gainApplyBtn.type = "button";
+  gainApplyBtn.disabled = true;
+  Object.assign(gainApplyBtn.style, btnStyle(), {
+    padding: "4px 10px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const gainHint = document.createElement("span");
+  gainHint.textContent = "(100% = unchanged · 0% = silent)";
+  gainHint.style.color = "#9a9a9a";
+  const undoBtn = document.createElement("button");
+  undoBtn.textContent = "Undo";
+  undoBtn.type = "button";
+  undoBtn.disabled = true;
+  Object.assign(undoBtn.style, btnStyle(), {
+    padding: "4px 10px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const redoBtn = document.createElement("button");
+  redoBtn.textContent = "Redo";
+  redoBtn.type = "button";
+  redoBtn.disabled = true;
+  Object.assign(redoBtn.style, btnStyle(), {
+    padding: "4px 10px",
+  } satisfies Partial<CSSStyleDeclaration>);
+
+  fxRow.appendChild(fxLabel);
+  fxRow.appendChild(gainSlider);
+  fxRow.appendChild(gainLabel);
+  fxRow.appendChild(gainApplyBtn);
+  fxRow.appendChild(undoBtn);
+  fxRow.appendChild(redoBtn);
+  fxRow.appendChild(gainHint);
+  root.appendChild(fxRow);
+
   // Selection row.
   const selRow = document.createElement("div");
   Object.assign(selRow.style, {
@@ -767,6 +959,11 @@ function buildUi(root: HTMLElement): UiHandles {
     zoomFullBtn,
     zoomSelBtn,
     scrollbar,
+    gainSlider,
+    gainLabel,
+    gainApplyBtn,
+    undoBtn,
+    redoBtn,
   };
 }
 

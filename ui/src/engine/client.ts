@@ -129,6 +129,30 @@ export class EngineClient {
     if (ev.kind !== "stop_playback_ok") throw new Error("unexpected event");
   }
 
+  async applyOp(sourceId: string, opJson: string): Promise<void> {
+    const nowIso = new Date().toISOString();
+    const ev = await this.request<EngineCommand & { kind: "apply_op" }>(
+      (req) => ({ kind: "apply_op", req, sourceId, opJson, nowIso }),
+    );
+    if (ev.kind !== "apply_op_ok") throw new Error("unexpected event");
+  }
+
+  async undo(sourceId: string): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "undo" }>(
+      (req) => ({ kind: "undo", req, sourceId }),
+    );
+    if (ev.kind !== "undo_ok") throw new Error("unexpected event");
+    return ev.didUndo;
+  }
+
+  async redo(sourceId: string): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "redo" }>(
+      (req) => ({ kind: "redo", req, sourceId }),
+    );
+    if (ev.kind !== "redo_ok") throw new Error("unexpected event");
+    return ev.didRedo;
+  }
+
   terminate(): void {
     this.worker.terminate();
     this.pending.clear();
