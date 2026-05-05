@@ -13,6 +13,8 @@
 
 use std::f32::consts::PI;
 
+use rustfft::{FftPlanner, num_complex::Complex};
+
 use crate::effect::{
     AutotuneParams, AutotuneScale, AutotuneTarget, CompParams, DelayParams, EqBand, EqBandKind,
     EqParams, LimitParams, ReverbModel, ReverbParams,
@@ -21,6 +23,7 @@ use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
 use crate::range::SampleRange;
+use crate::stft::Stft;
 
 #[derive(Debug)]
 pub enum DspError {
@@ -74,6 +77,7 @@ pub fn apply(
         Op::Reverse { range } => reverse(buffer, channels, *range),
 
         Op::Cut { range } => cut(buffer, channels, *range),
+        Op::Trim { range } => trim(buffer, channels, *range),
         Op::Normalize {
             range,
             target,
@@ -224,6 +228,24 @@ fn cut(buffer: &mut Vec<f32>, channels: u16, range: SampleRange) -> Result<(), D
     let start = (range.start() * ch) as usize;
     let end = (range.end() * ch) as usize;
     buffer.drain(start..end);
+    Ok(())
+}
+
+/// Keep only `range`, discarding everything outside. Drains the tail
+/// first so the head's indices stay valid for the second drain.
+fn trim(buffer: &mut Vec<f32>, channels: u16, range: SampleRange) -> Result<(), DspError> {
+    let ch = channels as u64;
+    let total_frames = buffer.len() as u64 / ch;
+    if range.end() > total_frames {
+        return Err(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        });
+    }
+    let end = (range.end() * ch) as usize;
+    buffer.truncate(end);
+    let start = (range.start() * ch) as usize;
+    buffer.drain(0..start);
     Ok(())
 }
 
@@ -617,8 +639,29 @@ fn snap_to_degrees(midi: f32, key_pc: u8, degrees: &[u8]) -> f32 {
     best
 }
 
-/// Autotune dispatch — top of the file uses this from `apply`. Operates on
-/// the source range, splices the corrected segment back into `buffer`.
+/// Autotune entry point used by `apply`. Dispatches on
+/// `params.preserve_formants`: the WSOLA path is the chipmunky-but-simple
+/// "T-Pain" sound; the spectral path runs a phase vocoder with cepstral
+/// envelope preservation so formants stay in place.
+fn autotune(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    range: SampleRange,
+    params: &AutotuneParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    if params.preserve_formants {
+        autotune_spectral(buffer, channels, range, params, sample_rate)
+    } else {
+        autotune_wsola(buffer, channels, range, params, sample_rate)
+    }
+}
+
+/// WSOLA-based autotune. Pitch-shifts each analysis window in time-domain
+/// using the existing WSOLA + linear-resample pitch_shift helper, then
+/// overlap-adds the corrected windows. Cheap and works for moderate
+/// shifts; the shift itself doesn't preserve formants so this is the
+/// chipmunk / T-Pain sound at large ratios.
 ///
 /// Algorithm sketch:
 /// 1. Window the input range with 50 ms Hann windows at 50 % overlap.
@@ -631,7 +674,7 @@ fn snap_to_degrees(midi: f32, key_pc: u8, degrees: &[u8]) -> f32 {
 ///    resampling), then OLA back into the output, dividing by the summed
 ///    window weights so unity output is preserved.
 /// 6. Splice the autotuned region into `buffer`.
-fn autotune(
+fn autotune_wsola(
     buffer: &mut Vec<f32>,
     channels: u16,
     range: SampleRange,
@@ -768,6 +811,225 @@ fn autotune(
             for c in 0..ch_us {
                 output[f * ch_us + c] /= weight[f];
             }
+        }
+    }
+
+    buffer.splice(start..end, output);
+    Ok(())
+}
+
+/// Phase-vocoder autotune with cepstral envelope preservation.
+///
+/// For each STFT frame:
+/// 1. Get magnitude/phase from the FFT bins.
+/// 2. Compute the cepstrum, lifter the low-quefrency coefficients, and
+///    re-FFT to get the spectral *envelope* (the slow shape, formants).
+/// 3. Gather-style bin remap: for each output bin `k_out`, find source
+///    bin `k_in = round(k_out / ratio)`, copy the magnitude and advance
+///    the output's running phase by `ratio * true_freq * hop`. This is
+///    the standard phase-vocoder pitch shift.
+/// 4. While remapping, swap envelopes — multiply the source bin's
+///    magnitude by `envelope[k_out] / envelope[k_in]` so the formant
+///    structure stays at its original Hz rather than moving with the
+///    pitch.
+/// 5. Conjugate-mirror to fill the second half of the spectrum, then
+///    let the STFT module overlap-add the synthesised frames.
+fn autotune_spectral(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    range: SampleRange,
+    params: &AutotuneParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    let ch = channels as u64;
+    let total_frames = buffer.len() as u64 / ch;
+    if range.end() > total_frames {
+        return Err(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        });
+    }
+    let in_frames = (range.end() - range.start()) as usize;
+    if in_frames == 0 {
+        return Err(DspError::EmptySignal);
+    }
+    let ch_us = channels as usize;
+
+    let start = (range.start() * ch) as usize;
+    let end = (range.end() * ch) as usize;
+    let input: Vec<f32> = buffer[start..end].to_vec();
+
+    let mono: Vec<f32> = if ch_us == 1 {
+        input.clone()
+    } else {
+        let mut m = Vec::with_capacity(in_frames);
+        for f in 0..in_frames {
+            let mut s = 0.0_f32;
+            for c in 0..ch_us {
+                s += input[f * ch_us + c];
+            }
+            m.push(s / ch_us as f32);
+        }
+        m
+    };
+
+    // 2048-point FFT with 75 % overlap — the standard phase-vocoder grid.
+    // 43 ms windows at 48 kHz, hop 10.7 ms.
+    const FFT_SIZE: usize = 2048;
+    const HOP: usize = 512;
+    let half = FFT_SIZE / 2;
+    let stft = Stft::new_hann(FFT_SIZE, HOP);
+    let frame_count = stft.frame_count(in_frames);
+
+    // Pre-compute per-frame target ratios via mono YIN. Smoothed by a
+    // one-pole IIR keyed off retune_ms.
+    let yin_window = (((sample_rate as f32) * 0.05).round() as usize).max(256);
+    let hop_ms = (HOP as f32) / sample_rate as f32 * 1000.0;
+    let alpha = if params.retune_ms <= 0.0 {
+        0.0
+    } else {
+        (-hop_ms / params.retune_ms).exp()
+    };
+    let mut ratios = vec![1.0_f32; frame_count];
+    let mut smoothed = 1.0_f32;
+    for f in 0..frame_count {
+        let centre = f * HOP;
+        let half_yin = yin_window / 2;
+        let lo = centre.saturating_sub(half_yin);
+        let hi = (centre + half_yin).min(mono.len());
+        let detected = if hi > lo + 64 {
+            yin_pitch(&mono[lo..hi], sample_rate)
+        } else {
+            None
+        };
+        let target_hz = match (&params.target, detected) {
+            (AutotuneTarget::Scale { scale, key_pc }, Some(d)) => {
+                Some(snap_to_scale(d, *scale, *key_pc))
+            }
+            (
+                AutotuneTarget::Reference {
+                    contour_hz,
+                    hop_samples,
+                },
+                _,
+            ) => {
+                if *hop_samples == 0 {
+                    None
+                } else {
+                    let idx = (centre as u64 / *hop_samples) as usize;
+                    contour_hz.get(idx).copied().filter(|h| *h > 0.0)
+                }
+            }
+            _ => None,
+        };
+        let raw = match (detected, target_hz) {
+            (Some(d), Some(t)) if d > 0.0 => (t / d).clamp(0.5, 2.0),
+            _ => 1.0,
+        };
+        smoothed = smoothed * alpha + raw * (1.0 - alpha);
+        ratios[f] = smoothed;
+    }
+
+    // Cepstrum FFT planner — the STFT module's planners aren't exposed,
+    // so we keep our own. Cheap to construct; rustfft caches twiddles.
+    let mut planner = FftPlanner::<f32>::new();
+    let cep_fwd = planner.plan_fft_forward(FFT_SIZE);
+    let cep_inv = planner.plan_fft_inverse(FFT_SIZE);
+
+    let expected_advance = 2.0 * PI * HOP as f32 / FFT_SIZE as f32;
+    let mut output = vec![0.0_f32; input.len()];
+
+    for c in 0..ch_us {
+        let chan_input: Vec<f32> = (0..in_frames).map(|f| input[f * ch_us + c]).collect();
+
+        let mut prev_phase = vec![0.0_f32; FFT_SIZE];
+        let mut out_phase = vec![0.0_f32; FFT_SIZE];
+        let mut cep = vec![Complex::<f32>::new(0.0, 0.0); FFT_SIZE];
+        let mut new_bins = vec![Complex::<f32>::new(0.0, 0.0); FFT_SIZE];
+        let mut frame_idx = 0_usize;
+
+        let chan_out = stft.process(&chan_input, |bins| {
+            let ratio = ratios.get(frame_idx).copied().unwrap_or(1.0);
+
+            let mut mag = vec![0.0_f32; FFT_SIZE];
+            let mut phase = vec![0.0_f32; FFT_SIZE];
+            for k in 0..FFT_SIZE {
+                mag[k] = bins[k].norm();
+                phase[k] = bins[k].arg();
+            }
+
+            // Cepstral spectral envelope: log|X|, IFFT, lifter (zero high
+            // quefrency), FFT back, exp. The cutoff of 30 keeps just the
+            // formant-scale shape and discards the harmonic detail. Mirror
+            // the lifter on both ends because the cepstrum is symmetric.
+            for k in 0..FFT_SIZE {
+                cep[k] = Complex::new((mag[k] + 1e-9).ln(), 0.0);
+            }
+            cep_inv.process(&mut cep);
+            let cutoff = 30usize;
+            if FFT_SIZE > 2 * cutoff {
+                for k in cutoff..(FFT_SIZE - cutoff) {
+                    cep[k] = Complex::new(0.0, 0.0);
+                }
+            }
+            cep_fwd.process(&mut cep);
+            let envelope: Vec<f32> = cep
+                .iter()
+                .map(|c| (c.re / FFT_SIZE as f32).exp().max(1e-9))
+                .collect();
+
+            // Build the new spectrum by *scattering* input bins to their
+            // round-mapped output bins. Scatter avoids the gather-mode
+            // aliasing that happens when an output bin's phase advance
+            // differs from its nominal frequency by more than ±π/H — that
+            // distance is fs/(2H), and any output bin further from the
+            // best source gets phase-wrapped, leaking energy at fs/H from
+            // the target. With scatter, each input bin writes to exactly
+            // the output bin closest to ratio·input frequency.
+            for nb in new_bins.iter_mut() {
+                *nb = Complex::new(0.0, 0.0);
+            }
+            let mut phase_set_this_frame = vec![false; FFT_SIZE];
+            for k_in in 1..=half {
+                let k_out = ((k_in as f32) * ratio).round() as isize;
+                if k_out < 1 || (k_out as usize) > half {
+                    continue;
+                }
+                let k_out = k_out as usize;
+
+                // Phase-vocoder true frequency at the source bin.
+                let pd = phase[k_in] - prev_phase[k_in] - (k_in as f32) * expected_advance;
+                let wrapped = pd - (pd / (2.0 * PI)).round() * 2.0 * PI;
+                let advance_per_hop = (k_in as f32) * expected_advance + wrapped;
+
+                // Each output bin's phase advances exactly once per frame
+                // (otherwise colliding input bins would over-advance).
+                if !phase_set_this_frame[k_out] {
+                    out_phase[k_out] += ratio * advance_per_hop;
+                    phase_set_this_frame[k_out] = true;
+                }
+
+                // Envelope swap: input bin's mag normalised by the source
+                // envelope, re-multiplied by the *output* bin's envelope.
+                // Formants stay put at their original Hz.
+                let scaled = mag[k_in] * envelope[k_out] / envelope[k_in];
+                new_bins[k_out] += Complex::from_polar(scaled, out_phase[k_out]);
+            }
+            new_bins[0] = Complex::new(0.0, 0.0);
+            // Conjugate symmetry for a real-valued IFFT.
+            for k in 1..half {
+                new_bins[FFT_SIZE - k] = new_bins[k].conj();
+            }
+            // Nyquist bin must be real.
+            new_bins[half] = Complex::new(new_bins[half].re, 0.0);
+
+            bins.copy_from_slice(&new_bins);
+            prev_phase.copy_from_slice(&phase);
+            frame_idx += 1;
+        });
+
+        for f in 0..in_frames.min(chan_out.len()) {
+            output[f * ch_us + c] = chan_out[f];
         }
     }
 
@@ -1824,6 +2086,27 @@ mod tests {
     }
 
     #[test]
+    fn trim_keeps_only_the_range() {
+        let mut samples = buf(&[1.0, 2.0, 3.0, 4.0, 5.0]);
+        apply(&Op::Trim { range: r(1, 4) }, &mut samples, 1, 48_000).unwrap();
+        assert_eq!(samples, vec![2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn trim_in_stereo_drops_outside_frame_pairs() {
+        let mut samples = buf(&[1.0, -1.0, 2.0, -2.0, 3.0, -3.0, 4.0, -4.0]);
+        apply(&Op::Trim { range: r(1, 3) }, &mut samples, 2, 48_000).unwrap();
+        assert_eq!(samples, vec![2.0, -2.0, 3.0, -3.0]);
+    }
+
+    #[test]
+    fn trim_full_range_is_identity() {
+        let mut samples = buf(&[1.0, 2.0, 3.0]);
+        apply(&Op::Trim { range: r(0, 3) }, &mut samples, 1, 48_000).unwrap();
+        assert_eq!(samples, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
     fn normalize_peak_scales_to_target_db() {
         let mut samples = buf(&[0.25, -0.5, 0.5, -0.25]);
         apply(
@@ -2792,5 +3075,104 @@ mod tests {
         let body = &samples[2048..samples.len() - 2048];
         let f = dominant_freq(body, fs);
         assert!((f - 880.0).abs() < 15.0, "expected ~880 Hz, got {f}");
+    }
+
+    #[test]
+    fn autotune_spectral_pulls_pitch_with_formants_on() {
+        // 442 Hz sine through chromatic autotune with formants enabled.
+        // Should still pull to ~440 Hz; the spectral path is just a
+        // different implementation, not a different goal.
+        let fs = 48_000;
+        let frames = 32_768;
+        let mut samples = synth_sine(442.0, fs, frames);
+        apply(
+            &Op::Autotune {
+                range: r(0, frames as u64),
+                params: AutotuneParams {
+                    target: AutotuneTarget::Scale {
+                        scale: AutotuneScale::Chromatic,
+                        key_pc: 0,
+                    },
+                    retune_ms: 0.0,
+                    preserve_formants: true,
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        // The phase vocoder needs a few frames to build up COLA, so trim
+        // generously from both ends.
+        let body = &samples[4096..samples.len() - 4096];
+        let f = dominant_freq(body, fs);
+        assert!((f - 440.0).abs() < 6.0, "expected ~440 Hz, got {f}");
+    }
+
+    #[test]
+    fn autotune_spectral_octave_up_via_reference() {
+        // Use a higher fundamental so the FFT bin resolution doesn't
+        // dominate. At 880 Hz an octave-up to 1760 Hz puts the energy
+        // around bins 75 vs 38 in a 2048-point FFT, well-resolved.
+        let fs = 48_000;
+        let frames = 32_768;
+        let mut samples = synth_sine(880.0, fs, frames);
+        let hop = ((fs as f32) * 0.025) as u64;
+        let num_hops = (frames as u64 / hop) as usize + 1;
+        let contour = vec![1760.0_f32; num_hops];
+        apply(
+            &Op::Autotune {
+                range: r(0, frames as u64),
+                params: AutotuneParams {
+                    target: AutotuneTarget::Reference {
+                        contour_hz: contour,
+                        hop_samples: hop,
+                    },
+                    retune_ms: 0.0,
+                    preserve_formants: true,
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let body = &samples[4096..samples.len() - 4096];
+        let f = dominant_freq(body, fs);
+        // Phase-vocoder bin remap is approximate — accept ±30 Hz where the
+        // FFT bin width is ~23 Hz at 2048-point analysis.
+        assert!((f - 1760.0).abs() < 30.0, "expected ~1760 Hz, got {f}");
+    }
+
+    #[test]
+    fn autotune_spectral_no_pitch_change_is_near_identity() {
+        // Reference contour matches the input pitch exactly: ratio≈1, the
+        // spectral path should leave the signal untouched in pitch.
+        let fs = 48_000;
+        let frames = 16_384;
+        let mut samples = synth_sine(440.0, fs, frames);
+        let hop = ((fs as f32) * 0.025) as u64;
+        let num_hops = (frames as u64 / hop) as usize + 1;
+        let contour = vec![440.0_f32; num_hops];
+        apply(
+            &Op::Autotune {
+                range: r(0, frames as u64),
+                params: AutotuneParams {
+                    target: AutotuneTarget::Reference {
+                        contour_hz: contour,
+                        hop_samples: hop,
+                    },
+                    retune_ms: 0.0,
+                    preserve_formants: true,
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let body = &samples[4096..samples.len() - 4096];
+        let f = dominant_freq(body, fs);
+        assert!((f - 440.0).abs() < 4.0, "expected ~440 Hz, got {f}");
     }
 }

@@ -286,20 +286,24 @@ fn render_clip_into(
         });
     }
 
+    // Lenient on clip ranges: a destructive op (Trim, Cut, Generate) on the
+    // source can leave existing clips referencing frames past the new end.
+    // Clamp source_out to the effective length and skip the clip entirely
+    // if even source_in is past the end. The reconciliation pass in
+    // apply_op fixes this proactively for new ops, but staying defensive
+    // means we still render projects from before that fix landed.
     let effective = engine.effective_frame_count(&clip.source_id)?;
-    if clip.source_out > effective {
-        return Err(MixdownError::ClipBeyondSource {
-            clip: clip.id,
-            source: clip.source_id.clone(),
-            source_out: clip.source_out,
-            effective,
-        });
+    if clip.source_in >= effective {
+        return Ok(());
     }
-
+    let clamped_out = clip.source_out.min(effective);
+    if clamped_out <= clip.source_in {
+        return Ok(());
+    }
     let clip_range =
-        crate::range::SampleRange::new(clip.source_in, clip.source_out).expect("validated");
+        crate::range::SampleRange::new(clip.source_in, clamped_out).expect("clamped to effective");
     let samples = engine.query_samples(&clip.source_id, clip_range)?;
-    let frames = (clip.source_out - clip.source_in) as usize;
+    let frames = (clamped_out - clip.source_in) as usize;
     let ch = source.channel_count as usize;
 
     let clip_gain = db_to_linear(clip.gain_db);

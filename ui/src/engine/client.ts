@@ -351,6 +351,42 @@ export class EngineClient {
     return ev.contour;
   }
 
+  async duplicateSource(sourceId: string): Promise<string> {
+    const nowIso = new Date().toISOString();
+    const ev = await this.request<EngineCommand & { kind: "duplicate_source" }>(
+      (req) => ({ kind: "duplicate_source", req, sourceId, nowIso }),
+    );
+    if (ev.kind !== "duplicate_source_ok") throw new Error("unexpected event");
+    return ev.newSourceId;
+  }
+
+  async renameSource(sourceId: string, newName: string): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "rename_source" }>(
+      (req) => ({ kind: "rename_source", req, sourceId, newName }),
+    );
+    if (ev.kind !== "rename_source_ok") throw new Error("unexpected event");
+  }
+
+  async renderRangeToSource(
+    startFrame: number,
+    endFrame: number,
+    desiredName: string,
+  ): Promise<string> {
+    const nowIso = new Date().toISOString();
+    const ev = await this.request<EngineCommand & { kind: "render_range_to_source" }>(
+      (req) => ({
+        kind: "render_range_to_source",
+        req,
+        startFrame,
+        endFrame,
+        desiredName,
+        nowIso,
+      }),
+    );
+    if (ev.kind !== "render_range_to_source_ok") throw new Error("unexpected event");
+    return ev.newSourceId;
+  }
+
   terminate(): void {
     this.worker.terminate();
     this.pending.clear();

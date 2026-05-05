@@ -68,6 +68,14 @@ type WasmEngine = {
     hopSamples: number,
     windowSamples: number,
   ) => Float32Array;
+  duplicateSource: (sourceId: string, nowIso: string) => string;
+  renameSource: (sourceId: string, newName: string) => void;
+  renderRangeToSource: (
+    startFrame: bigint,
+    endFrame: bigint,
+    desiredName: string,
+    nowIso: string,
+  ) => string;
 };
 
 type EngineModule = {
@@ -376,6 +384,29 @@ let playback: PlaybackState | null = null;
             cmd.windowSamples,
           );
           send({ kind: "detect_pitch_contour_ok", req: cmd.req, contour });
+          return;
+        }
+
+        case "duplicate_source": {
+          const newSourceId = engine.duplicateSource(cmd.sourceId, cmd.nowIso);
+          send({ kind: "duplicate_source_ok", req: cmd.req, newSourceId });
+          return;
+        }
+
+        case "rename_source": {
+          engine.renameSource(cmd.sourceId, cmd.newName);
+          send({ kind: "rename_source_ok", req: cmd.req });
+          return;
+        }
+
+        case "render_range_to_source": {
+          const newSourceId = engine.renderRangeToSource(
+            BigInt(Math.floor(cmd.startFrame)),
+            BigInt(Math.floor(cmd.endFrame)),
+            cmd.desiredName,
+            cmd.nowIso,
+          );
+          send({ kind: "render_range_to_source_ok", req: cmd.req, newSourceId });
           return;
         }
       }

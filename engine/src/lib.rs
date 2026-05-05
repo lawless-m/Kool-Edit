@@ -251,6 +251,54 @@ mod wasm_api {
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
+        /// Make an independent copy of `source_id`. The new source captures
+        /// the current rendered state (edits flattened) and gets a unique
+        /// id and auto-suffixed name. Returns the new source id.
+        #[wasm_bindgen(js_name = duplicateSource)]
+        pub fn duplicate_source(
+            &mut self,
+            source_id: &str,
+            now_iso8601: &str,
+        ) -> Result<String, JsError> {
+            self.inner
+                .duplicate_source(&SourceId::new(source_id), Timestamp(now_iso8601.into()))
+                .map(|id| id.as_str().to_owned())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        #[wasm_bindgen(js_name = renameSource)]
+        pub fn rename_source(
+            &mut self,
+            source_id: &str,
+            new_name: &str,
+        ) -> Result<(), JsError> {
+            self.inner
+                .rename_source(&SourceId::new(source_id), new_name)
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// Render the arrangement over `[start_frame, end_frame)` (project
+        /// frames at the project sample rate) and store the result as a
+        /// new stereo source. Returns the new source id.
+        #[wasm_bindgen(js_name = renderRangeToSource)]
+        pub fn render_range_to_source(
+            &mut self,
+            start_frame: u64,
+            end_frame: u64,
+            desired_name: &str,
+            now_iso8601: &str,
+        ) -> Result<String, JsError> {
+            self.inner
+                .render_range_to_source(
+                    start_frame,
+                    end_frame,
+                    desired_name,
+                    Timestamp(now_iso8601.into()),
+                )
+                .map(|id| id.as_str().to_owned())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
         #[wasm_bindgen(js_name = projectJson)]
         pub fn project_json(&self) -> Result<String, JsError> {
             self.inner
@@ -376,8 +424,12 @@ mod wasm_api {
         }
 
         /// List all imported sources as a JSON array. Each entry is
-        /// `{id, name, frames, sampleRate, channels}` so the multitrack UI
-        /// can populate its source picker without extra round trips.
+        /// `{id, name, frames, sampleRate, channels}` where `frames` is the
+        /// *effective* length after applying the source's active edit list
+        /// — UI callers (selection bounds, clip placement) need the
+        /// playable length, not the immutable base file length, otherwise
+        /// length-changing ops (Trim, Cut, Generate) leave them off by the
+        /// difference.
         #[wasm_bindgen(js_name = listSources)]
         pub fn list_sources(&self) -> String {
             let arr: Vec<serde_json::Value> = self
@@ -386,10 +438,14 @@ mod wasm_api {
                 .sources
                 .values()
                 .map(|s| {
+                    let effective = self
+                        .inner
+                        .effective_frame_count(&s.id)
+                        .unwrap_or(s.base_length);
                     serde_json::json!({
                         "id": s.id.as_str(),
                         "name": s.name,
-                        "frames": s.base_length,
+                        "frames": effective,
                         "sampleRate": s.sample_rate,
                         "channels": s.channel_count,
                     })

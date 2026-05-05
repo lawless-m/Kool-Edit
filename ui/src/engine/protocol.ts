@@ -88,6 +88,16 @@ export type EngineCommand =
       endFrame: number;
       hopSamples: number;
       windowSamples: number;
+    }
+  | { kind: "duplicate_source"; req: RequestId; sourceId: string; nowIso: string }
+  | { kind: "rename_source"; req: RequestId; sourceId: string; newName: string }
+  | {
+      kind: "render_range_to_source";
+      req: RequestId;
+      startFrame: number;
+      endFrame: number;
+      desiredName: string;
+      nowIso: string;
     };
 
 export type EngineEvent =
@@ -126,4 +136,7 @@ export type EngineEvent =
   | { kind: "export_kepz_ok"; req: RequestId; bytes: Uint8Array }
   | { kind: "import_kepz_ok"; req: RequestId }
   | { kind: "detect_pitch_contour_ok"; req: RequestId; contour: Float32Array }
+  | { kind: "duplicate_source_ok"; req: RequestId; newSourceId: string }
+  | { kind: "rename_source_ok"; req: RequestId }
+  | { kind: "render_range_to_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "error"; req: RequestId; reason: string };

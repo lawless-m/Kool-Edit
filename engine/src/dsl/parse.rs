@@ -340,6 +340,7 @@ impl Parser {
             "reverse" => Op::Reverse { range },
             "dc_remove" => Op::DcRemove { range },
             "cut" => Op::Cut { range },
+            "trim" => Op::Trim { range },
             "gain" => Op::Gain {
                 range,
                 db: self.parse_db()?,

@@ -210,6 +210,10 @@ impl<'a> Emitter<'a> {
                 "{}  cut",
                 fmt_range(*range, sample_rate)
             )),
+            Op::Trim { range } => self.line(&format!(
+                "{}  trim",
+                fmt_range(*range, sample_rate)
+            )),
             Op::TimeStretch { range, ratio } => self.line(&format!(
                 "{}  time_stretch ratio:{}",
                 fmt_range(*range, sample_rate),

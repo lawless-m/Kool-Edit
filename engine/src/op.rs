@@ -100,6 +100,13 @@ pub enum Op {
     Cut {
         range: SampleRange,
     },
+    /// Keep only `range`, discarding everything outside. The buffer ends
+    /// up exactly `range.len()` frames long. Equivalent to two cuts
+    /// (`[end..total)` then `[0..start)`) but lands as a single op so
+    /// "Trim to selection" is one undo step.
+    Trim {
+        range: SampleRange,
+    },
     Insert {
         at: u64,
         samples_ref: ClipboardRef,

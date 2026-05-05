@@ -1,10 +1,14 @@
 // Tab shell: boots the engine, owns the shared Playback, mounts both tabs.
-// Each tab's DOM is built once and toggled with `display:none` so state
-// persists across switches.
+// The visual chrome (topbar + transport bar) follows the redesign in
+// kool-edit-design-docs / Kooledit.zip — phosphor palette, big timecode,
+// L/R master meters at the top; status LED + filename + kbd hints at the
+// bottom. Editor and arranger panel internals are still the older layout
+// pending later slices.
 
+import "./styles.css";
 import { EngineClient, EngineUnavailable } from "./engine/client";
 import { Playback } from "./audio/playback";
-import { mountEditor, btnStyle } from "./editor";
+import { mountEditor } from "./editor";
 import { mountArranger } from "./arranger";
 
 type TabId = "editor" | "arranger";
@@ -13,109 +17,178 @@ async function main(): Promise<void> {
   const root = document.querySelector<HTMLDivElement>("#app");
   if (!root) throw new Error("#app element missing from index.html");
 
-  Object.assign(root.style, {
-    display: "flex",
-    flexDirection: "column",
-    gap: "12px",
-    fontFamily: "system-ui, sans-serif",
-    background: "#1a1a1a",
-    color: "#d8d8d8",
-    padding: "16px",
-    minHeight: "100vh",
-    boxSizing: "border-box",
-  } satisfies Partial<CSSStyleDeclaration>);
+  root.className = "app";
+  root.innerHTML = "";
 
-  const header = document.createElement("div");
-  header.textContent = "Kool-Edit";
-  header.style.fontSize = "18px";
-  header.style.fontWeight = "600";
-  root.appendChild(header);
+  // ---- topbar ---------------------------------------------------------
 
-  const banner = document.createElement("div");
-  banner.textContent = "booting…";
-  banner.style.fontSize = "12px";
-  banner.style.color = "#9a9a9a";
-  banner.style.fontFamily = "ui-monospace, monospace";
-  root.appendChild(banner);
+  const topbar = document.createElement("header");
+  topbar.className = "topbar";
+
+  // Brand
+  const brand = document.createElement("div");
+  brand.className = "brand";
+  const brandMark = document.createElement("div");
+  brandMark.className = "brand-mark";
+  brand.appendChild(brandMark);
+  const brandText = document.createElement("div");
+  brandText.className = "brand-text";
+  const brandName = document.createElement("div");
+  brandName.className = "brand-name";
+  brandName.innerHTML = `KOOL<span class="accent">·</span>EDIT`;
+  const brandMeta = document.createElement("div");
+  brandMeta.className = "brand-meta";
+  brandMeta.textContent = "booting…";
+  brandText.appendChild(brandName);
+  brandText.appendChild(brandMeta);
+  brand.appendChild(brandText);
+  topbar.appendChild(brand);
+
+  // Tabs (segmented)
+  const tabs = document.createElement("div");
+  tabs.className = "tabs";
+  const editorTab = makeTab("EDITOR");
+  const arrangerTab = makeTab("ARRANGER");
+  tabs.appendChild(editorTab);
+  tabs.appendChild(arrangerTab);
+  topbar.appendChild(tabs);
+
+  // Timecode
+  const timecode = document.createElement("div");
+  timecode.className = "timecode";
+  const timecodeDisplay = document.createElement("div");
+  timecodeDisplay.className = "timecode-display";
+  timecodeDisplay.innerHTML = `00:00:00<span class="ms">.000</span>`;
+  const timecodeLabel = document.createElement("div");
+  timecodeLabel.className = "timecode-label";
+  timecodeLabel.textContent = "TIMECODE";
+  timecode.appendChild(timecodeDisplay);
+  timecode.appendChild(timecodeLabel);
+  topbar.appendChild(timecode);
+
+  // Master meters (visual stub for now — real levels wiring is later)
+  const meters = document.createElement("div");
+  meters.className = "meters";
+  const meterRows = [makeMeterRow("L"), makeMeterRow("R")];
+  meters.appendChild(meterRows[0]!.row);
+  meters.appendChild(meterRows[1]!.row);
+  topbar.appendChild(meters);
+
+  // Right-side tools
+  const tools = document.createElement("div");
+  tools.className = "topbar-tools";
+  const saveBtn = document.createElement("button");
+  saveBtn.className = "btn";
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save .kepz";
+  const loadBtn = document.createElement("button");
+  loadBtn.className = "btn";
+  loadBtn.type = "button";
+  loadBtn.textContent = "Load .kepz";
+  // Hidden <input type="file"> driven by the Load button so the topbar
+  // doesn't have to host a raw file picker.
+  const loadInput = document.createElement("input");
+  loadInput.type = "file";
+  loadInput.accept = ".kepz,application/zip";
+  loadInput.style.display = "none";
+  loadBtn.addEventListener("click", () => loadInput.click());
+  const settingsBtn = document.createElement("button");
+  settingsBtn.className = "btn icon-only";
+  settingsBtn.type = "button";
+  settingsBtn.title = "Settings (coming soon)";
+  settingsBtn.textContent = "⚙";
+  settingsBtn.disabled = true;
+  tools.appendChild(saveBtn);
+  tools.appendChild(loadBtn);
+  tools.appendChild(loadInput);
+  tools.appendChild(settingsBtn);
+  topbar.appendChild(tools);
+
+  root.appendChild(topbar);
+
+  // ---- workspace (editor / arranger) ----------------------------------
+
+  const workspace = document.createElement("main");
+  workspace.className = "workspace";
+  const editorRoot = document.createElement("div");
+  const arrangerRoot = document.createElement("div");
+  arrangerRoot.style.display = "none";
+  editorRoot.style.flex = "1";
+  arrangerRoot.style.flex = "1";
+  workspace.appendChild(editorRoot);
+  workspace.appendChild(arrangerRoot);
+  root.appendChild(workspace);
+
+  // ---- transport bar --------------------------------------------------
+
+  const transportBar = document.createElement("footer");
+  transportBar.className = "transport-bar";
+  const statusLine = document.createElement("div");
+  statusLine.className = "status-line";
+  const statusLed = document.createElement("span");
+  statusLed.className = "led idle";
+  const statusState = document.createElement("span");
+  statusState.textContent = "STOPPED";
+  const statusFile = document.createElement("span");
+  statusFile.textContent = "no project loaded";
+  const statusFmt = document.createElement("span");
+  statusFmt.textContent = "format_version=1";
+  const statusContext = document.createElement("span");
+  statusContext.textContent = "";
+  statusLine.appendChild(statusLed);
+  statusLine.appendChild(statusState);
+  statusLine.appendChild(span("·"));
+  statusLine.appendChild(statusFile);
+  statusLine.appendChild(span("·"));
+  statusLine.appendChild(statusFmt);
+  statusLine.appendChild(span("·"));
+  statusLine.appendChild(statusContext);
+  transportBar.appendChild(statusLine);
+
+  const kbdHints = document.createElement("span");
+  kbdHints.className = "hint";
+  kbdHints.innerHTML = `<span class="kbd">SPACE</span> play/pause &nbsp;
+    <span class="kbd">L</span> loop &nbsp;
+    <span class="kbd">⌘Z</span> undo`;
+  transportBar.appendChild(kbdHints);
+  root.appendChild(transportBar);
+
+  // ---- engine boot ---------------------------------------------------
 
   let client: EngineClient;
   try {
     client = await EngineClient.boot();
   } catch (e) {
     if (e instanceof EngineUnavailable) {
-      banner.textContent = `engine unavailable: ${e.message}`;
+      brandMeta.textContent = `engine unavailable: ${e.message}`;
     } else {
-      banner.textContent = `boot failed: ${String(e)}`;
+      brandMeta.textContent = `boot failed: ${String(e)}`;
     }
     return;
   }
-  banner.textContent = await client.banner();
+  // banner format: "kool-edit-engine vX.Y.Z (format_version=1)"
+  const banner = await client.banner();
+  brandMeta.textContent = banner.replace(/^kool-edit-engine /, "");
+  const fmtMatch = banner.match(/format_version=(\d+)/);
+  if (fmtMatch) statusFmt.textContent = `format_version=${fmtMatch[1]}`;
 
   const playback = new Playback(client);
 
-  // ---- project save / load ----
-  const projectBar = document.createElement("div");
-  Object.assign(projectBar.style, {
-    display: "flex",
-    gap: "8px",
-    alignItems: "center",
-    fontSize: "12px",
-    color: "#aaa",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const saveBtn = document.createElement("button");
-  saveBtn.type = "button";
-  saveBtn.textContent = "Save .kepz";
-  Object.assign(saveBtn.style, btnStyle(), {
-    padding: "4px 10px",
-    fontSize: "12px",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const loadLabel = document.createElement("label");
-  loadLabel.textContent = "Load .kepz: ";
-  Object.assign(loadLabel.style, {
-    display: "flex",
-    alignItems: "center",
-    gap: "6px",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const loadInput = document.createElement("input");
-  loadInput.type = "file";
-  loadInput.accept = ".kepz,application/zip";
-  loadLabel.appendChild(loadInput);
-  const projectStatus = document.createElement("span");
-  projectStatus.style.color = "#9a9a9a";
-  projectStatus.style.fontFamily = "ui-monospace, monospace";
-  projectBar.appendChild(saveBtn);
-  projectBar.appendChild(loadLabel);
-  projectBar.appendChild(projectStatus);
-  root.appendChild(projectBar);
-
-  // ---- tab bar ----
-  const tabBar = document.createElement("div");
-  Object.assign(tabBar.style, {
-    display: "flex",
-    gap: "4px",
-    borderBottom: "1px solid #2a2a2a",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const editorTab = makeTabBtn("Editor");
-  const arrangerTab = makeTabBtn("Arranger");
-  tabBar.appendChild(editorTab);
-  tabBar.appendChild(arrangerTab);
-  root.appendChild(tabBar);
-
-  // ---- content hosts ----
-  const editorRoot = document.createElement("div");
-  const arrangerRoot = document.createElement("div");
-  arrangerRoot.style.display = "none";
-  root.appendChild(editorRoot);
-  root.appendChild(arrangerRoot);
-
   const editor = await mountEditor(editorRoot, client, playback, {
-    onSourceImported: () => arranger.refresh(),
+    onSourceImported: () => {
+      void arranger.refresh();
+    },
   });
-  const arranger = await mountArranger(arrangerRoot, client);
+  const arranger = await mountArranger(arrangerRoot, client, {
+    onSourceImported: () => {
+      void editor.refreshLibrary();
+    },
+  });
 
-  // ---- save / load wiring ----
+  // ---- save / load wiring --------------------------------------------
+
   saveBtn.addEventListener("click", async () => {
-    projectStatus.textContent = "exporting…";
+    statusContext.textContent = "exporting…";
     try {
       const bytes = await client.exportKepz();
       const blob = new Blob([bytes as BlobPart], { type: "application/zip" });
@@ -123,60 +196,135 @@ async function main(): Promise<void> {
       const a = document.createElement("a");
       a.href = url;
       const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-      a.download = `kool-edit-${stamp}.kepz`;
+      const filename = `kool-edit-${stamp}.kepz`;
+      a.download = filename;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
-      projectStatus.textContent = `saved (${bytes.byteLength.toLocaleString()} bytes)`;
+      statusFile.textContent = filename;
+      statusContext.textContent = `saved (${bytes.byteLength.toLocaleString()} bytes)`;
     } catch (err) {
-      projectStatus.textContent = `save failed: ${String(err)}`;
+      statusContext.textContent = `save failed: ${String(err)}`;
     }
   });
+
   loadInput.addEventListener("change", async () => {
     const file = loadInput.files?.[0];
     if (!file) return;
-    projectStatus.textContent = `loading ${file.name}…`;
+    statusContext.textContent = `loading ${file.name}…`;
     try {
       const buf = await file.arrayBuffer();
       await client.importKepz(new Uint8Array(buf));
       await editor.reset();
       await arranger.refresh();
-      projectStatus.textContent = `loaded ${file.name}`;
+      statusFile.textContent = file.name;
+      statusContext.textContent = "loaded";
     } catch (err) {
-      projectStatus.textContent = `load failed: ${String(err)}`;
+      statusContext.textContent = `load failed: ${String(err)}`;
     } finally {
       loadInput.value = "";
     }
   });
 
-  const showTab = (tab: TabId): void => {
-    editorRoot.style.display = tab === "editor" ? "" : "none";
-    arrangerRoot.style.display = tab === "arranger" ? "" : "none";
-    setActiveStyle(editorTab, tab === "editor");
-    setActiveStyle(arrangerTab, tab === "arranger");
-    if (tab === "arranger") arranger.refresh();
-  };
+  // ---- tab wiring ----------------------------------------------------
 
+  const showTab = (tab: TabId): void => {
+    editorRoot.style.display = tab === "editor" ? "flex" : "none";
+    arrangerRoot.style.display = tab === "arranger" ? "flex" : "none";
+    editorTab.classList.toggle("active", tab === "editor");
+    arrangerTab.classList.toggle("active", tab === "arranger");
+    if (tab === "arranger") void arranger.refresh();
+  };
   editorTab.addEventListener("click", () => showTab("editor"));
   arrangerTab.addEventListener("click", () => showTab("arranger"));
   showTab("editor");
+
+  // ---- timecode + status loop ----------------------------------------
+
+  const refreshChrome = (): void => {
+    const playing = playback.isPlaying() && !playback.isPaused();
+    statusLed.classList.toggle("idle", !playing);
+    statusState.textContent = playing
+      ? playback.isLooping()
+        ? "LOOPING"
+        : "PLAYING"
+      : "STOPPED";
+
+    // Time = source-frame cursor / output-sample-rate (seconds elapsed in
+    // playback). When idle, snap to 0.
+    const pos = playback.position();
+    const outSr = playback.outputSampleRate();
+    let seconds = 0;
+    if (playing && pos && outSr) {
+      seconds = pos.sourceFrame / outSr;
+    }
+    timecodeDisplay.innerHTML = formatTimecode(seconds);
+  };
+  // 30 fps is enough for the timecode display; cheap enough that we run
+  // it always rather than gating on playback state.
+  setInterval(refreshChrome, 33);
+  refreshChrome();
 }
 
-function makeTabBtn(label: string): HTMLButtonElement {
+function makeTab(label: string): HTMLButtonElement {
   const b = document.createElement("button");
   b.type = "button";
-  b.textContent = label;
-  Object.assign(b.style, btnStyle(), {
-    borderBottom: "none",
-    borderRadius: "0",
-  } satisfies Partial<CSSStyleDeclaration>);
+  b.className = "tab";
+  const dot = document.createElement("span");
+  dot.className = "dot";
+  b.appendChild(dot);
+  const txt = document.createElement("span");
+  txt.textContent = label;
+  b.appendChild(txt);
   return b;
 }
 
-function setActiveStyle(b: HTMLButtonElement, active: boolean): void {
-  b.style.background = active ? "#3a3a3a" : "#2a2a2a";
-  b.style.color = active ? "#ffffff" : "#d8d8d8";
+function makeMeterRow(label: string): {
+  row: HTMLDivElement;
+  fill: HTMLDivElement;
+  peak: HTMLDivElement;
+  db: HTMLDivElement;
+} {
+  const row = document.createElement("div");
+  row.className = "meter-row";
+  const lab = document.createElement("div");
+  lab.className = "meter-label";
+  lab.textContent = label;
+  const bar = document.createElement("div");
+  bar.className = "meter-bar";
+  const fill = document.createElement("div");
+  fill.className = "meter-fill";
+  const peak = document.createElement("div");
+  peak.className = "meter-peak";
+  bar.appendChild(fill);
+  bar.appendChild(peak);
+  const db = document.createElement("div");
+  db.className = "meter-db";
+  db.textContent = "−∞";
+  row.appendChild(lab);
+  row.appendChild(bar);
+  row.appendChild(db);
+  return { row, fill, peak, db };
+}
+
+function span(text: string): HTMLSpanElement {
+  const s = document.createElement("span");
+  s.textContent = text;
+  return s;
+}
+
+/** HH:MM:SS.mmm with the milliseconds in a dimmer span so the design's
+ *  two-tone treatment lands without the caller having to do the slicing. */
+function formatTimecode(totalSeconds: number): string {
+  const safe = Number.isFinite(totalSeconds) ? Math.max(0, totalSeconds) : 0;
+  const h = Math.floor(safe / 3600);
+  const m = Math.floor((safe % 3600) / 60);
+  const s = Math.floor(safe % 60);
+  const ms = Math.floor((safe - Math.floor(safe)) * 1000);
+  const pad2 = (n: number): string => n.toString().padStart(2, "0");
+  const pad3 = (n: number): string => n.toString().padStart(3, "0");
+  return `${pad2(h)}:${pad2(m)}:${pad2(s)}<span class="ms">.${pad3(ms)}</span>`;
 }
 
 main().catch((err) => {

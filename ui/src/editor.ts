@@ -1,8 +1,10 @@
-// Single-source waveform editor tab. Owns one `currentSourceId` plus its
-// selection, viewport, and gain preview state. The shell (main.ts) boots the
-// shared EngineClient and Playback and hands them in.
+// Single-source waveform editor tab. Cool-Edit-style layout: library pane on
+// the left (every imported source, click-to-load, double-click-to-rename,
+// Duplicate button), destructive FX panel + waveform + transport on the right.
+// The shell (main.ts) boots the shared EngineClient and Playback and hands
+// them in.
 
-import type { EngineClient } from "./engine/client";
+import type { EngineClient, SourceInfo } from "./engine/client";
 import type { Playback } from "./audio/playback";
 import { drawWaveform } from "./waveform";
 
@@ -18,9 +20,11 @@ interface Viewport {
 
 const TRIM_NUDGE_MS = 10;
 const MIN_VIEWPORT_FRAMES = 64; // peak cache decimation; finer than this is wasted
+const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
 export interface EditorOptions {
-  /** Called after a fresh import lands so the arranger can refresh its source list. */
+  /** Called after a fresh import / duplicate / rename so other tabs (the
+   *  arranger) can refresh their source list. */
   onSourceImported?: () => void;
 }
 
@@ -29,6 +33,9 @@ export interface EditorHandle {
    *  fresh project at the shell level so the editor doesn't keep pointing
    *  at an id that no longer exists. */
   reset: () => Promise<void>;
+  /** Re-fetch the source list from the engine. Called when the arranger
+   *  imports a wav so the editor's library reflects it without a tab switch. */
+  refreshLibrary: () => Promise<void>;
 }
 
 export async function mountEditor(
@@ -47,6 +54,7 @@ export async function mountEditor(
   let playheadRaf: number | null = null;
   let pendingPeakRequest = 0; // race guard for in-flight peakSummary calls
   let cachedPeaks: Float32Array | null = null;
+  let sources: SourceInfo[] = [];
 
   // ---- selection helpers ------------------------------------------------
 
@@ -89,14 +97,13 @@ export async function mountEditor(
       ui.inInput.value = "";
       ui.outInput.value = "";
     }
-    const trimEnabled = selection !== null;
+    const hasSelection = selection !== null;
     for (const b of [ui.inMinus, ui.inPlus, ui.outMinus, ui.outPlus]) {
-      b.disabled = !trimEnabled;
+      b.disabled = !hasSelection;
     }
     ui.inInput.disabled = sourceFrameCount === 0;
     ui.outInput.disabled = sourceFrameCount === 0;
-    ui.gainSlider.disabled = !trimEnabled;
-    ui.gainApplyBtn.disabled = !trimEnabled;
+    ui.trimBtn.disabled = !hasSelection || currentSourceId === null;
   };
 
   const trim = (which: "in" | "out", deltaMs: number): void => {
@@ -197,34 +204,9 @@ export async function mountEditor(
     drawCachedWaveform();
   };
 
-  /** Redraw the waveform with the slider's gain preview overlaid on the
-   *  selection columns. Multiplicative on `cachedPeaks` — what you see is
-   *  what an Apply at the current slider value would give you. */
   const drawCachedWaveform = (): void => {
     if (!cachedPeaks) return;
-    const percent = parseFloat(ui.gainSlider.value);
-    const gainLin = Number.isFinite(percent) ? percent / 100 : 1;
-    if (gainLin === 1 || !selection || sourceFrameCount === 0) {
-      drawWaveform(ui.canvas, cachedPeaks);
-      return;
-    }
-    const w = ui.canvas.width;
-    const vLen = Math.max(1, viewport.endFrame - viewport.startFrame);
-    const colFromFrame = (f: number): number =>
-      Math.max(0, Math.min(w, Math.round(((f - viewport.startFrame) / vLen) * w)));
-    const colIn = colFromFrame(selection.inFrame);
-    const colOut = colFromFrame(selection.outFrame);
-    if (colOut <= colIn) {
-      drawWaveform(ui.canvas, cachedPeaks);
-      return;
-    }
-    const previewed = cachedPeaks.slice();
-    for (let col = colIn; col < colOut; col++) {
-      const i = col * 2;
-      previewed[i] = Math.max(-1, Math.min(1, cachedPeaks[i] * gainLin));
-      previewed[i + 1] = Math.max(-1, Math.min(1, cachedPeaks[i + 1] * gainLin));
-    }
-    drawWaveform(ui.canvas, previewed);
+    drawWaveform(ui.canvas, cachedPeaks);
   };
 
   // ---- canvas drawing ---------------------------------------------------
@@ -415,42 +397,189 @@ export async function mountEditor(
     if (ev.button === 1) ev.preventDefault();
   });
 
+  // ---- library ---------------------------------------------------------
+
+  const refreshLibrary = async (): Promise<void> => {
+    sources = await client.listSources();
+    renderLibrary();
+  };
+
+  const renderLibrary = (): void => {
+    ui.libraryList.innerHTML = "";
+    if (sources.length === 0) {
+      const empty = document.createElement("div");
+      empty.textContent = "No sources yet. Open a WAV.";
+      Object.assign(empty.style, {
+        color: "#888",
+        fontStyle: "italic",
+        padding: "8px",
+        fontSize: "12px",
+      } satisfies Partial<CSSStyleDeclaration>);
+      ui.libraryList.appendChild(empty);
+    } else {
+      for (const s of sources) ui.libraryList.appendChild(makeLibraryRow(s));
+    }
+    ui.duplicateBtn.disabled = currentSourceId === null;
+  };
+
+  const makeLibraryRow = (s: SourceInfo): HTMLDivElement => {
+    const row = document.createElement("div");
+    row.dataset.sourceId = s.id;
+    Object.assign(row.style, {
+      padding: "6px 8px",
+      cursor: "pointer",
+      borderBottom: "1px solid #1f1f1f",
+      background: s.id === currentSourceId ? "#2a3a2a" : "transparent",
+      display: "flex",
+      flexDirection: "column",
+      gap: "2px",
+    } satisfies Partial<CSSStyleDeclaration>);
+
+    const nameEl = document.createElement("div");
+    nameEl.textContent = s.name;
+    nameEl.title = `${s.id} · ${s.frames.toLocaleString()} fr · ${s.sampleRate} Hz · ${s.channels}ch`;
+    Object.assign(nameEl.style, {
+      overflow: "hidden",
+      textOverflow: "ellipsis",
+      whiteSpace: "nowrap",
+      fontSize: "12px",
+      color: s.id === currentSourceId ? "#cfe9cf" : "#d8d8d8",
+    } satisfies Partial<CSSStyleDeclaration>);
+
+    const meta = document.createElement("div");
+    const seconds = s.sampleRate > 0 ? s.frames / s.sampleRate : 0;
+    meta.textContent = `${seconds.toFixed(2)}s · ${s.channels}ch`;
+    Object.assign(meta.style, {
+      color: "#888",
+      fontSize: "10px",
+      fontFamily: "ui-monospace, monospace",
+    } satisfies Partial<CSSStyleDeclaration>);
+
+    row.appendChild(nameEl);
+    row.appendChild(meta);
+
+    row.addEventListener("click", () => {
+      if (s.id === currentSourceId) return;
+      void loadSource(s.id);
+    });
+    nameEl.addEventListener("dblclick", (ev) => {
+      ev.stopPropagation();
+      beginRename(s, nameEl);
+    });
+    return row;
+  };
+
+  const beginRename = (s: SourceInfo, nameEl: HTMLDivElement): void => {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.value = s.name;
+    Object.assign(input.style, {
+      width: "100%",
+      padding: "2px 4px",
+      background: "#0c0c0c",
+      color: "#d8d8d8",
+      border: "1px solid #5a5a5a",
+      fontFamily: "inherit",
+      fontSize: "12px",
+      boxSizing: "border-box",
+    } satisfies Partial<CSSStyleDeclaration>);
+    nameEl.replaceWith(input);
+    input.focus();
+    input.select();
+
+    let done = false;
+    const finish = async (commit: boolean): Promise<void> => {
+      if (done) return;
+      done = true;
+      if (commit) {
+        const next = input.value.trim();
+        if (next && next !== s.name) {
+          try {
+            await client.renameSource(s.id, next);
+            opts.onSourceImported?.();
+          } catch (err) {
+            ui.status.textContent = `rename failed: ${String(err)}`;
+          }
+        }
+      }
+      await refreshLibrary();
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        void finish(true);
+      } else if (ev.key === "Escape") {
+        ev.preventDefault();
+        void finish(false);
+      }
+    });
+    input.addEventListener("blur", () => {
+      void finish(true);
+    });
+  };
+
+  /** Switch the editor to an existing source from the library. */
+  const loadSource = async (id: string): Promise<void> => {
+    await playback.stop();
+    stopPlayheadLoop();
+    const info = sources.find((s) => s.id === id);
+    if (!info) {
+      ui.status.textContent = `source ${id} not found`;
+      return;
+    }
+    currentSourceId = id;
+    sourceFrameCount = info.frames;
+    sourceSampleRate = info.sampleRate;
+    viewport = { startFrame: 0, endFrame: info.frames };
+    cachedPeaks = null;
+    setSelection(null);
+    setTransportEnabled(true);
+    ui.undoBtn.disabled = false;
+    ui.redoBtn.disabled = false;
+    ui.duplicateBtn.disabled = false;
+    syncFxApplyEnabled();
+    ui.status.textContent = `${info.name} · ${info.id} · ${info.frames.toLocaleString()} frames @ ${info.sampleRate} Hz`;
+    renderLibrary();
+    syncSelectionInputs();
+    syncScrollbar();
+    syncZoomButtons();
+    await redrawWaveform();
+    redrawOverlay();
+  };
+
   // ---- file load -------------------------------------------------------
 
   ui.fileInput.addEventListener("change", async () => {
     const file = ui.fileInput.files?.[0];
     if (!file) return;
-    await playback.stop();
-    stopPlayheadLoop();
-    currentSourceId = null;
-    sourceFrameCount = 0;
-    sourceSampleRate = 0;
-    viewport = { startFrame: 0, endFrame: 0 };
-    cachedPeaks = null;
-    ui.gainSlider.value = "100";
-    ui.gainLabel.textContent = "100%";
-    setSelection(null);
-    setTransportEnabled(false);
     ui.status.textContent = `decoding ${file.name}…`;
     try {
       const buf = await file.arrayBuffer();
       const imp = await client.importWav(file.name, new Uint8Array(buf));
-      currentSourceId = imp.sourceId;
-      sourceFrameCount = imp.frames;
-      sourceSampleRate = imp.sampleRate;
-      viewport = { startFrame: 0, endFrame: imp.frames };
-      ui.status.textContent = `${file.name} · ${imp.sourceId} · ${imp.frames.toLocaleString()} frames @ ${imp.sampleRate} Hz`;
-      syncSelectionInputs();
-      syncScrollbar();
-      syncZoomButtons();
-      setTransportEnabled(true);
-      ui.undoBtn.disabled = false;
-      ui.redoBtn.disabled = false;
-      await redrawWaveform();
-      redrawOverlay();
+      await refreshLibrary();
+      await loadSource(imp.sourceId);
+      ui.fileInput.value = "";
       opts.onSourceImported?.();
     } catch (err) {
       ui.status.textContent = `import failed: ${String(err)}`;
+      ui.fileInput.value = "";
+    }
+  });
+
+  // ---- duplicate -------------------------------------------------------
+
+  ui.duplicateBtn.addEventListener("click", async () => {
+    if (!currentSourceId) return;
+    ui.duplicateBtn.disabled = true;
+    try {
+      const newId = await client.duplicateSource(currentSourceId);
+      await refreshLibrary();
+      await loadSource(newId);
+      opts.onSourceImported?.();
+      ui.status.textContent = `duplicated`;
+    } catch (err) {
+      ui.status.textContent = `duplicate failed: ${String(err)}`;
+      ui.duplicateBtn.disabled = currentSourceId === null;
     }
   });
 
@@ -558,17 +687,509 @@ export async function mountEditor(
     setViewport(start, start + len);
   });
 
-  // ---- effects --------------------------------------------------------
+  // ---- effects ---------------------------------------------------------
+  // Destructive ops applied to the current source. Range = current
+  // selection if any, else the whole source. Each kind has its own
+  // params row; Autotune is a special case because it has two modes.
 
-  /** Convert 0..200% scale to dB. 100% → 0 dB; 0% maps to -120 dB. */
-  const percentToDb = (percent: number): number => {
-    if (percent <= 0) return -120;
-    return 20 * Math.log10(percent / 100);
+  type FxParam =
+    | {
+        kind: "number";
+        key: string;
+        label: string;
+        min: number;
+        max: number;
+        step: number;
+        default: number;
+      }
+    | { kind: "select"; key: string; label: string; options: string[]; default: string };
+
+  interface FxDef {
+    id: string;
+    label: string;
+    params: FxParam[];
+    build: (range: { start: number; end: number }, vals: Record<string, string>) => unknown;
+  }
+
+  const num = (vals: Record<string, string>, k: string, fallback: number): number => {
+    const v = parseFloat(vals[k] ?? "");
+    return Number.isFinite(v) ? v : fallback;
   };
 
-  ui.gainSlider.addEventListener("input", () => {
-    ui.gainLabel.textContent = `${ui.gainSlider.value}%`;
-    drawCachedWaveform();
+  const fxDefs: FxDef[] = [
+    {
+      id: "Gain",
+      label: "Gain",
+      params: [{ kind: "number", key: "db", label: "dB", min: -60, max: 24, step: 0.5, default: 0 }],
+      build: (range, vals) => ({ Gain: { range, db: num(vals, "db", 0) } }),
+    },
+    {
+      id: "Normalize",
+      label: "Normalize",
+      params: [
+        {
+          kind: "select",
+          key: "target",
+          label: "target",
+          options: ["Peak", "Rms", "LufsIntegrated"],
+          default: "Peak",
+        },
+        { kind: "number", key: "value_db", label: "dB", min: -30, max: 0, step: 0.1, default: -1 },
+      ],
+      build: (range, vals) => ({
+        Normalize: {
+          range,
+          target: vals.target ?? "Peak",
+          value_db: num(vals, "value_db", -1),
+        },
+      }),
+    },
+    { id: "Reverse", label: "Reverse", params: [], build: (range) => ({ Reverse: { range } }) },
+    { id: "DcRemove", label: "DC Remove", params: [], build: (range) => ({ DcRemove: { range } }) },
+    { id: "Silence", label: "Silence", params: [], build: (range) => ({ Silence: { range } }) },
+    {
+      id: "Fade",
+      label: "Fade",
+      params: [
+        { kind: "select", key: "direction", label: "dir", options: ["In", "Out"], default: "In" },
+        {
+          kind: "select",
+          key: "shape",
+          label: "shape",
+          options: ["Linear", "Logarithmic", "Exponential", "SCurve"],
+          default: "Linear",
+        },
+      ],
+      build: (range, vals) => ({
+        Fade: {
+          range,
+          shape: vals.shape ?? "Linear",
+          direction: vals.direction ?? "In",
+        },
+      }),
+    },
+    {
+      id: "Reverb",
+      label: "Reverb",
+      params: [
+        {
+          kind: "select",
+          key: "model",
+          label: "model",
+          options: ["Hall", "Room", "Plate"],
+          default: "Hall",
+        },
+        { kind: "number", key: "size", label: "size", min: 0, max: 1, step: 0.05, default: 0.5 },
+        { kind: "number", key: "damping", label: "damp", min: 0, max: 1, step: 0.05, default: 0.5 },
+        { kind: "number", key: "mix", label: "mix", min: 0, max: 1, step: 0.05, default: 0.3 },
+      ],
+      build: (range, vals) => ({
+        Reverb: {
+          range,
+          params: {
+            model: vals.model ?? "Hall",
+            size: num(vals, "size", 0.5),
+            damping: num(vals, "damping", 0.5),
+            mix: num(vals, "mix", 0.3),
+          },
+        },
+      }),
+    },
+    {
+      id: "Delay",
+      label: "Delay",
+      params: [
+        { kind: "number", key: "time_ms", label: "ms", min: 1, max: 2000, step: 10, default: 250 },
+        { kind: "number", key: "feedback", label: "fb", min: 0, max: 0.95, step: 0.05, default: 0.4 },
+        { kind: "number", key: "mix", label: "mix", min: 0, max: 1, step: 0.05, default: 0.3 },
+        {
+          kind: "select",
+          key: "ping_pong",
+          label: "ping-pong",
+          options: ["off", "on"],
+          default: "off",
+        },
+      ],
+      build: (range, vals) => ({
+        Delay: {
+          range,
+          params: {
+            time_ms: num(vals, "time_ms", 250),
+            feedback: num(vals, "feedback", 0.4),
+            mix: num(vals, "mix", 0.3),
+            ping_pong: vals.ping_pong === "on",
+            feedback_lp_hz: null,
+          },
+        },
+      }),
+    },
+    {
+      id: "TimeStretch",
+      label: "Time Stretch",
+      params: [
+        { kind: "number", key: "ratio", label: "ratio", min: 0.25, max: 4, step: 0.05, default: 1.0 },
+      ],
+      build: (range, vals) => ({ TimeStretch: { range, ratio: num(vals, "ratio", 1.0) } }),
+    },
+    {
+      id: "PitchShift",
+      label: "Pitch Shift",
+      params: [
+        { kind: "number", key: "cents", label: "cents", min: -2400, max: 2400, step: 50, default: 0 },
+      ],
+      build: (range, vals) => ({ PitchShift: { range, cents: num(vals, "cents", 0) } }),
+    },
+  ];
+
+  for (const def of fxDefs) {
+    const opt = document.createElement("option");
+    opt.value = def.id;
+    opt.textContent = def.label;
+    ui.fxKindSelect.appendChild(opt);
+  }
+  // Autotune is special: its UI depends on the chosen mode (Scale vs
+  // Reference). Reference mode picks another *source* from the library and
+  // aligns its pitch contour source-start to source-start.
+  {
+    const opt = document.createElement("option");
+    opt.value = "Autotune";
+    opt.textContent = "Autotune";
+    ui.fxKindSelect.appendChild(opt);
+  }
+
+  let autotuneInputs: {
+    mode: HTMLSelectElement;
+    scaleRow: HTMLElement;
+    scale: HTMLSelectElement;
+    key: HTMLSelectElement;
+    referenceRow: HTMLElement;
+    refSource: HTMLSelectElement;
+    retune: HTMLInputElement;
+    formant: HTMLInputElement;
+  } | null = null;
+
+  let currentFxInputs: Record<string, HTMLInputElement | HTMLSelectElement> = {};
+
+  const populateReferenceSources = (excludeId: string | null): void => {
+    if (!autotuneInputs) return;
+    const sel = autotuneInputs.refSource;
+    sel.innerHTML = "";
+    const candidates = sources.filter((s) => s.id !== excludeId);
+    if (candidates.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(no other source)";
+      opt.disabled = true;
+      sel.appendChild(opt);
+      return;
+    }
+    for (const s of candidates) {
+      const opt = document.createElement("option");
+      opt.value = s.id;
+      opt.textContent = s.name;
+      sel.appendChild(opt);
+    }
+  };
+
+  const wrapStyle: Partial<CSSStyleDeclaration> = {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "4px",
+    fontSize: "11px",
+    color: "#aaa",
+  };
+  const selStyle: Partial<CSSStyleDeclaration> = {
+    padding: "2px 4px",
+    background: "#0c0c0c",
+    color: "#d8d8d8",
+    border: "1px solid #3a3a3a",
+    fontSize: "12px",
+  };
+  const numberInputStyle: Partial<CSSStyleDeclaration> = {
+    width: "60px",
+    padding: "2px 4px",
+    background: "#0c0c0c",
+    color: "#d8d8d8",
+    border: "1px solid #3a3a3a",
+    fontFamily: "ui-monospace, monospace",
+    fontSize: "12px",
+  };
+
+  const makeNumberInput = (): HTMLInputElement => {
+    const i = document.createElement("input");
+    i.type = "number";
+    Object.assign(i.style, numberInputStyle);
+    return i;
+  };
+
+  const buildAutotuneInputs = (): void => {
+    ui.fxParamsRow.innerHTML = "";
+    currentFxInputs = {};
+
+    const modeWrap = document.createElement("label");
+    Object.assign(modeWrap.style, wrapStyle);
+    modeWrap.appendChild(document.createTextNode("mode"));
+    const mode = document.createElement("select");
+    Object.assign(mode.style, selStyle);
+    for (const m of ["Scale", "Reference"]) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      mode.appendChild(o);
+    }
+    modeWrap.appendChild(mode);
+
+    const scaleRow = document.createElement("span");
+    Object.assign(scaleRow.style, { display: "inline-flex", gap: "6px" } satisfies Partial<CSSStyleDeclaration>);
+    const scaleWrap = document.createElement("label");
+    Object.assign(scaleWrap.style, wrapStyle);
+    scaleWrap.appendChild(document.createTextNode("scale"));
+    const scale = document.createElement("select");
+    Object.assign(scale.style, selStyle);
+    for (const s of ["Chromatic", "Major", "Minor"]) {
+      const o = document.createElement("option");
+      o.value = s;
+      o.textContent = s;
+      scale.appendChild(o);
+    }
+    scaleWrap.appendChild(scale);
+    const keyWrap = document.createElement("label");
+    Object.assign(keyWrap.style, wrapStyle);
+    keyWrap.appendChild(document.createTextNode("key"));
+    const key = document.createElement("select");
+    Object.assign(key.style, selStyle);
+    for (let i = 0; i < 12; i++) {
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = NOTE_NAMES[i]!;
+      key.appendChild(o);
+    }
+    keyWrap.appendChild(key);
+    scaleRow.appendChild(scaleWrap);
+    scaleRow.appendChild(keyWrap);
+
+    const referenceRow = document.createElement("span");
+    Object.assign(referenceRow.style, { display: "none", gap: "6px" } satisfies Partial<CSSStyleDeclaration>);
+    const refWrap = document.createElement("label");
+    Object.assign(refWrap.style, wrapStyle);
+    refWrap.appendChild(document.createTextNode("reference"));
+    const refSource = document.createElement("select");
+    Object.assign(refSource.style, selStyle);
+    refWrap.appendChild(refSource);
+    referenceRow.appendChild(refWrap);
+
+    const retuneWrap = document.createElement("label");
+    Object.assign(retuneWrap.style, wrapStyle);
+    retuneWrap.appendChild(document.createTextNode("retune ms"));
+    const retune = makeNumberInput();
+    retune.min = "0";
+    retune.max = "500";
+    retune.step = "5";
+    retune.value = "0";
+    retune.title = "0 = instant snap (T-Pain). Larger values glide toward target.";
+    retuneWrap.appendChild(retune);
+
+    const formantWrap = document.createElement("label");
+    Object.assign(formantWrap.style, wrapStyle);
+    formantWrap.title =
+      "Phase-vocoder path with cepstral envelope preservation — keeps formants in place during pitch shift.";
+    const formant = document.createElement("input");
+    formant.type = "checkbox";
+    formantWrap.appendChild(formant);
+    formantWrap.appendChild(document.createTextNode("preserve formants"));
+
+    ui.fxParamsRow.appendChild(modeWrap);
+    ui.fxParamsRow.appendChild(scaleRow);
+    ui.fxParamsRow.appendChild(referenceRow);
+    ui.fxParamsRow.appendChild(retuneWrap);
+    ui.fxParamsRow.appendChild(formantWrap);
+
+    autotuneInputs = {
+      mode,
+      scaleRow,
+      scale,
+      key,
+      referenceRow,
+      refSource,
+      retune,
+      formant,
+    };
+
+    mode.addEventListener("change", () => {
+      const isRef = mode.value === "Reference";
+      scaleRow.style.display = isRef ? "none" : "inline-flex";
+      referenceRow.style.display = isRef ? "inline-flex" : "none";
+      if (isRef) populateReferenceSources(currentSourceId);
+    });
+  };
+
+  const buildFxParamInputs = (def: FxDef): void => {
+    ui.fxParamsRow.innerHTML = "";
+    currentFxInputs = {};
+    for (const p of def.params) {
+      const wrap = document.createElement("label");
+      Object.assign(wrap.style, wrapStyle);
+      const lab = document.createElement("span");
+      lab.textContent = p.label;
+      wrap.appendChild(lab);
+      if (p.kind === "number") {
+        const input = makeNumberInput();
+        input.min = String(p.min);
+        input.max = String(p.max);
+        input.step = String(p.step);
+        input.value = String(p.default);
+        wrap.appendChild(input);
+        currentFxInputs[p.key] = input;
+      } else {
+        const sel = document.createElement("select");
+        Object.assign(sel.style, selStyle);
+        for (const o of p.options) {
+          const op = document.createElement("option");
+          op.value = o;
+          op.textContent = o;
+          sel.appendChild(op);
+        }
+        sel.value = p.default;
+        wrap.appendChild(sel);
+        currentFxInputs[p.key] = sel;
+      }
+      ui.fxParamsRow.appendChild(wrap);
+    }
+  };
+
+  buildFxParamInputs(fxDefs[0]!);
+
+  const syncFxApplyEnabled = (): void => {
+    ui.fxApplyBtn.disabled = currentSourceId === null;
+  };
+
+  ui.fxKindSelect.addEventListener("change", () => {
+    if (ui.fxKindSelect.value === "Autotune") {
+      buildAutotuneInputs();
+      // Initial UI state: Scale mode, so scaleRow is visible already.
+    } else {
+      autotuneInputs = null;
+      const def = fxDefs.find((d) => d.id === ui.fxKindSelect.value);
+      if (def) buildFxParamInputs(def);
+    }
+    syncFxApplyEnabled();
+  });
+
+  /** Build a Reference-mode pitch contour aligned source-start to
+   *  source-start: hop `i` of the input maps to hop `offsetHops + i` of
+   *  the reference, where `offsetHops = floor(inputRange.start / hop)`.
+   *  Frames past the reference's end stay at 0 Hz (unvoiced → no retune). */
+  const buildReferenceContour = async (
+    refSourceId: string,
+    inputRange: { start: number; end: number },
+    hopSamples: number,
+    windowSamples: number,
+  ): Promise<number[]> => {
+    const refInfo = sources.find((s) => s.id === refSourceId);
+    if (!refInfo) return [];
+    const refContour = await client.detectPitchContour(
+      refSourceId,
+      0,
+      refInfo.frames,
+      hopSamples,
+      windowSamples,
+    );
+    const inputFrames = inputRange.end - inputRange.start;
+    const numHops = Math.ceil(inputFrames / hopSamples) + 1;
+    const offsetHops = Math.floor(inputRange.start / hopSamples);
+    const aligned: number[] = new Array(numHops).fill(0);
+    for (let i = 0; i < numHops; i++) {
+      aligned[i] = refContour[offsetHops + i] ?? 0;
+    }
+    return aligned;
+  };
+
+  ui.fxApplyBtn.addEventListener("click", async () => {
+    if (!currentSourceId) return;
+    const range = selection
+      ? { start: selection.inFrame, end: selection.outFrame }
+      : { start: 0, end: sourceFrameCount };
+    if (range.end <= range.start) {
+      ui.status.textContent = "fx: empty range";
+      return;
+    }
+
+    if (ui.fxKindSelect.value === "Autotune") {
+      if (!autotuneInputs) return;
+      const retuneMs = parseFloat(autotuneInputs.retune.value);
+      const preserveFormants = autotuneInputs.formant.checked;
+      ui.fxApplyBtn.disabled = true;
+      try {
+        let target: unknown;
+        if (autotuneInputs.mode.value === "Scale") {
+          const scale = autotuneInputs.scale.value;
+          const keyPc = parseInt(autotuneInputs.key.value, 10) || 0;
+          target = { Scale: { scale, key_pc: keyPc } };
+        } else {
+          const refId = autotuneInputs.refSource.value;
+          if (!refId) {
+            ui.status.textContent = "autotune: pick a reference source";
+            return;
+          }
+          // 25 ms hop, 50 ms window — same family as the engine's autotune
+          // analysis windows, so contour alignment is straightforward.
+          const hopSamples = Math.max(1, Math.round((sourceSampleRate * 25) / 1000));
+          const windowSamples = Math.max(64, Math.round((sourceSampleRate * 50) / 1000));
+          const contour = await buildReferenceContour(refId, range, hopSamples, windowSamples);
+          target = { Reference: { contour_hz: contour, hop_samples: hopSamples } };
+        }
+        const opJson = JSON.stringify({
+          Autotune: {
+            range,
+            params: {
+              target,
+              retune_ms: Number.isFinite(retuneMs) ? retuneMs : 0,
+              preserve_formants: preserveFormants,
+            },
+          },
+        });
+        await client.applyOp(currentSourceId, opJson);
+        await refreshAfterEdit();
+        ui.status.textContent = `Autotune applied (${autotuneInputs.mode.value})`;
+      } catch (err) {
+        ui.status.textContent = `autotune failed: ${String(err)}`;
+      } finally {
+        syncFxApplyEnabled();
+      }
+      return;
+    }
+
+    const def = fxDefs.find((d) => d.id === ui.fxKindSelect.value);
+    if (!def) return;
+    const vals: Record<string, string> = {};
+    for (const [k, el] of Object.entries(currentFxInputs)) vals[k] = el.value;
+    const op = def.build(range, vals);
+    ui.fxApplyBtn.disabled = true;
+    try {
+      await client.applyOp(currentSourceId, JSON.stringify(op));
+      // Length-changing ops: refresh source frame count from the engine,
+      // since the buffer now spans more or fewer frames.
+      if (def.id === "TimeStretch") {
+        const ratio = num(vals, "ratio", 1.0);
+        if (Math.abs(ratio - 1.0) > 1e-3) {
+          await refreshLibrary();
+          await loadSource(currentSourceId);
+          opts.onSourceImported?.();
+          ui.status.textContent = `Time Stretch ×${ratio.toFixed(2)} applied`;
+          return;
+        }
+      }
+      await refreshAfterEdit();
+      // Source content changed — let the arranger refresh its peak cache
+      // and (for length-changing ops we don't special-case here) its
+      // cached source.frames.
+      opts.onSourceImported?.();
+      ui.status.textContent = `${def.label} applied`;
+    } catch (err) {
+      ui.status.textContent = `${def.label} failed: ${String(err)}`;
+    } finally {
+      syncFxApplyEnabled();
+    }
   });
 
   const refreshAfterEdit = async (): Promise<void> => {
@@ -581,13 +1202,44 @@ export async function mountEditor(
     }
   };
 
+  ui.trimBtn.addEventListener("click", async () => {
+    if (!currentSourceId || !selection) return;
+    const range = { start: selection.inFrame, end: selection.outFrame };
+    if (range.end <= range.start) return;
+    ui.trimBtn.disabled = true;
+    try {
+      await client.applyOp(currentSourceId, JSON.stringify({ Trim: { range } }));
+      // Trim shrinks the source — reload from the engine so frame count,
+      // viewport, and selection all align with the new length.
+      await refreshLibrary();
+      await loadSource(currentSourceId);
+      // Tell the arranger so its cached source.frames updates — otherwise
+      // a subsequent drop-onto-track would size the clip against the old
+      // length and reference frames past the trimmed end.
+      opts.onSourceImported?.();
+      ui.status.textContent = `trimmed to selection (${range.end - range.start} frames)`;
+    } catch (err) {
+      ui.status.textContent = `trim failed: ${String(err)}`;
+    } finally {
+      syncSelectionInputs();
+    }
+  });
+
   ui.undoBtn.addEventListener("click", async () => {
     if (!currentSourceId) return;
     ui.undoBtn.disabled = true;
     try {
       const did = await client.undo(currentSourceId);
       ui.status.textContent = did ? "undone" : "nothing to undo";
-      await refreshAfterEdit();
+      // Frame count may have changed (undoing a Trim/Cut) so reload from
+      // the engine rather than just redrawing the waveform in place.
+      if (did) {
+        await refreshLibrary();
+        await loadSource(currentSourceId);
+        opts.onSourceImported?.();
+      } else {
+        await refreshAfterEdit();
+      }
     } catch (err) {
       ui.status.textContent = `undo failed: ${String(err)}`;
     } finally {
@@ -601,7 +1253,13 @@ export async function mountEditor(
     try {
       const did = await client.redo(currentSourceId);
       ui.status.textContent = did ? "redone" : "nothing to redo";
-      await refreshAfterEdit();
+      if (did) {
+        await refreshLibrary();
+        await loadSource(currentSourceId);
+        opts.onSourceImported?.();
+      } else {
+        await refreshAfterEdit();
+      }
     } catch (err) {
       ui.status.textContent = `redo failed: ${String(err)}`;
     } finally {
@@ -609,36 +1267,11 @@ export async function mountEditor(
     }
   });
 
-  ui.gainApplyBtn.addEventListener("click", async () => {
-    if (!currentSourceId || !selection) return;
-    const percent = parseFloat(ui.gainSlider.value);
-    if (!Number.isFinite(percent)) return;
-    const db = percentToDb(percent);
-    const opJson = JSON.stringify({
-      Gain: { range: { start: selection.inFrame, end: selection.outFrame }, db },
-    });
-    ui.gainApplyBtn.disabled = true;
-    try {
-      await client.applyOp(currentSourceId, opJson);
-      ui.gainSlider.value = "100";
-      ui.gainLabel.textContent = "100%";
-      await redrawWaveform();
-      redrawOverlay();
-      if (playback.isPlaying()) {
-        const fromFrame = playback.isPaused() ? selection.inFrame : currentSourceFrame();
-        await startPlay(playback.isLooping(), fromFrame);
-      }
-      ui.status.textContent = `gain ${percent}% (${db.toFixed(2)} dB) applied`;
-    } catch (err) {
-      ui.status.textContent = `gain failed: ${String(err)}`;
-    } finally {
-      ui.gainApplyBtn.disabled = selection === null;
-    }
-  });
-
   syncSelectionInputs();
   syncZoomButtons();
   syncScrollbar();
+  syncFxApplyEnabled();
+  await refreshLibrary();
 
   const reset = async (): Promise<void> => {
     await playback.stop();
@@ -648,12 +1281,11 @@ export async function mountEditor(
     sourceSampleRate = 0;
     viewport = { startFrame: 0, endFrame: 0 };
     cachedPeaks = null;
-    ui.gainSlider.value = "100";
-    ui.gainLabel.textContent = "100%";
     setSelection(null);
     setTransportEnabled(false);
     ui.undoBtn.disabled = true;
     ui.redoBtn.disabled = true;
+    ui.duplicateBtn.disabled = true;
     ui.fileInput.value = "";
     ui.status.textContent = "no source loaded";
     const ctx = ui.canvas.getContext("2d");
@@ -661,9 +1293,11 @@ export async function mountEditor(
     redrawOverlay();
     syncScrollbar();
     syncZoomButtons();
+    syncFxApplyEnabled();
+    await refreshLibrary();
   };
 
-  return { reset };
+  return { reset, refreshLibrary };
 }
 
 interface UiHandles {
@@ -685,9 +1319,12 @@ interface UiHandles {
   zoomFullBtn: HTMLButtonElement;
   zoomSelBtn: HTMLButtonElement;
   scrollbar: HTMLInputElement;
-  gainSlider: HTMLInputElement;
-  gainLabel: HTMLElement;
-  gainApplyBtn: HTMLButtonElement;
+  libraryList: HTMLDivElement;
+  duplicateBtn: HTMLButtonElement;
+  fxKindSelect: HTMLSelectElement;
+  fxParamsRow: HTMLDivElement;
+  fxApplyBtn: HTMLButtonElement;
+  trimBtn: HTMLButtonElement;
   undoBtn: HTMLButtonElement;
   redoBtn: HTMLButtonElement;
 }
@@ -700,6 +1337,7 @@ function buildUi(root: HTMLElement): UiHandles {
     gap: "12px",
   } satisfies Partial<CSSStyleDeclaration>);
 
+  // ---- top "Open WAV" row ----
   const fileRow = document.createElement("label");
   fileRow.style.display = "flex";
   fileRow.style.alignItems = "center";
@@ -711,6 +1349,87 @@ function buildUi(root: HTMLElement): UiHandles {
   fileRow.appendChild(fileInput);
   root.appendChild(fileRow);
 
+  // ---- horizontal split: library | main ----
+  const split = document.createElement("div");
+  Object.assign(split.style, {
+    display: "flex",
+    flexDirection: "row",
+    gap: "12px",
+    alignItems: "stretch",
+    minHeight: "0",
+  } satisfies Partial<CSSStyleDeclaration>);
+  root.appendChild(split);
+
+  // ---- library pane (left) ----
+  const libraryPane = document.createElement("div");
+  Object.assign(libraryPane.style, {
+    width: "240px",
+    flex: "0 0 240px",
+    display: "flex",
+    flexDirection: "column",
+    background: "#101010",
+    border: "1px solid #2a2a2a",
+    boxSizing: "border-box",
+  } satisfies Partial<CSSStyleDeclaration>);
+
+  const libraryHeader = document.createElement("div");
+  Object.assign(libraryHeader.style, {
+    padding: "6px 8px",
+    fontSize: "12px",
+    fontWeight: "600",
+    color: "#cfcfcf",
+    borderBottom: "1px solid #2a2a2a",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const libraryTitle = document.createElement("span");
+  libraryTitle.textContent = "Library";
+  const duplicateBtn = document.createElement("button");
+  duplicateBtn.type = "button";
+  duplicateBtn.textContent = "Duplicate";
+  duplicateBtn.title = "Duplicate the current source (creates an independent copy)";
+  duplicateBtn.disabled = true;
+  Object.assign(duplicateBtn.style, btnStyle(), {
+    padding: "2px 8px",
+    fontSize: "11px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  libraryHeader.appendChild(libraryTitle);
+  libraryHeader.appendChild(duplicateBtn);
+  libraryPane.appendChild(libraryHeader);
+
+  const libraryList = document.createElement("div");
+  Object.assign(libraryList.style, {
+    flex: "1 1 auto",
+    overflowY: "auto",
+    minHeight: "200px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  libraryPane.appendChild(libraryList);
+
+  const libraryHint = document.createElement("div");
+  libraryHint.textContent = "click = load · double-click name = rename";
+  Object.assign(libraryHint.style, {
+    padding: "4px 8px",
+    fontSize: "10px",
+    color: "#777",
+    borderTop: "1px solid #2a2a2a",
+  } satisfies Partial<CSSStyleDeclaration>);
+  libraryPane.appendChild(libraryHint);
+
+  split.appendChild(libraryPane);
+
+  // ---- main pane (right) ----
+  const main = document.createElement("div");
+  Object.assign(main.style, {
+    display: "flex",
+    flexDirection: "column",
+    gap: "12px",
+    flex: "1 1 auto",
+    minWidth: "0",
+  } satisfies Partial<CSSStyleDeclaration>);
+  split.appendChild(main);
+
+  // Transport
   const transport = document.createElement("div");
   transport.style.display = "flex";
   transport.style.gap = "8px";
@@ -730,8 +1449,9 @@ function buildUi(root: HTMLElement): UiHandles {
   transport.appendChild(playBtn);
   transport.appendChild(loopBtn);
   transport.appendChild(stopBtn);
-  root.appendChild(transport);
+  main.appendChild(transport);
 
+  // Waveform canvas
   const canvasWrap = document.createElement("div");
   Object.assign(canvasWrap.style, {
     position: "relative",
@@ -762,7 +1482,7 @@ function buildUi(root: HTMLElement): UiHandles {
   } satisfies Partial<CSSStyleDeclaration>);
   canvasWrap.appendChild(canvas);
   canvasWrap.appendChild(playhead);
-  root.appendChild(canvasWrap);
+  main.appendChild(canvasWrap);
 
   const scrollbar = document.createElement("input");
   scrollbar.type = "range";
@@ -771,8 +1491,9 @@ function buildUi(root: HTMLElement): UiHandles {
     width: "100%",
     margin: "0",
   } satisfies Partial<CSSStyleDeclaration>);
-  root.appendChild(scrollbar);
+  main.appendChild(scrollbar);
 
+  // Zoom row
   const zoomRow = document.createElement("div");
   Object.assign(zoomRow.style, {
     display: "flex",
@@ -806,45 +1527,55 @@ function buildUi(root: HTMLElement): UiHandles {
   zoomRow.appendChild(zoomFullBtn);
   zoomRow.appendChild(zoomSelBtn);
   zoomRow.appendChild(wheelHint);
-  root.appendChild(zoomRow);
+  main.appendChild(zoomRow);
 
+  // FX row: kind select + params + apply + undo/redo
   const fxRow = document.createElement("div");
   Object.assign(fxRow.style, {
     display: "flex",
     alignItems: "center",
     gap: "8px",
     fontSize: "13px",
+    flexWrap: "wrap",
   } satisfies Partial<CSSStyleDeclaration>);
   const fxLabel = document.createElement("span");
-  fxLabel.textContent = "Amplify:";
-  const gainSlider = document.createElement("input");
-  gainSlider.type = "range";
-  gainSlider.min = "0";
-  gainSlider.max = "200";
-  gainSlider.step = "1";
-  gainSlider.value = "100";
-  gainSlider.disabled = true;
-  Object.assign(gainSlider.style, {
-    flex: "1",
-    maxWidth: "300px",
+  fxLabel.textContent = "Effect:";
+  const fxKindSelect = document.createElement("select");
+  Object.assign(fxKindSelect.style, {
+    padding: "4px 6px",
+    background: "#0c0c0c",
+    color: "#d8d8d8",
+    border: "1px solid #3a3a3a",
+    fontSize: "13px",
   } satisfies Partial<CSSStyleDeclaration>);
-  const gainLabel = document.createElement("span");
-  gainLabel.textContent = "100%";
-  Object.assign(gainLabel.style, {
-    fontFamily: "ui-monospace, monospace",
-    minWidth: "70px",
-    textAlign: "right",
+  const fxParamsRow = document.createElement("div");
+  Object.assign(fxParamsRow.style, {
+    display: "inline-flex",
+    alignItems: "center",
+    gap: "8px",
+    flexWrap: "wrap",
   } satisfies Partial<CSSStyleDeclaration>);
-  const gainApplyBtn = document.createElement("button");
-  gainApplyBtn.textContent = "Apply to selection";
-  gainApplyBtn.type = "button";
-  gainApplyBtn.disabled = true;
-  Object.assign(gainApplyBtn.style, btnStyle(), {
+  const fxApplyBtn = document.createElement("button");
+  fxApplyBtn.type = "button";
+  fxApplyBtn.textContent = "Apply";
+  fxApplyBtn.disabled = true;
+  Object.assign(fxApplyBtn.style, btnStyle(), {
     padding: "4px 10px",
   } satisfies Partial<CSSStyleDeclaration>);
-  const gainHint = document.createElement("span");
-  gainHint.textContent = "(100% = unchanged · 0% = silent)";
-  gainHint.style.color = "#9a9a9a";
+  const fxSep = document.createElement("span");
+  fxSep.textContent = "·";
+  fxSep.style.color = "#555";
+  const trimBtn = document.createElement("button");
+  trimBtn.textContent = "Trim";
+  trimBtn.type = "button";
+  trimBtn.disabled = true;
+  trimBtn.title = "Keep only the selection, discard everything outside";
+  Object.assign(trimBtn.style, btnStyle(), {
+    padding: "4px 10px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const fxSep2 = document.createElement("span");
+  fxSep2.textContent = "·";
+  fxSep2.style.color = "#555";
   const undoBtn = document.createElement("button");
   undoBtn.textContent = "Undo";
   undoBtn.type = "button";
@@ -859,16 +1590,22 @@ function buildUi(root: HTMLElement): UiHandles {
   Object.assign(redoBtn.style, btnStyle(), {
     padding: "4px 10px",
   } satisfies Partial<CSSStyleDeclaration>);
-
+  const fxHint = document.createElement("span");
+  fxHint.textContent = "(applies to selection if any, else whole source)";
+  fxHint.style.color = "#9a9a9a";
   fxRow.appendChild(fxLabel);
-  fxRow.appendChild(gainSlider);
-  fxRow.appendChild(gainLabel);
-  fxRow.appendChild(gainApplyBtn);
+  fxRow.appendChild(fxKindSelect);
+  fxRow.appendChild(fxParamsRow);
+  fxRow.appendChild(fxApplyBtn);
+  fxRow.appendChild(fxSep);
+  fxRow.appendChild(trimBtn);
+  fxRow.appendChild(fxSep2);
   fxRow.appendChild(undoBtn);
   fxRow.appendChild(redoBtn);
-  fxRow.appendChild(gainHint);
-  root.appendChild(fxRow);
+  fxRow.appendChild(fxHint);
+  main.appendChild(fxRow);
 
+  // Selection inputs
   const selRow = document.createElement("div");
   Object.assign(selRow.style, {
     display: "flex",
@@ -931,14 +1668,14 @@ function buildUi(root: HTMLElement): UiHandles {
   selRow.appendChild(outMinus);
   selRow.appendChild(outPlus);
   selRow.appendChild(unitsLabel);
-  root.appendChild(selRow);
+  main.appendChild(selRow);
 
   const status = document.createElement("div");
   status.textContent = "no source loaded";
   status.style.fontSize = "12px";
   status.style.color = "#9a9a9a";
   status.style.fontFamily = "ui-monospace, monospace";
-  root.appendChild(status);
+  main.appendChild(status);
 
   return {
     fileInput,
@@ -959,9 +1696,12 @@ function buildUi(root: HTMLElement): UiHandles {
     zoomFullBtn,
     zoomSelBtn,
     scrollbar,
-    gainSlider,
-    gainLabel,
-    gainApplyBtn,
+    libraryList,
+    duplicateBtn,
+    fxKindSelect,
+    fxParamsRow,
+    fxApplyBtn,
+    trimBtn,
     undoBtn,
     redoBtn,
   };
@@ -970,9 +1710,10 @@ function buildUi(root: HTMLElement): UiHandles {
 export function btnStyle(): Partial<CSSStyleDeclaration> {
   return {
     padding: "6px 14px",
-    background: "#2a2a2a",
-    color: "#d8d8d8",
-    border: "1px solid #3a3a3a",
+    background: "var(--bg-2)",
+    color: "var(--text-2)",
+    border: "1px solid var(--line-2)",
+    borderRadius: "var(--r-2)",
     cursor: "pointer",
     fontFamily: "inherit",
   };

@@ -57,6 +57,7 @@ pub enum QueryError {
     UnknownProfile(ProfileId),
     Storage(StorageError),
     Dsp(DspError),
+    EmptyName,
 }
 
 impl std::fmt::Display for QueryError {
@@ -66,6 +67,7 @@ impl std::fmt::Display for QueryError {
             Self::UnknownProfile(id) => write!(f, "unknown noise profile: {id}"),
             Self::Storage(e) => write!(f, "{e}"),
             Self::Dsp(e) => write!(f, "{e}"),
+            Self::EmptyName => write!(f, "name must not be empty"),
         }
     }
 }
@@ -175,8 +177,12 @@ impl Engine {
         Ok(id)
     }
 
+    /// Effective playable length of a source in frames, after applying its
+    /// active edit list. Length-changing ops (Trim, Cut, Generate) make
+    /// this differ from the immutable base file length — UI callers
+    /// always want the effective value.
     pub fn source_frame_count(&self, id: &SourceId) -> Option<u64> {
-        self.project.sources.get(id).map(|s| s.base_length)
+        self.effective_frame_count(id).ok()
     }
 
     pub fn source_sample_rate(&self, id: &SourceId) -> Option<u32> {
@@ -455,11 +461,175 @@ impl Engine {
         crate::mixdown::mixdown_stereo(self)
     }
 
+    /// Make an independent copy of `id`. The copy captures the *current
+    /// rendered* state (base + active edits flattened into a fresh base
+    /// file) with an empty edit list, so subsequent destructive edits to
+    /// either the original or the copy don't affect the other. The new
+    /// source gets an auto-suffixed name (`foo.wav` → `foo(1).wav`) and a
+    /// unique id derived from the original.
+    pub fn duplicate_source(
+        &mut self,
+        id: &SourceId,
+        now: Timestamp,
+    ) -> Result<SourceId, QueryError> {
+        let rendered = self.render_full(id)?;
+        let (channel_count, sample_rate, name) = {
+            let s = self
+                .project
+                .sources
+                .get(id)
+                .expect("verified by render_full");
+            (s.channel_count, s.sample_rate, s.name.clone())
+        };
+        let new_id = self.next_duplicate_id(id);
+        let new_name = self.next_duplicate_name(&name);
+        let path = format!("sources/{new_id}/base.f32");
+        self.storage.write_all(&path, &rendered)?;
+
+        let new_length = rendered.len() as u64 / channel_count as u64;
+        let source = Source::new(
+            new_id.clone(),
+            new_name,
+            channel_count,
+            sample_rate,
+            StoragePath::new(path),
+            new_length,
+            now,
+        );
+        let peaks = PeakCache::from_samples(&rendered, channel_count, DEFAULT_DECIMATION);
+        self.project.sources.insert(new_id.clone(), source);
+        self.peaks.insert(new_id.clone(), peaks);
+        Ok(new_id)
+    }
+
+    /// Set the display name of a source. Empty/whitespace names are rejected.
+    pub fn rename_source(&mut self, id: &SourceId, new_name: &str) -> Result<(), QueryError> {
+        let trimmed = new_name.trim();
+        if trimmed.is_empty() {
+            return Err(QueryError::EmptyName);
+        }
+        let source = self
+            .project
+            .sources
+            .get_mut(id)
+            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+        source.name = trimmed.to_owned();
+        Ok(())
+    }
+
+    fn next_duplicate_id(&self, original: &SourceId) -> SourceId {
+        let stem = original.as_str();
+        for n in 1u32.. {
+            let candidate = SourceId::new(format!("{stem}_d{n}"));
+            if !self.project.sources.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("u32 exhausted before unique id found")
+    }
+
+    fn next_duplicate_name(&self, original: &str) -> String {
+        let existing: std::collections::HashSet<&str> = self
+            .project
+            .sources
+            .values()
+            .map(|s| s.name.as_str())
+            .collect();
+        let (stem, ext) = split_name_ext(original);
+        let (base_stem, start_n) = strip_paren_suffix(stem);
+        for n in start_n.. {
+            let candidate = if ext.is_empty() {
+                format!("{base_stem}({n})")
+            } else {
+                format!("{base_stem}({n}).{ext}")
+            };
+            if !existing.contains(candidate.as_str()) {
+                return candidate;
+            }
+        }
+        unreachable!("u32 exhausted before unique name found")
+    }
+
     /// Convenience: render the project and encode the result as a 32-bit
     /// float WAV. The output is suitable for download or for writing to disk.
     pub fn mixdown_wav(&self) -> Result<Vec<u8>, crate::mixdown::MixdownError> {
         let stereo = self.mixdown_stereo()?;
         Ok(crate::wav::encode_f32(&stereo, 2, self.project.sample_rate()))
+    }
+
+    /// Render the arrangement over `[start_frame, end_frame)` (project
+    /// frames, project sample rate) and store the result as a new stereo
+    /// source named `desired_name`. Returns the new source's id. The name
+    /// is auto-suffixed if it collides with an existing source.
+    ///
+    /// Implementation note: the v1 path renders the full project and slices
+    /// — wasteful for short selections in long arrangements, but correct
+    /// across every existing mixdown feature. A range-aware mixdown can
+    /// land later behind the same API.
+    pub fn render_range_to_source(
+        &mut self,
+        start_frame: u64,
+        end_frame: u64,
+        desired_name: &str,
+        now: Timestamp,
+    ) -> Result<SourceId, crate::mixdown::MixdownError> {
+        if end_frame <= start_frame {
+            return Err(crate::mixdown::MixdownError::Unsupported("empty range"));
+        }
+        let stereo = self.mixdown_stereo()?;
+        let total_frames = (stereo.len() / 2) as u64;
+        if start_frame >= total_frames {
+            return Err(crate::mixdown::MixdownError::Unsupported("range past end"));
+        }
+        let end = end_frame.min(total_frames);
+        let lo = (start_frame * 2) as usize;
+        let hi = (end * 2) as usize;
+        let slice: Vec<f32> = stereo[lo..hi].to_vec();
+
+        let new_id = self.next_id_with_prefix("src_render");
+        let new_name = self.ensure_unique_name(desired_name);
+        let path = format!("sources/{new_id}/base.f32");
+        self.storage
+            .write_all(&path, &slice)
+            .map_err(|e| crate::mixdown::MixdownError::Query(QueryError::Storage(e)))?;
+
+        let frame_count = end - start_frame;
+        let source = Source::new(
+            new_id.clone(),
+            new_name,
+            2,
+            self.project.sample_rate(),
+            StoragePath::new(path),
+            frame_count,
+            now,
+        );
+        let peaks = PeakCache::from_samples(&slice, 2, DEFAULT_DECIMATION);
+        self.project.sources.insert(new_id.clone(), source);
+        self.peaks.insert(new_id.clone(), peaks);
+        Ok(new_id)
+    }
+
+    fn next_id_with_prefix(&self, prefix: &str) -> SourceId {
+        for n in 1u32.. {
+            let candidate = SourceId::new(format!("{prefix}_{n:04}"));
+            if !self.project.sources.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+        unreachable!("u32 exhausted before unique id found")
+    }
+
+    fn ensure_unique_name(&self, desired: &str) -> String {
+        let existing: std::collections::HashSet<&str> = self
+            .project
+            .sources
+            .values()
+            .map(|s| s.name.as_str())
+            .collect();
+        if !existing.contains(desired) {
+            return desired.to_owned();
+        }
+        self.next_duplicate_name(desired)
     }
 
     /// Build a `.kepz` portable archive: project JSON plus every source's
@@ -632,6 +802,27 @@ fn content_derived_id(bytes: &[u8]) -> SourceId {
     hasher.write(bytes);
     let h = hasher.finish();
     SourceId::new(format!("src_{:04x}", h & 0xffff))
+}
+
+fn split_name_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && i < name.len() - 1 => (&name[..i], &name[i + 1..]),
+        _ => (name, ""),
+    }
+}
+
+fn strip_paren_suffix(stem: &str) -> (&str, u32) {
+    if stem.ends_with(')') {
+        if let Some(open) = stem.rfind('(') {
+            if open > 0 {
+                let inside = &stem[open + 1..stem.len() - 1];
+                if let Ok(n) = inside.parse::<u32>() {
+                    return (&stem[..open], n + 1);
+                }
+            }
+        }
+    }
+    (stem, 1)
 }
 
 #[cfg(test)]
@@ -1079,5 +1270,151 @@ mod tests {
         let mut engine = Engine::new(96_000);
         let err = engine.import_wav("bad.wav", b"not a wav", now()).unwrap_err();
         assert!(matches!(err, ImportError::Wav(_)));
+    }
+
+    #[test]
+    fn duplicate_source_creates_independent_copy_with_suffixed_name() {
+        let bytes = synth_mono_wav(&[0.1, 0.2, 0.3, 0.4], 48_000);
+        let mut engine = Engine::new(48_000);
+        let a = engine.import_wav("loop.wav", &bytes, now()).unwrap();
+        let b = engine.duplicate_source(&a, now()).unwrap();
+        assert_ne!(a, b);
+        let names: Vec<String> = engine
+            .project()
+            .sources
+            .values()
+            .map(|s| s.name.clone())
+            .collect();
+        assert!(names.contains(&"loop.wav".to_string()));
+        assert!(names.contains(&"loop(1).wav".to_string()));
+
+        // Editing the original must not change the duplicate's samples.
+        engine
+            .apply_op(
+                &a,
+                Op::Silence {
+                    range: SampleRange::new(0, 4).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+        let dup = engine
+            .read_base_samples(&b, SampleRange::new(0, 4).unwrap())
+            .unwrap();
+        assert!((dup[0] - 0.1).abs() < 1e-6);
+        assert!((dup[1] - 0.2).abs() < 1e-6);
+    }
+
+    #[test]
+    fn duplicate_source_increments_existing_paren_suffix() {
+        let bytes = synth_mono_wav(&[0.0; 4], 48_000);
+        let mut engine = Engine::new(48_000);
+        let a = engine.import_wav("loop.wav", &bytes, now()).unwrap();
+        let _b = engine.duplicate_source(&a, now()).unwrap(); // loop(1).wav
+        let c = engine.duplicate_source(&a, now()).unwrap(); // loop(2).wav (loop(1) taken)
+        let name_c = engine.project().sources.get(&c).unwrap().name.clone();
+        assert_eq!(name_c, "loop(2).wav");
+
+        // Duplicating the (1) variant should produce (2) — but (2) is taken,
+        // so it should land on (3).
+        let b_id = engine
+            .project()
+            .sources
+            .iter()
+            .find(|(_, s)| s.name == "loop(1).wav")
+            .map(|(id, _)| id.clone())
+            .unwrap();
+        let d = engine.duplicate_source(&b_id, now()).unwrap();
+        let name_d = engine.project().sources.get(&d).unwrap().name.clone();
+        assert_eq!(name_d, "loop(3).wav");
+    }
+
+    #[test]
+    fn duplicate_source_handles_extensionless_name() {
+        let bytes = synth_mono_wav(&[0.0; 4], 48_000);
+        let mut engine = Engine::new(48_000);
+        let a = engine.import_wav("kick", &bytes, now()).unwrap();
+        let b = engine.duplicate_source(&a, now()).unwrap();
+        let name = engine.project().sources.get(&b).unwrap().name.clone();
+        assert_eq!(name, "kick(1)");
+    }
+
+    #[test]
+    fn rename_source_sets_name_and_rejects_empty() {
+        let bytes = synth_mono_wav(&[0.0; 2], 48_000);
+        let mut engine = Engine::new(48_000);
+        let a = engine.import_wav("orig.wav", &bytes, now()).unwrap();
+        engine.rename_source(&a, "  bass loop  ").unwrap();
+        let n = engine.project().sources.get(&a).unwrap().name.clone();
+        assert_eq!(n, "bass loop");
+
+        let err = engine.rename_source(&a, "   ").unwrap_err();
+        assert!(matches!(err, QueryError::EmptyName));
+    }
+
+    #[test]
+    fn render_range_to_source_captures_arrangement_slice_as_new_source() {
+        use crate::ids::{ClipId, TrackId};
+        use crate::project::{Clip, Fade, Track};
+
+        let bytes = synth_mono_wav(&[0.5_f32; 100], 48_000);
+        let mut engine = Engine::new(48_000);
+        let src = engine.import_wav("a.wav", &bytes, now()).unwrap();
+
+        let mut track = Track {
+            id: TrackId(1),
+            name: "T".into(),
+            height: 80.0,
+            mute: false,
+            solo: false,
+            arm: false,
+            gain_db: 0.0,
+            pan: 0.0,
+            inserts: Vec::new(),
+            automation: Vec::new(),
+            clips: Vec::new(),
+        };
+        track.clips.push(Clip {
+            id: ClipId(1),
+            source_id: src.clone(),
+            name: "clip".into(),
+            track_position: SampleRange::new(0, 100).unwrap(),
+            source_in: 0,
+            source_out: 100,
+            gain_db: 0.0,
+            pan: 0.0,
+            fade_in: Fade::none(),
+            fade_out: Fade::none(),
+            time_stretch: 1.0,
+            pitch_shift_cents: 0.0,
+            envelopes: Vec::new(),
+            locked: false,
+            group: None,
+        });
+        engine.project_mut().tracks.push(track);
+
+        let new_id = engine
+            .render_range_to_source(20, 60, "Render.wav", now())
+            .unwrap();
+        let new_src = engine.project().sources.get(&new_id).unwrap();
+        assert_eq!(new_src.channel_count, 2);
+        assert_eq!(new_src.base_length, 40);
+        assert_eq!(new_src.name, "Render.wav");
+
+        // A second render with the same desired name should auto-suffix.
+        let new_id2 = engine
+            .render_range_to_source(20, 60, "Render.wav", now())
+            .unwrap();
+        assert_ne!(new_id, new_id2);
+        assert_eq!(
+            engine.project().sources.get(&new_id2).unwrap().name,
+            "Render(1).wav"
+        );
+
+        // Empty range rejected.
+        let err = engine
+            .render_range_to_source(50, 50, "x.wav", now())
+            .unwrap_err();
+        assert!(matches!(err, crate::mixdown::MixdownError::Unsupported(_)));
     }
 }

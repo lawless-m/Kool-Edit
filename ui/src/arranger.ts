@@ -18,14 +18,32 @@ const HEADER_COL_WIDTH = 180;
 const MIN_LANE_PX = 800;
 
 type GridMode = "beats" | "time";
+type SnapDivision = "off" | "bar" | "beat" | "1/2" | "1/3" | "1/4" | "1/8";
+
+const SNAP_OPTIONS: { value: SnapDivision; label: string }[] = [
+  { value: "off", label: "Off" },
+  { value: "bar", label: "Bar" },
+  { value: "beat", label: "Beat" },
+  { value: "1/2", label: "1/2 beat" },
+  { value: "1/3", label: "Triplet (1/3)" },
+  { value: "1/4", label: "1/4 beat" },
+  { value: "1/8", label: "1/8 beat" },
+];
 
 export interface ArrangerHandle {
   refresh(): Promise<void>;
 }
 
+export interface ArrangerOptions {
+  /** Called when the arranger imports a new wav into the library so the
+   *  editor's source list can refresh without a tab switch. */
+  onSourceImported?: () => void;
+}
+
 export async function mountArranger(
   root: HTMLElement,
   client: EngineClient,
+  opts: ArrangerOptions = {},
 ): Promise<ArrangerHandle> {
   const ui = buildUi(root);
 
@@ -81,6 +99,7 @@ export async function mountArranger(
   let beatsPerBar = 4;
   let beatUnit = 4; // 4 = quarter, 8 = eighth, etc.
   let gridMode: GridMode = "beats";
+  let snapDivision: SnapDivision = "beat";
   let pixelsPerSecond = DEFAULT_PIXELS_PER_SECOND;
 
   const setStatus = (msg: string): void => {
@@ -111,10 +130,32 @@ export async function mountArranger(
   const beatsToFrames = (beats: number): number =>
     Math.max(0, Math.round(beats * secondsPerBeat() * projectSr));
 
+  /** Snap step in *beats*. Returns null when snap is off or grid mode is
+   *  time. The bar option is resolved against the current time-sig so a
+   *  later beats-per-bar change picks up automatically. */
+  const snapStepBeats = (): number | null => {
+    if (gridMode !== "beats" || snapDivision === "off") return null;
+    switch (snapDivision) {
+      case "bar":
+        return beatsPerBar;
+      case "beat":
+        return 1;
+      case "1/2":
+        return 0.5;
+      case "1/3":
+        return 1 / 3;
+      case "1/4":
+        return 0.25;
+      case "1/8":
+        return 0.125;
+    }
+  };
+
   const snapFrames = (frames: number): number => {
-    if (gridMode !== "beats") return frames;
+    const step = snapStepBeats();
+    if (step === null) return frames;
     const beats = framesToBeats(frames);
-    return beatsToFrames(Math.round(beats));
+    return beatsToFrames(Math.round(beats / step) * step);
   };
 
   const projectLengthFrames = (): number => {
@@ -175,7 +216,6 @@ export async function mountArranger(
     const noProject = projectLengthFrames() === 0;
     ui.playBtn.disabled = noProject;
     ui.loopBtn.disabled = noProject;
-    syncFxPanel();
   };
 
   const setBinHover = (b: boolean): void => {
@@ -250,8 +290,10 @@ export async function mountArranger(
     return Math.max(MIN_LANE_PX, laneSec * pixelsPerSecond);
   };
 
-  /** Build the CSS for a lane's background grid. Bar lines are heavier;
-   *  beat lines are lighter. In time mode there's just one tick per second. */
+  /** Build the CSS for a lane's background grid. Layers stack from
+   *  faintest to strongest so the strong lines paint on top: sub-beat
+   *  (only when snap is finer than 1 beat), beat, bar. In time mode
+   *  there's just one tick per second. */
   const laneGridStyle = (): { backgroundImage: string; backgroundSize: string } => {
     if (gridMode === "time") {
       const px = pixelsPerSecond;
@@ -266,20 +308,41 @@ export async function mountArranger(
     }
     const beatPx = pxPerBeat();
     const barPx = pxPerBar();
+    const step = snapStepBeats();
+    const layers: string[] = [];
+    const sizes: string[] = [];
+    // Sub-beat layer: only when the snap step is finer than a beat. Even
+    // finer than ~6 px between lines turns into mush, so skip drawing it
+    // in that case (mathematically still snaps, just no visual aid).
+    if (step !== null && step < 1) {
+      const subPx = beatPx * step;
+      if (subPx >= 6) {
+        layers.push(
+          `repeating-linear-gradient(to right,
+            transparent 0,
+            transparent ${subPx - 1}px,
+            rgba(120,120,120,0.10) ${subPx - 1}px,
+            rgba(120,120,120,0.10) ${subPx}px)`,
+        );
+        sizes.push(`${subPx}px 100%`);
+      }
+    }
+    layers.push(
+      `repeating-linear-gradient(to right,
+        transparent 0,
+        transparent ${beatPx - 1}px,
+        rgba(120,120,120,0.16) ${beatPx - 1}px,
+        rgba(120,120,120,0.16) ${beatPx}px)`,
+      `repeating-linear-gradient(to right,
+        transparent 0,
+        transparent ${barPx - 1}px,
+        rgba(180,230,180,0.30) ${barPx - 1}px,
+        rgba(180,230,180,0.30) ${barPx}px)`,
+    );
+    sizes.push(`${beatPx}px 100%`, `${barPx}px 100%`);
     return {
-      backgroundImage: [
-        `repeating-linear-gradient(to right,
-          transparent 0,
-          transparent ${beatPx - 1}px,
-          rgba(120,120,120,0.16) ${beatPx - 1}px,
-          rgba(120,120,120,0.16) ${beatPx}px)`,
-        `repeating-linear-gradient(to right,
-          transparent 0,
-          transparent ${barPx - 1}px,
-          rgba(180,230,180,0.30) ${barPx - 1}px,
-          rgba(180,230,180,0.30) ${barPx}px)`,
-      ].join(", "),
-      backgroundSize: `${beatPx}px 100%, ${barPx}px 100%`,
+      backgroundImage: layers.join(", "),
+      backgroundSize: sizes.join(", "),
     };
   };
 
@@ -336,7 +399,35 @@ export async function mountArranger(
     if (gridMode === "beats") {
       const barPx = pxPerBar();
       const beatPx = pxPerBeat();
+      const step = snapStepBeats();
       const totalBars = Math.ceil(laneWidth / barPx);
+      // Sub-beat ticks first (faintest), so beat / bar ticks paint over.
+      // Only draw sub-beat ticks when (a) the snap step is finer than
+      // a beat and (b) there's enough px between them to be useful.
+      if (step !== null && step < 1) {
+        const subPx = beatPx * step;
+        if (subPx >= 6) {
+          const totalSubs = Math.ceil(laneWidth / subPx);
+          for (let i = 0; i <= totalSubs; i++) {
+            // Skip subdivisions that fall on a beat or bar line — those
+            // get their own (stronger) tick below.
+            const beatsAt = i * step;
+            if (Math.abs(beatsAt - Math.round(beatsAt)) < 1e-6) continue;
+            const xSub = i * subPx;
+            if (xSub > laneWidth) break;
+            const tick = document.createElement("div");
+            Object.assign(tick.style, {
+              position: "absolute",
+              left: `${xSub}px`,
+              top: "8px",
+              bottom: "0",
+              width: "1px",
+              background: "rgba(120,120,120,0.25)",
+            } satisfies Partial<CSSStyleDeclaration>);
+            ruler.appendChild(tick);
+          }
+        }
+      }
       for (let bar = 0; bar <= totalBars; bar++) {
         const xBar = bar * barPx;
         addTick(xBar, `${bar + 1}`, true);
@@ -370,7 +461,9 @@ export async function mountArranger(
 
   const drawSelection = (): void => {
     const o = ui.selectionOverlay;
-    if (!hasSelection()) {
+    const has = hasSelection();
+    ui.renderToClipBtn.disabled = !has;
+    if (!has) {
       o.style.display = "none";
       ui.inHandle.style.display = "none";
       ui.outHandle.style.display = "none";
@@ -814,6 +907,7 @@ export async function mountArranger(
       setStatus(`imported ${file.name} as ${imp.sourceId}`);
       ui.fileInput.value = "";
       await refresh();
+      opts.onSourceImported?.();
     } catch (err) {
       setStatus(`import failed: ${String(err)}`);
     }
@@ -833,655 +927,6 @@ export async function mountArranger(
     selectedClip = null;
     await refresh();
   });
-
-  // ---- clip FX --------------------------------------------------------
-  // Destructive ops applied to the underlying source over the clip's
-  // [sourceIn, sourceOut) window. Same path as the editor's gain effect:
-  // build an opJson and call applyOp; refresh peaks for the affected source
-  // and redraw; if playing, restart so the change is heard.
-
-  type FxParam =
-    | { kind: "number"; key: string; label: string; min: number; max: number; step: number; default: number }
-    | { kind: "select"; key: string; label: string; options: string[]; default: string };
-
-  interface FxDef {
-    id: string;
-    label: string;
-    params: FxParam[];
-    build: (range: { start: number; end: number }, vals: Record<string, string>) => unknown;
-  }
-
-  const num = (vals: Record<string, string>, k: string, fallback: number): number => {
-    const v = parseFloat(vals[k] ?? "");
-    return Number.isFinite(v) ? v : fallback;
-  };
-
-  const fxDefs: FxDef[] = [
-    {
-      id: "Gain",
-      label: "Gain",
-      params: [{ kind: "number", key: "db", label: "dB", min: -60, max: 24, step: 0.5, default: 0 }],
-      build: (range, vals) => ({ Gain: { range, db: num(vals, "db", 0) } }),
-    },
-    {
-      id: "Normalize",
-      label: "Normalize",
-      params: [
-        {
-          kind: "select",
-          key: "target",
-          label: "target",
-          options: ["Peak", "Rms", "LufsIntegrated"],
-          default: "Peak",
-        },
-        { kind: "number", key: "value_db", label: "dB", min: -30, max: 0, step: 0.1, default: -1 },
-      ],
-      build: (range, vals) => ({
-        Normalize: {
-          range,
-          target: vals.target ?? "Peak",
-          value_db: num(vals, "value_db", -1),
-        },
-      }),
-    },
-    {
-      id: "Reverse",
-      label: "Reverse",
-      params: [],
-      build: (range) => ({ Reverse: { range } }),
-    },
-    {
-      id: "DcRemove",
-      label: "DC Remove",
-      params: [],
-      build: (range) => ({ DcRemove: { range } }),
-    },
-    {
-      id: "Silence",
-      label: "Silence",
-      params: [],
-      build: (range) => ({ Silence: { range } }),
-    },
-    {
-      id: "Fade",
-      label: "Fade",
-      params: [
-        { kind: "select", key: "direction", label: "dir", options: ["In", "Out"], default: "In" },
-        {
-          kind: "select",
-          key: "shape",
-          label: "shape",
-          options: ["Linear", "Logarithmic", "Exponential", "SCurve"],
-          default: "Linear",
-        },
-      ],
-      build: (range, vals) => ({
-        Fade: {
-          range,
-          shape: vals.shape ?? "Linear",
-          direction: vals.direction ?? "In",
-        },
-      }),
-    },
-    {
-      id: "Reverb",
-      label: "Reverb",
-      params: [
-        {
-          kind: "select",
-          key: "model",
-          label: "model",
-          options: ["Hall", "Room", "Plate"],
-          default: "Hall",
-        },
-        { kind: "number", key: "size", label: "size", min: 0, max: 1, step: 0.05, default: 0.5 },
-        { kind: "number", key: "damping", label: "damp", min: 0, max: 1, step: 0.05, default: 0.5 },
-        { kind: "number", key: "mix", label: "mix", min: 0, max: 1, step: 0.05, default: 0.3 },
-      ],
-      build: (range, vals) => ({
-        Reverb: {
-          range,
-          params: {
-            model: vals.model ?? "Hall",
-            size: num(vals, "size", 0.5),
-            damping: num(vals, "damping", 0.5),
-            mix: num(vals, "mix", 0.3),
-          },
-        },
-      }),
-    },
-    {
-      id: "Delay",
-      label: "Delay",
-      params: [
-        { kind: "number", key: "time_ms", label: "ms", min: 1, max: 2000, step: 10, default: 250 },
-        { kind: "number", key: "feedback", label: "fb", min: 0, max: 0.95, step: 0.05, default: 0.4 },
-        { kind: "number", key: "mix", label: "mix", min: 0, max: 1, step: 0.05, default: 0.3 },
-        { kind: "select", key: "ping_pong", label: "ping-pong", options: ["off", "on"], default: "off" },
-      ],
-      build: (range, vals) => ({
-        Delay: {
-          range,
-          params: {
-            time_ms: num(vals, "time_ms", 250),
-            feedback: num(vals, "feedback", 0.4),
-            mix: num(vals, "mix", 0.3),
-            ping_pong: vals.ping_pong === "on",
-            feedback_lp_hz: null,
-          },
-        },
-      }),
-    },
-    {
-      id: "TimeStretch",
-      label: "Time Stretch",
-      params: [
-        { kind: "number", key: "ratio", label: "ratio", min: 0.25, max: 4, step: 0.05, default: 1.0 },
-      ],
-      build: (range, vals) => ({ TimeStretch: { range, ratio: num(vals, "ratio", 1.0) } }),
-    },
-    {
-      id: "PitchShift",
-      label: "Pitch Shift",
-      params: [
-        { kind: "number", key: "cents", label: "cents", min: -2400, max: 2400, step: 50, default: 0 },
-      ],
-      build: (range, vals) => ({ PitchShift: { range, cents: num(vals, "cents", 0) } }),
-    },
-  ];
-
-  for (const def of fxDefs) {
-    const opt = document.createElement("option");
-    opt.value = def.id;
-    opt.textContent = def.label;
-    ui.fxKindSelect.appendChild(opt);
-  }
-  // Autotune is special: its UI depends on the chosen mode (Scale vs
-  // Reference) and Reference mode requires async work (run YIN over a
-  // reference clip) before the op can be built. So it lives outside the
-  // simple fxDefs schema, picked by id "Autotune".
-  {
-    const opt = document.createElement("option");
-    opt.value = "Autotune";
-    opt.textContent = "Autotune";
-    ui.fxKindSelect.appendChild(opt);
-  }
-
-  // Autotune-specific inputs live here. Built lazily when the user picks
-  // "Autotune" in the kind dropdown; cleared when they pick anything else.
-  let autotuneInputs: {
-    mode: HTMLSelectElement;
-    scaleRow: HTMLElement;
-    scale: HTMLSelectElement;
-    key: HTMLSelectElement;
-    referenceRow: HTMLElement;
-    refClip: HTMLSelectElement;
-    retune: HTMLInputElement;
-    formant: HTMLInputElement;
-  } | null = null;
-
-  const NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
-
-  /** Populate the reference-clip dropdown with every clip currently in the
-   *  arranger except the one that's being autotuned (we don't tune to
-   *  ourselves). Each option's value is "trackId:clipId". */
-  const populateReferenceClips = (excludeTrackId: number, excludeClipId: number): void => {
-    if (!autotuneInputs) return;
-    const sel = autotuneInputs.refClip;
-    sel.innerHTML = "";
-    for (const t of tracks) {
-      const list = clipsByTrack.get(t.id) ?? [];
-      for (const c of list) {
-        if (t.id === excludeTrackId && c.id === excludeClipId) continue;
-        const opt = document.createElement("option");
-        opt.value = `${t.id}:${c.id}`;
-        const src = findSource(c.sourceId);
-        opt.textContent = `${t.name} — ${src?.name ?? c.sourceId}`;
-        sel.appendChild(opt);
-      }
-    }
-    if (sel.options.length === 0) {
-      const opt = document.createElement("option");
-      opt.value = "";
-      opt.textContent = "(no other clip available)";
-      opt.disabled = true;
-      sel.appendChild(opt);
-    }
-  };
-
-  const buildAutotuneInputs = (): void => {
-    ui.fxParamsRow.innerHTML = "";
-    currentFxInputs = {};
-    const wrapStyle: Partial<CSSStyleDeclaration> = {
-      display: "inline-flex",
-      alignItems: "center",
-      gap: "4px",
-      fontSize: "11px",
-      color: "#aaa",
-    };
-    const selStyle: Partial<CSSStyleDeclaration> = {
-      padding: "2px 4px",
-      background: "#0c0c0c",
-      color: "#d8d8d8",
-      border: "1px solid #3a3a3a",
-      fontSize: "12px",
-    };
-
-    const modeWrap = document.createElement("label");
-    Object.assign(modeWrap.style, wrapStyle);
-    modeWrap.appendChild(document.createTextNode("mode"));
-    const mode = document.createElement("select");
-    Object.assign(mode.style, selStyle);
-    for (const m of ["Scale", "Reference"]) {
-      const o = document.createElement("option");
-      o.value = m;
-      o.textContent = m;
-      mode.appendChild(o);
-    }
-    modeWrap.appendChild(mode);
-
-    // Scale-mode controls (scale + key)
-    const scaleRow = document.createElement("span");
-    Object.assign(scaleRow.style, { display: "inline-flex", gap: "6px" } satisfies Partial<CSSStyleDeclaration>);
-    const scaleWrap = document.createElement("label");
-    Object.assign(scaleWrap.style, wrapStyle);
-    scaleWrap.appendChild(document.createTextNode("scale"));
-    const scale = document.createElement("select");
-    Object.assign(scale.style, selStyle);
-    for (const s of ["Chromatic", "Major", "Minor"]) {
-      const o = document.createElement("option");
-      o.value = s;
-      o.textContent = s;
-      scale.appendChild(o);
-    }
-    scaleWrap.appendChild(scale);
-    const keyWrap = document.createElement("label");
-    Object.assign(keyWrap.style, wrapStyle);
-    keyWrap.appendChild(document.createTextNode("key"));
-    const key = document.createElement("select");
-    Object.assign(key.style, selStyle);
-    for (let i = 0; i < 12; i++) {
-      const o = document.createElement("option");
-      o.value = String(i);
-      o.textContent = NOTE_NAMES[i]!;
-      key.appendChild(o);
-    }
-    keyWrap.appendChild(key);
-    scaleRow.appendChild(scaleWrap);
-    scaleRow.appendChild(keyWrap);
-
-    // Reference-mode controls (clip picker)
-    const referenceRow = document.createElement("span");
-    Object.assign(referenceRow.style, { display: "none", gap: "6px" } satisfies Partial<CSSStyleDeclaration>);
-    const refWrap = document.createElement("label");
-    Object.assign(refWrap.style, wrapStyle);
-    refWrap.appendChild(document.createTextNode("reference"));
-    const refClip = document.createElement("select");
-    Object.assign(refClip.style, selStyle);
-    refWrap.appendChild(refClip);
-    referenceRow.appendChild(refWrap);
-
-    // Retune speed (always visible)
-    const retuneWrap = document.createElement("label");
-    Object.assign(retuneWrap.style, wrapStyle);
-    retuneWrap.appendChild(document.createTextNode("retune ms"));
-    const retune = makeNumberInput(60);
-    retune.min = "0";
-    retune.max = "500";
-    retune.step = "5";
-    retune.value = "0";
-    retune.title = "0 = instant snap (T-Pain). Larger values glide toward target.";
-    retuneWrap.appendChild(retune);
-
-    // Formant preserve toggle (wired but unimplemented in v1)
-    const formantWrap = document.createElement("label");
-    Object.assign(formantWrap.style, wrapStyle);
-    formantWrap.title =
-      "Preserve formants — slot reserved, not yet implemented; toggle is stored in the project.";
-    const formant = document.createElement("input");
-    formant.type = "checkbox";
-    formantWrap.appendChild(formant);
-    formantWrap.appendChild(document.createTextNode("preserve formants"));
-
-    ui.fxParamsRow.appendChild(modeWrap);
-    ui.fxParamsRow.appendChild(scaleRow);
-    ui.fxParamsRow.appendChild(referenceRow);
-    ui.fxParamsRow.appendChild(retuneWrap);
-    ui.fxParamsRow.appendChild(formantWrap);
-
-    autotuneInputs = {
-      mode,
-      scaleRow,
-      scale,
-      key,
-      referenceRow,
-      refClip,
-      retune,
-      formant,
-    };
-
-    mode.addEventListener("change", () => {
-      const isRef = mode.value === "Reference";
-      scaleRow.style.display = isRef ? "none" : "inline-flex";
-      referenceRow.style.display = isRef ? "inline-flex" : "none";
-      if (isRef && selectedClip) {
-        populateReferenceClips(selectedClip.trackId, selectedClip.clipId);
-      }
-    });
-
-    if (selectedClip) {
-      populateReferenceClips(selectedClip.trackId, selectedClip.clipId);
-    }
-  };
-
-  // Per-effect input elements live here so we can read their current values
-  // at apply time. Recreated whenever the picker changes.
-  let currentFxInputs: Record<string, HTMLInputElement | HTMLSelectElement> = {};
-
-  const buildFxParamInputs = (def: FxDef): void => {
-    ui.fxParamsRow.innerHTML = "";
-    currentFxInputs = {};
-    for (const p of def.params) {
-      const wrap = document.createElement("label");
-      Object.assign(wrap.style, {
-        display: "inline-flex",
-        alignItems: "center",
-        gap: "4px",
-        fontSize: "11px",
-        color: "#aaa",
-      } satisfies Partial<CSSStyleDeclaration>);
-      const lab = document.createElement("span");
-      lab.textContent = p.label;
-      wrap.appendChild(lab);
-      if (p.kind === "number") {
-        const input = makeNumberInput(60);
-        input.min = String(p.min);
-        input.max = String(p.max);
-        input.step = String(p.step);
-        input.value = String(p.default);
-        wrap.appendChild(input);
-        currentFxInputs[p.key] = input;
-      } else {
-        const sel = document.createElement("select");
-        Object.assign(sel.style, {
-          padding: "2px 4px",
-          background: "#0c0c0c",
-          color: "#d8d8d8",
-          border: "1px solid #3a3a3a",
-          fontSize: "12px",
-        } satisfies Partial<CSSStyleDeclaration>);
-        for (const o of p.options) {
-          const op = document.createElement("option");
-          op.value = o;
-          op.textContent = o;
-          sel.appendChild(op);
-        }
-        sel.value = p.default;
-        wrap.appendChild(sel);
-        currentFxInputs[p.key] = sel;
-      }
-      ui.fxParamsRow.appendChild(wrap);
-    }
-  };
-
-  buildFxParamInputs(fxDefs[0]!);
-
-  const findClip = (): ClipInfo | null => {
-    if (!selectedClip) return null;
-    const list = clipsByTrack.get(selectedClip.trackId) ?? [];
-    return list.find((c) => c.id === selectedClip!.clipId) ?? null;
-  };
-
-  const findSource = (sourceId: string): SourceInfo | null =>
-    sources.find((s) => s.id === sourceId) ?? null;
-
-  const syncFxPanel = (): void => {
-    const clip = findClip();
-    const enabled = clip !== null;
-    ui.fxKindSelect.disabled = !enabled;
-    ui.fxApplyBtn.disabled = !enabled;
-    for (const el of Object.values(currentFxInputs)) el.disabled = !enabled;
-    if (autotuneInputs) {
-      autotuneInputs.mode.disabled = !enabled;
-      autotuneInputs.scale.disabled = !enabled;
-      autotuneInputs.key.disabled = !enabled;
-      autotuneInputs.refClip.disabled = !enabled;
-      autotuneInputs.retune.disabled = !enabled;
-      autotuneInputs.formant.disabled = !enabled;
-      if (enabled && selectedClip && autotuneInputs.mode.value === "Reference") {
-        populateReferenceClips(selectedClip.trackId, selectedClip.clipId);
-      }
-    }
-    // Undo/redo are per-source: enabled when a clip is selected.
-    ui.fxUndoBtn.disabled = !enabled;
-    ui.fxRedoBtn.disabled = !enabled;
-    if (clip) {
-      const src = findSource(clip.sourceId);
-      const span = clip.sourceOut - clip.sourceIn;
-      ui.fxInfo.textContent = src
-        ? `Source: ${src.name} — applying to clip range [${clip.sourceIn}, ${clip.sourceOut}) (${span} frames). Destructive: every clip using this source will change.`
-        : `Source ${clip.sourceId} (range ${clip.sourceIn}..${clip.sourceOut})`;
-    } else {
-      ui.fxInfo.textContent =
-        "(select a clip to edit it destructively — affects every clip sharing the source)";
-    }
-  };
-
-  ui.fxKindSelect.addEventListener("change", () => {
-    if (ui.fxKindSelect.value === "Autotune") {
-      buildAutotuneInputs();
-    } else {
-      autotuneInputs = null;
-      const def = fxDefs.find((d) => d.id === ui.fxKindSelect.value);
-      if (def) buildFxParamInputs(def);
-    }
-    syncFxPanel();
-  });
-
-  /** Build a Reference-mode contour aligned to the input clip's source
-   *  range. For each hop within the input range we look up the timeline
-   *  position, find the same timeline position inside the reference clip,
-   *  and pull that hop's pitch from the reference's contour. Frames outside
-   *  the reference clip stay at 0 Hz (autotune treats those as unvoiced
-   *  and leaves the audio untouched). */
-  const buildReferenceContour = async (
-    inputClip: ClipInfo,
-    refClip: ClipInfo,
-    hopSamples: number,
-    windowSamples: number,
-  ): Promise<{ contour: number[]; hop: number }> => {
-    const refContour = await client.detectPitchContour(
-      refClip.sourceId,
-      refClip.sourceIn,
-      refClip.sourceOut,
-      hopSamples,
-      windowSamples,
-    );
-    const inputFrames = inputClip.sourceOut - inputClip.sourceIn;
-    const numHops = Math.ceil(inputFrames / hopSamples) + 1;
-    const aligned: number[] = new Array(numHops).fill(0);
-    for (let i = 0; i < numHops; i++) {
-      // Frame within the input source range, relative to inputClip.sourceIn.
-      const inputOffset = i * hopSamples;
-      // Project-timeline frame for that input position.
-      const timelinePos = inputClip.position + inputOffset;
-      // Same timeline frame mapped back to the reference clip's source.
-      const refSourcePos = timelinePos - refClip.position + refClip.sourceIn;
-      if (refSourcePos < refClip.sourceIn || refSourcePos >= refClip.sourceOut) {
-        continue;
-      }
-      const refOffset = refSourcePos - refClip.sourceIn;
-      const refIdx = Math.floor(refOffset / hopSamples);
-      aligned[i] = refContour[refIdx] ?? 0;
-    }
-    return { contour: aligned, hop: hopSamples };
-  };
-
-  ui.fxApplyBtn.addEventListener("click", async () => {
-    const clip = findClip();
-    const sel = selectedClip;
-    if (!clip || !sel) return;
-
-    // Autotune lives outside fxDefs so it gets its own branch up front.
-    if (ui.fxKindSelect.value === "Autotune") {
-      if (!autotuneInputs) return;
-      const range = { start: clip.sourceIn, end: clip.sourceOut };
-      if (range.end <= range.start) {
-        setStatus("fx: clip has empty range");
-        return;
-      }
-      const retuneMs = parseFloat(autotuneInputs.retune.value);
-      const preserveFormants = autotuneInputs.formant.checked;
-      ui.fxApplyBtn.disabled = true;
-      try {
-        let target: unknown;
-        if (autotuneInputs.mode.value === "Scale") {
-          const scale = autotuneInputs.scale.value;
-          const keyPc = parseInt(autotuneInputs.key.value, 10) || 0;
-          target = { Scale: { scale, key_pc: keyPc } };
-        } else {
-          const refKey = autotuneInputs.refClip.value;
-          if (!refKey) {
-            setStatus("autotune: pick a reference clip");
-            return;
-          }
-          const [refTrackIdStr, refClipIdStr] = refKey.split(":");
-          const refTrackId = parseInt(refTrackIdStr ?? "", 10);
-          const refClipId = parseInt(refClipIdStr ?? "", 10);
-          const refList = clipsByTrack.get(refTrackId) ?? [];
-          const refClip = refList.find((c) => c.id === refClipId);
-          if (!refClip) {
-            setStatus("autotune: reference clip not found");
-            return;
-          }
-          // 25 ms hop, 50 ms window — same family as the engine's autotune
-          // analysis windows, so contour alignment is straightforward.
-          const hopSamples = Math.max(1, Math.round((projectSr * 25) / 1000));
-          const windowSamples = Math.max(64, Math.round((projectSr * 50) / 1000));
-          const { contour, hop } = await buildReferenceContour(
-            clip,
-            refClip,
-            hopSamples,
-            windowSamples,
-          );
-          target = {
-            Reference: {
-              contour_hz: contour,
-              hop_samples: hop,
-            },
-          };
-        }
-        const opJson = JSON.stringify({
-          Autotune: {
-            range,
-            params: {
-              target,
-              retune_ms: Number.isFinite(retuneMs) ? retuneMs : 0,
-              preserve_formants: preserveFormants,
-            },
-          },
-        });
-        await client.applyOp(clip.sourceId, opJson);
-        await refreshSourceAfterFx(clip.sourceId);
-        setStatus(`Autotune applied (${autotuneInputs.mode.value})`);
-      } catch (err) {
-        setStatus(`autotune failed: ${String(err)}`);
-      } finally {
-        syncFxPanel();
-      }
-      return;
-    }
-
-    const def = fxDefs.find((d) => d.id === ui.fxKindSelect.value);
-    if (!def) return;
-    const vals: Record<string, string> = {};
-    for (const [k, el] of Object.entries(currentFxInputs)) vals[k] = el.value;
-    const range = { start: clip.sourceIn, end: clip.sourceOut };
-    if (range.end <= range.start) {
-      setStatus("fx: clip has empty range");
-      return;
-    }
-    const op = def.build(range, vals);
-    ui.fxApplyBtn.disabled = true;
-    try {
-      await client.applyOp(clip.sourceId, JSON.stringify(op));
-
-      // TimeStretch resizes the source range. Replace the clip so its
-      // window covers the stretched content rather than just the prefix.
-      // PitchShift preserves length, so no clip surgery needed.
-      if (def.id === "TimeStretch") {
-        const ratio = num(vals, "ratio", 1.0);
-        if (Math.abs(ratio - 1.0) > 1e-3) {
-          const oldLen = clip.sourceOut - clip.sourceIn;
-          const newLen = Math.max(1, Math.round(oldLen * ratio));
-          const newSourceOut = clip.sourceIn + newLen;
-          await client.removeClip(sel.trackId, sel.clipId);
-          const newId = await client.addClip(
-            sel.trackId,
-            clip.sourceId,
-            clip.position,
-            clip.sourceIn,
-            newSourceOut,
-          );
-          selectedClip = { trackId: sel.trackId, clipId: newId };
-          await refresh();
-          setStatus(`Time Stretch ×${ratio.toFixed(2)} applied (clip resized)`);
-          return;
-        }
-      }
-
-      await refreshSourceAfterFx(clip.sourceId);
-      setStatus(`${def.label} applied to ${clip.sourceId}`);
-    } catch (err) {
-      setStatus(`fx ${def.label} failed: ${String(err)}`);
-    } finally {
-      syncFxPanel();
-    }
-  });
-
-  ui.fxUndoBtn.addEventListener("click", async () => {
-    const clip = findClip();
-    if (!clip) return;
-    ui.fxUndoBtn.disabled = true;
-    try {
-      const did = await client.undo(clip.sourceId);
-      setStatus(did ? "undone" : "nothing to undo");
-      await refreshSourceAfterFx(clip.sourceId);
-    } catch (err) {
-      setStatus(`undo failed: ${String(err)}`);
-    } finally {
-      syncFxPanel();
-    }
-  });
-
-  ui.fxRedoBtn.addEventListener("click", async () => {
-    const clip = findClip();
-    if (!clip) return;
-    ui.fxRedoBtn.disabled = true;
-    try {
-      const did = await client.redo(clip.sourceId);
-      setStatus(did ? "redone" : "nothing to redo");
-      await refreshSourceAfterFx(clip.sourceId);
-    } catch (err) {
-      setStatus(`redo failed: ${String(err)}`);
-    } finally {
-      syncFxPanel();
-    }
-  });
-
-  // After a destructive op runs we only need to refresh peaks for the one
-  // affected source; everything else (clip lengths, tempo, tracks) is
-  // unchanged. Then redraw and re-render any active playback.
-  const refreshSourceAfterFx = async (sourceId: string): Promise<void> => {
-    try {
-      const peaks = await client.peakSummary(sourceId, PEAK_COLS);
-      sourcePeaks.set(sourceId, peaks);
-    } catch {
-      sourcePeaks.delete(sourceId);
-    }
-    drawTracks();
-    rerenderIfPlaying();
-  };
 
   // ---- zoom -----------------------------------------------------------
 
@@ -1558,10 +1003,26 @@ export async function mountArranger(
   ui.modeTimeBtn.addEventListener("click", () => setMode("time"));
   setMode("beats");
 
-  const persistTempo = (): void => {
-    void client.setTempo(bpm, beatsPerBar, beatUnit);
-  };
+  // Populate the snap dropdown and wire it. Changing the snap value
+  // redraws tracks so the lane grid + ruler reflect the new resolution.
+  for (const opt of SNAP_OPTIONS) {
+    const o = document.createElement("option");
+    o.value = opt.value;
+    o.textContent = opt.label;
+    ui.snapSelect.appendChild(o);
+  }
+  ui.snapSelect.value = snapDivision;
+  ui.snapSelect.addEventListener("change", () => {
+    snapDivision = ui.snapSelect.value as SnapDivision;
+    drawTracks();
+  });
 
+  const persistTempo = (): Promise<void> =>
+    client.setTempo(bpm, beatsPerBar, beatUnit);
+
+  // Persist the new tempo to the engine *before* reflow's refresh() pulls it
+  // back in — otherwise refresh() reads the stale value and clobbers the
+  // user's edit.
   ui.bpmInput.addEventListener("change", async () => {
     const v = parseFloat(ui.bpmInput.value);
     if (!Number.isFinite(v) || v <= 0) {
@@ -1571,9 +1032,9 @@ export async function mountArranger(
     const oldSPB = secondsPerBeat();
     const oldBPB = beatsPerBar;
     bpm = v;
+    await persistTempo();
     setStatus(`bpm ${bpm}`);
     await reflowForGridChange(oldSPB, oldBPB);
-    persistTempo();
     rerenderIfPlaying();
   });
 
@@ -1586,9 +1047,9 @@ export async function mountArranger(
     const oldSPB = secondsPerBeat();
     const oldBPB = beatsPerBar;
     beatsPerBar = v;
+    await persistTempo();
     setStatus(`time signature ${beatsPerBar}/${beatUnit}`);
     await reflowForGridChange(oldSPB, oldBPB);
-    persistTempo();
     rerenderIfPlaying();
   });
 
@@ -1601,9 +1062,9 @@ export async function mountArranger(
     const oldSPB = secondsPerBeat();
     const oldBPB = beatsPerBar;
     beatUnit = v;
+    await persistTempo();
     setStatus(`time signature ${beatsPerBar}/${beatUnit}`);
     await reflowForGridChange(oldSPB, oldBPB);
-    persistTempo();
     rerenderIfPlaying();
   });
 
@@ -1919,6 +1380,25 @@ export async function mountArranger(
     setStatus("selection cleared");
   });
 
+  ui.renderToClipBtn.addEventListener("click", async () => {
+    if (!hasSelection()) return;
+    const start = inFrame!;
+    const end = outFrame!;
+    ui.renderToClipBtn.disabled = true;
+    setStatus("rendering selection…");
+    try {
+      const newId = await client.renderRangeToSource(start, end, "Render.wav");
+      const seconds = (end - start) / Math.max(1, projectSr);
+      setStatus(`rendered ${seconds.toFixed(2)}s → ${newId}`);
+      await refresh();
+      opts.onSourceImported?.();
+    } catch (err) {
+      setStatus(`render failed: ${String(err)}`);
+    } finally {
+      ui.renderToClipBtn.disabled = !hasSelection();
+    }
+  });
+
   // Delete (not Backspace — browsers map that to navigate-back) removes the
   // selected clip. Skip when typing in inputs so digits can be edited freely.
   window.addEventListener("keydown", (ev) => {
@@ -1970,6 +1450,7 @@ interface ArrangerUi {
   deleteClipBtn: HTMLButtonElement;
   modeBeatsBtn: HTMLButtonElement;
   modeTimeBtn: HTMLButtonElement;
+  snapSelect: HTMLSelectElement;
   bpmInput: HTMLInputElement;
   beatsPerBarInput: HTMLInputElement;
   beatUnitInput: HTMLInputElement;
@@ -1980,13 +1461,7 @@ interface ArrangerUi {
   loopBtn: HTMLButtonElement;
   stopBtn: HTMLButtonElement;
   clearSelBtn: HTMLButtonElement;
-  fxPanel: HTMLDivElement;
-  fxKindSelect: HTMLSelectElement;
-  fxParamsRow: HTMLDivElement;
-  fxApplyBtn: HTMLButtonElement;
-  fxUndoBtn: HTMLButtonElement;
-  fxRedoBtn: HTMLButtonElement;
-  fxInfo: HTMLSpanElement;
+  renderToClipBtn: HTMLButtonElement;
   status: HTMLDivElement;
 }
 
@@ -2085,6 +1560,21 @@ function buildUi(root: HTMLElement): ArrangerUi {
   const modeBeatsBtn = makeToolbarBtn("Beats");
   const modeTimeBtn = makeToolbarBtn("Time");
 
+  const sepSnap = makeSep();
+  const snapLabel = document.createElement("span");
+  snapLabel.textContent = "Snap:";
+  snapLabel.style.color = "#aaa";
+  const snapSelect = document.createElement("select");
+  Object.assign(snapSelect.style, {
+    padding: "4px 6px",
+    background: "var(--bg-sunken)",
+    color: "var(--text-2)",
+    border: "1px solid var(--line-2)",
+    borderRadius: "var(--r-2)",
+    fontSize: "12px",
+    fontFamily: "inherit",
+  } satisfies Partial<CSSStyleDeclaration>);
+
   const sep2 = makeSep();
   const bpmLabel = document.createElement("span");
   bpmLabel.textContent = "BPM:";
@@ -2124,6 +1614,9 @@ function buildUi(root: HTMLElement): ArrangerUi {
   toolbar.appendChild(gridLabel);
   toolbar.appendChild(modeBeatsBtn);
   toolbar.appendChild(modeTimeBtn);
+  toolbar.appendChild(sepSnap);
+  toolbar.appendChild(snapLabel);
+  toolbar.appendChild(snapSelect);
   toolbar.appendChild(sep2);
   toolbar.appendChild(bpmLabel);
   toolbar.appendChild(bpmInput);
@@ -2281,6 +1774,15 @@ function buildUi(root: HTMLElement): ArrangerUi {
   Object.assign(clearSelBtn.style, btnStyle());
   transport.appendChild(clearSelBtn);
 
+  const renderToClipBtn = document.createElement("button");
+  renderToClipBtn.textContent = "Render to clip";
+  renderToClipBtn.type = "button";
+  renderToClipBtn.title =
+    "Mix down the selection and add the result as a new source in the library";
+  renderToClipBtn.disabled = true;
+  Object.assign(renderToClipBtn.style, btnStyle());
+  transport.appendChild(renderToClipBtn);
+
   const hint = document.createElement("span");
   hint.textContent =
     "(drag the ruler to make a selection, then drag its green edges to refine — Shift bypasses snap)";
@@ -2288,85 +1790,6 @@ function buildUi(root: HTMLElement): ArrangerUi {
   hint.style.fontSize = "12px";
   transport.appendChild(hint);
   root.appendChild(transport);
-
-  // FX panel — destructive effects applied to the selected clip's range on
-  // its underlying source. Greyed out when no clip is selected.
-  const fxPanel = document.createElement("div");
-  Object.assign(fxPanel.style, {
-    display: "flex",
-    flexDirection: "column",
-    gap: "4px",
-    padding: "6px 8px",
-    background: "#1a1a1a",
-    border: "1px solid #2a2a2a",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const fxRow = document.createElement("div");
-  Object.assign(fxRow.style, {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    flexWrap: "wrap",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const fxLabel = document.createElement("span");
-  fxLabel.textContent = "Clip FX:";
-  fxLabel.style.color = "#aaa";
-  fxLabel.style.fontWeight = "600";
-  fxLabel.style.fontSize = "12px";
-  const fxKindSelect = document.createElement("select");
-  Object.assign(fxKindSelect.style, {
-    padding: "2px 4px",
-    background: "#0c0c0c",
-    color: "#d8d8d8",
-    border: "1px solid #3a3a3a",
-    fontSize: "12px",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const fxParamsRow = document.createElement("div");
-  Object.assign(fxParamsRow.style, {
-    display: "flex",
-    alignItems: "center",
-    gap: "6px",
-    flex: "1",
-    flexWrap: "wrap",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const fxApplyBtn = document.createElement("button");
-  fxApplyBtn.textContent = "Apply to clip";
-  fxApplyBtn.type = "button";
-  fxApplyBtn.disabled = true;
-  Object.assign(fxApplyBtn.style, btnStyle());
-  const fxSep = document.createElement("div");
-  Object.assign(fxSep.style, {
-    width: "1px",
-    height: "20px",
-    background: "#2a2a2a",
-    margin: "0 2px",
-  } satisfies Partial<CSSStyleDeclaration>);
-  const fxUndoBtn = document.createElement("button");
-  fxUndoBtn.textContent = "Undo";
-  fxUndoBtn.type = "button";
-  fxUndoBtn.disabled = true;
-  Object.assign(fxUndoBtn.style, btnStyle());
-  const fxRedoBtn = document.createElement("button");
-  fxRedoBtn.textContent = "Redo";
-  fxRedoBtn.type = "button";
-  fxRedoBtn.disabled = true;
-  Object.assign(fxRedoBtn.style, btnStyle());
-  fxRow.appendChild(fxLabel);
-  fxRow.appendChild(fxKindSelect);
-  fxRow.appendChild(fxParamsRow);
-  fxRow.appendChild(fxApplyBtn);
-  fxRow.appendChild(fxSep);
-  fxRow.appendChild(fxUndoBtn);
-  fxRow.appendChild(fxRedoBtn);
-  const fxInfo = document.createElement("span");
-  Object.assign(fxInfo.style, {
-    color: "#9a9a9a",
-    fontSize: "11px",
-    fontFamily: "ui-monospace, monospace",
-  } satisfies Partial<CSSStyleDeclaration>);
-  fxInfo.textContent = "(select a clip to edit it destructively — affects every clip sharing the source)";
-  fxPanel.appendChild(fxRow);
-  fxPanel.appendChild(fxInfo);
-  root.appendChild(fxPanel);
 
   const status = document.createElement("div");
   Object.assign(status.style, {
@@ -2391,6 +1814,7 @@ function buildUi(root: HTMLElement): ArrangerUi {
     deleteClipBtn,
     modeBeatsBtn,
     modeTimeBtn,
+    snapSelect,
     bpmInput,
     beatsPerBarInput,
     beatUnitInput,
@@ -2401,13 +1825,7 @@ function buildUi(root: HTMLElement): ArrangerUi {
     loopBtn,
     stopBtn,
     clearSelBtn,
-    fxPanel,
-    fxKindSelect,
-    fxParamsRow,
-    fxApplyBtn,
-    fxUndoBtn,
-    fxRedoBtn,
-    fxInfo,
+    renderToClipBtn,
     status,
   };
 }
