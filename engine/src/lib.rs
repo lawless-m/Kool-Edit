@@ -45,7 +45,7 @@ mod wasm_api {
     use crate::engine::Engine;
     use crate::ids::{ClipId, ProfileId, SourceId, TrackId};
     use crate::op::Op;
-    use crate::project::{Clip, Fade, Project, Track};
+    use crate::project::{Clip, Fade, Project, TempoSettings, Track};
     use crate::range::SampleRange;
     use crate::source::Timestamp;
 
@@ -129,6 +129,58 @@ mod wasm_api {
         #[wasm_bindgen(js_name = sourceFrameCount)]
         pub fn source_frame_count(&self, source_id: &str) -> Option<u64> {
             self.inner.source_frame_count(&SourceId::new(source_id))
+        }
+
+        /// Run YIN pitch detection over the given source range and return
+        /// one Hz value per `hop_samples` step (window centred on each hop;
+        /// 0.0 = unvoiced). Used by Autotune's Reference mode in the UI.
+        #[wasm_bindgen(js_name = detectPitchContour)]
+        pub fn detect_pitch_contour(
+            &self,
+            source_id: &str,
+            start_frame: u64,
+            end_frame: u64,
+            hop_samples: u32,
+            window_samples: u32,
+        ) -> Result<Box<[f32]>, JsError> {
+            let id = SourceId::new(source_id);
+            let range = SampleRange::new(start_frame, end_frame)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let samples = self
+                .inner
+                .query_samples(&id, range)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let channels = self
+                .inner
+                .source_channel_count(&id)
+                .ok_or_else(|| JsError::new("unknown source"))?;
+            // YIN is monophonic: collapse multichannel input by averaging.
+            let mono: Vec<f32> = if channels == 1 {
+                samples
+            } else {
+                let ch = channels as usize;
+                let frames = samples.len() / ch;
+                (0..frames)
+                    .map(|f| {
+                        let mut s = 0.0_f32;
+                        for c in 0..ch {
+                            s += samples[f * ch + c];
+                        }
+                        s / ch as f32
+                    })
+                    .collect()
+            };
+            let sample_rate = self
+                .inner
+                .source_sample_rate(&id)
+                .ok_or_else(|| JsError::new("unknown source"))?;
+            let contour = crate::dsp::pitch_contour(
+                &mono,
+                sample_rate,
+                hop_samples as usize,
+                window_samples as usize,
+            );
+            Ok(contour.into_boxed_slice())
         }
 
         #[wasm_bindgen(js_name = sourceSampleRate)]
@@ -299,6 +351,28 @@ mod wasm_api {
         #[wasm_bindgen(js_name = projectSampleRate)]
         pub fn project_sample_rate(&self) -> u32 {
             self.inner.project().sample_rate()
+        }
+
+        /// Returns the project's tempo settings as JSON:
+        /// `{bpm, beatsPerBar, beatUnit}`.
+        #[wasm_bindgen(js_name = getTempo)]
+        pub fn get_tempo(&self) -> String {
+            let t = self.inner.project().tempo;
+            serde_json::json!({
+                "bpm": t.bpm,
+                "beatsPerBar": t.beats_per_bar,
+                "beatUnit": t.beat_unit,
+            })
+            .to_string()
+        }
+
+        #[wasm_bindgen(js_name = setTempo)]
+        pub fn set_tempo(&mut self, bpm: f32, beats_per_bar: u32, beat_unit: u32) {
+            self.inner.project_mut().tempo = TempoSettings {
+                bpm,
+                beats_per_bar,
+                beat_unit,
+            };
         }
 
         /// List all imported sources as a JSON array. Each entry is

@@ -260,6 +260,7 @@ impl<'a> Emitter<'a> {
                 return Err(EmitError::Unsupported("clipboard ops"));
             }
             Op::SpectralEdit { .. } => return Err(EmitError::Unsupported("spectral edit")),
+            Op::Autotune { .. } => return Err(EmitError::Unsupported("autotune")),
         }
         Ok(())
     }

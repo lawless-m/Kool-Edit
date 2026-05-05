@@ -500,14 +500,21 @@ impl Engine {
                 .write_all(&source.path, &source.samples)
                 .map_err(|e| KepzError::Io(std::io::Error::other(e.to_string())))?;
         }
-        // Peak caches aren't serialised; the engine will rebuild them on
-        // demand. peak_summary returns None for imported sources until they
-        // are regenerated.
-        Ok(Self {
+        let mut engine = Self {
             project: archive.project,
             storage,
             peaks: std::collections::BTreeMap::new(),
-        })
+        };
+        // Peak caches aren't part of the archive; rebuild them now so the
+        // arranger's first peakSummary call after load returns proper data
+        // (otherwise clips render as flat rectangles until something else
+        // dirties the source).
+        let ids: Vec<SourceId> = engine.project.sources.keys().cloned().collect();
+        for id in ids {
+            // Best-effort: a per-source failure shouldn't block the load.
+            let _ = engine.regenerate_peaks(&id);
+        }
+        Ok(engine)
     }
 }
 

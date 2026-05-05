@@ -45,6 +45,14 @@ export type EngineCommand =
   | { kind: "redo"; req: RequestId; sourceId: string }
   | { kind: "list_sources"; req: RequestId }
   | { kind: "project_sample_rate"; req: RequestId }
+  | { kind: "get_tempo"; req: RequestId }
+  | {
+      kind: "set_tempo";
+      req: RequestId;
+      bpm: number;
+      beatsPerBar: number;
+      beatUnit: number;
+    }
   | { kind: "add_track"; req: RequestId; name: string }
   | { kind: "list_tracks"; req: RequestId }
   | { kind: "remove_track"; req: RequestId; trackId: number }
@@ -69,7 +77,18 @@ export type EngineCommand =
       newPositionFrame: number;
     }
   | { kind: "remove_clip"; req: RequestId; trackId: number; clipId: number }
-  | { kind: "mixdown_wav"; req: RequestId };
+  | { kind: "mixdown_wav"; req: RequestId }
+  | { kind: "export_kepz"; req: RequestId }
+  | { kind: "import_kepz"; req: RequestId; bytes: Uint8Array }
+  | {
+      kind: "detect_pitch_contour";
+      req: RequestId;
+      sourceId: string;
+      startFrame: number;
+      endFrame: number;
+      hopSamples: number;
+      windowSamples: number;
+    };
 
 export type EngineEvent =
   | { kind: "ready" }
@@ -91,6 +110,8 @@ export type EngineEvent =
   | { kind: "redo_ok"; req: RequestId; didRedo: boolean }
   | { kind: "list_sources_ok"; req: RequestId; json: string }
   | { kind: "project_sample_rate_ok"; req: RequestId; sampleRate: number }
+  | { kind: "get_tempo_ok"; req: RequestId; json: string }
+  | { kind: "set_tempo_ok"; req: RequestId }
   | { kind: "add_track_ok"; req: RequestId; trackId: number }
   | { kind: "list_tracks_ok"; req: RequestId; json: string }
   | { kind: "remove_track_ok"; req: RequestId; removed: boolean }
@@ -102,4 +123,7 @@ export type EngineEvent =
   | { kind: "move_clip_ok"; req: RequestId }
   | { kind: "remove_clip_ok"; req: RequestId; removed: boolean }
   | { kind: "mixdown_wav_ok"; req: RequestId; bytes: Uint8Array }
+  | { kind: "export_kepz_ok"; req: RequestId; bytes: Uint8Array }
+  | { kind: "import_kepz_ok"; req: RequestId }
+  | { kind: "detect_pitch_contour_ok"; req: RequestId; contour: Float32Array }
   | { kind: "error"; req: RequestId; reason: string };

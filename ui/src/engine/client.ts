@@ -193,6 +193,21 @@ export class EngineClient {
     return ev.sampleRate;
   }
 
+  async getTempo(): Promise<{ bpm: number; beatsPerBar: number; beatUnit: number }> {
+    const ev = await this.request<EngineCommand & { kind: "get_tempo" }>(
+      (req) => ({ kind: "get_tempo", req }),
+    );
+    if (ev.kind !== "get_tempo_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as { bpm: number; beatsPerBar: number; beatUnit: number };
+  }
+
+  async setTempo(bpm: number, beatsPerBar: number, beatUnit: number): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_tempo" }>(
+      (req) => ({ kind: "set_tempo", req, bpm, beatsPerBar, beatUnit }),
+    );
+    if (ev.kind !== "set_tempo_ok") throw new Error("unexpected event");
+  }
+
   async listSources(): Promise<SourceInfo[]> {
     const ev = await this.request<EngineCommand & { kind: "list_sources" }>(
       (req) => ({ kind: "list_sources", req }),
@@ -297,6 +312,43 @@ export class EngineClient {
     );
     if (ev.kind !== "mixdown_wav_ok") throw new Error("unexpected event");
     return ev.bytes;
+  }
+
+  async exportKepz(): Promise<Uint8Array> {
+    const ev = await this.request<EngineCommand & { kind: "export_kepz" }>(
+      (req) => ({ kind: "export_kepz", req }),
+    );
+    if (ev.kind !== "export_kepz_ok") throw new Error("unexpected event");
+    return ev.bytes;
+  }
+
+  async importKepz(bytes: Uint8Array): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "import_kepz" }>(
+      (req) => ({ kind: "import_kepz", req, bytes }),
+    );
+    if (ev.kind !== "import_kepz_ok") throw new Error("unexpected event");
+  }
+
+  async detectPitchContour(
+    sourceId: string,
+    startFrame: number,
+    endFrame: number,
+    hopSamples: number,
+    windowSamples: number,
+  ): Promise<Float32Array> {
+    const ev = await this.request<EngineCommand & { kind: "detect_pitch_contour" }>(
+      (req) => ({
+        kind: "detect_pitch_contour",
+        req,
+        sourceId,
+        startFrame,
+        endFrame,
+        hopSamples,
+        windowSamples,
+      }),
+    );
+    if (ev.kind !== "detect_pitch_contour_ok") throw new Error("unexpected event");
+    return ev.contour;
   }
 
   terminate(): void {

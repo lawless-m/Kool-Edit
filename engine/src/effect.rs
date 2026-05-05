@@ -123,3 +123,39 @@ impl EffectParams {
         }
     }
 }
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutotuneScale {
+    Chromatic,
+    Major,
+    Minor,
+}
+
+/// What pitch the audio should be pulled to. `Scale` snaps to the nearest
+/// note in the chosen scale rooted at `key_pc` (0=C, 1=C#, …, 11=B).
+/// `Reference` follows a pre-computed pitch contour produced by running
+/// pitch detection on another clip; `contour_hz[i]` is the target frequency
+/// for input frame `i * hop_samples` (0.0 means "unvoiced — leave alone").
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum AutotuneTarget {
+    Scale {
+        scale: AutotuneScale,
+        key_pc: u8,
+    },
+    Reference {
+        contour_hz: Vec<f32>,
+        hop_samples: u64,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct AutotuneParams {
+    pub target: AutotuneTarget,
+    /// Smoothing time-constant in milliseconds. 0 = instant snap (T-Pain
+    /// style); larger values let the pitch glide toward target.
+    pub retune_ms: f32,
+    /// Reserved — formant preservation isn't implemented yet. The slot is
+    /// here so a future cepstral / LPC pass can land without a project-file
+    /// migration.
+    pub preserve_formants: bool,
+}

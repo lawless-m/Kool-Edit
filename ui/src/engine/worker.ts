@@ -39,6 +39,8 @@ type WasmEngine = {
   redo: (sourceId: string) => boolean;
   // Multitrack
   projectSampleRate: () => number;
+  getTempo: () => string;
+  setTempo: (bpm: number, beatsPerBar: number, beatUnit: number) => void;
   listSources: () => string;
   addTrack: (name: string) => bigint;
   listTracks: () => string;
@@ -57,6 +59,15 @@ type WasmEngine = {
   moveClip: (trackId: bigint, clipId: bigint, newPositionFrame: bigint) => void;
   removeClip: (trackId: bigint, clipId: bigint) => boolean;
   mixdownWav: () => Uint8Array;
+  exportKepz: () => Uint8Array;
+  importKepz: (bytes: Uint8Array) => void;
+  detectPitchContour: (
+    sourceId: string,
+    startFrame: bigint,
+    endFrame: bigint,
+    hopSamples: number,
+    windowSamples: number,
+  ) => Float32Array;
 };
 
 type EngineModule = {
@@ -253,6 +264,17 @@ let playback: PlaybackState | null = null;
           return;
         }
 
+        case "get_tempo": {
+          send({ kind: "get_tempo_ok", req: cmd.req, json: engine.getTempo() });
+          return;
+        }
+
+        case "set_tempo": {
+          engine.setTempo(cmd.bpm, cmd.beatsPerBar, cmd.beatUnit);
+          send({ kind: "set_tempo_ok", req: cmd.req });
+          return;
+        }
+
         case "add_track": {
           const trackId = Number(engine.addTrack(cmd.name));
           send({ kind: "add_track_ok", req: cmd.req, trackId });
@@ -331,6 +353,29 @@ let playback: PlaybackState | null = null;
         case "mixdown_wav": {
           const bytes = engine.mixdownWav();
           send({ kind: "mixdown_wav_ok", req: cmd.req, bytes });
+          return;
+        }
+
+        case "export_kepz": {
+          const bytes = engine.exportKepz();
+          send({ kind: "export_kepz_ok", req: cmd.req, bytes });
+          return;
+        }
+
+        case "import_kepz": {
+          engine.importKepz(cmd.bytes);
+          send({ kind: "import_kepz_ok", req: cmd.req });
+          return;
+        }
+        case "detect_pitch_contour": {
+          const contour = engine.detectPitchContour(
+            cmd.sourceId,
+            BigInt(cmd.startFrame),
+            BigInt(cmd.endFrame),
+            cmd.hopSamples,
+            cmd.windowSamples,
+          );
+          send({ kind: "detect_pitch_contour_ok", req: cmd.req, contour });
           return;
         }
       }

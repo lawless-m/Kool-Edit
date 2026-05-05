@@ -53,6 +53,41 @@ async function main(): Promise<void> {
 
   const playback = new Playback(client);
 
+  // ---- project save / load ----
+  const projectBar = document.createElement("div");
+  Object.assign(projectBar.style, {
+    display: "flex",
+    gap: "8px",
+    alignItems: "center",
+    fontSize: "12px",
+    color: "#aaa",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const saveBtn = document.createElement("button");
+  saveBtn.type = "button";
+  saveBtn.textContent = "Save .kepz";
+  Object.assign(saveBtn.style, btnStyle(), {
+    padding: "4px 10px",
+    fontSize: "12px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const loadLabel = document.createElement("label");
+  loadLabel.textContent = "Load .kepz: ";
+  Object.assign(loadLabel.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const loadInput = document.createElement("input");
+  loadInput.type = "file";
+  loadInput.accept = ".kepz,application/zip";
+  loadLabel.appendChild(loadInput);
+  const projectStatus = document.createElement("span");
+  projectStatus.style.color = "#9a9a9a";
+  projectStatus.style.fontFamily = "ui-monospace, monospace";
+  projectBar.appendChild(saveBtn);
+  projectBar.appendChild(loadLabel);
+  projectBar.appendChild(projectStatus);
+  root.appendChild(projectBar);
+
   // ---- tab bar ----
   const tabBar = document.createElement("div");
   Object.assign(tabBar.style, {
@@ -73,10 +108,47 @@ async function main(): Promise<void> {
   root.appendChild(editorRoot);
   root.appendChild(arrangerRoot);
 
-  await mountEditor(editorRoot, client, playback, {
+  const editor = await mountEditor(editorRoot, client, playback, {
     onSourceImported: () => arranger.refresh(),
   });
   const arranger = await mountArranger(arrangerRoot, client);
+
+  // ---- save / load wiring ----
+  saveBtn.addEventListener("click", async () => {
+    projectStatus.textContent = "exporting…";
+    try {
+      const bytes = await client.exportKepz();
+      const blob = new Blob([bytes as BlobPart], { type: "application/zip" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+      a.download = `kool-edit-${stamp}.kepz`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+      projectStatus.textContent = `saved (${bytes.byteLength.toLocaleString()} bytes)`;
+    } catch (err) {
+      projectStatus.textContent = `save failed: ${String(err)}`;
+    }
+  });
+  loadInput.addEventListener("change", async () => {
+    const file = loadInput.files?.[0];
+    if (!file) return;
+    projectStatus.textContent = `loading ${file.name}…`;
+    try {
+      const buf = await file.arrayBuffer();
+      await client.importKepz(new Uint8Array(buf));
+      await editor.reset();
+      await arranger.refresh();
+      projectStatus.textContent = `loaded ${file.name}`;
+    } catch (err) {
+      projectStatus.textContent = `load failed: ${String(err)}`;
+    } finally {
+      loadInput.value = "";
+    }
+  });
 
   const showTab = (tab: TabId): void => {
     editorRoot.style.display = tab === "editor" ? "" : "none";

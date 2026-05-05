@@ -35,6 +35,26 @@ pub struct TransportState {
     pub loop_range: Option<SampleRange>,
 }
 
+/// Project-level tempo and time-signature. Lives on the project so the
+/// arranger's BPM/time-sig settings survive save/load. Older `.kepz` files
+/// that pre-date this field load with `Default::default()` (120 BPM, 4/4).
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TempoSettings {
+    pub bpm: f32,
+    pub beats_per_bar: u32,
+    pub beat_unit: u32,
+}
+
+impl Default for TempoSettings {
+    fn default() -> Self {
+        Self {
+            bpm: 120.0,
+            beats_per_bar: 4,
+            beat_unit: 4,
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub enum ActiveView {
     #[default]
@@ -159,6 +179,8 @@ pub struct Project {
     pub markers: Vec<Marker>,
     pub transport: TransportState,
     pub view: ViewState,
+    #[serde(default)]
+    pub tempo: TempoSettings,
     pub noise_profiles: BTreeMap<ProfileId, NoiseProfile>,
 }
 
@@ -174,6 +196,7 @@ impl Project {
             markers: Vec::new(),
             transport: TransportState::default(),
             view: ViewState::default(),
+            tempo: TempoSettings::default(),
             noise_profiles: BTreeMap::new(),
         }
     }
@@ -636,6 +659,32 @@ mod tests {
         let s = p.to_json().unwrap();
         let p2 = Project::from_json(&s).unwrap();
         assert_eq!(p, p2);
+    }
+
+    #[test]
+    fn tempo_round_trips_and_defaults_when_missing() {
+        // Setting non-default values and round-tripping preserves them.
+        let mut p = Project::new(96_000);
+        p.tempo = TempoSettings { bpm: 95.5, beats_per_bar: 6, beat_unit: 8 };
+        let s = p.to_json().unwrap();
+        let p2 = Project::from_json(&s).unwrap();
+        assert_eq!(p2.tempo, p.tempo);
+
+        // Older project JSON without the tempo field falls back to default.
+        let no_tempo = r#"{
+            "format_version": 1,
+            "metadata": {"name": "", "created_at": null, "modified_at": null},
+            "sample_rate": 96000,
+            "sources": {},
+            "tracks": [],
+            "master": {"gain_db": 0.0, "inserts": []},
+            "markers": [],
+            "transport": {"playhead": 0, "looping": false, "loop_range": null},
+            "view": {"zoom": 1.0, "scroll_samples": 0, "active_view": "Waveform"},
+            "noise_profiles": {}
+        }"#;
+        let loaded = Project::from_json(no_tempo).unwrap();
+        assert_eq!(loaded.tempo, TempoSettings::default());
     }
 
     #[test]

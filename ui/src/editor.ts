@@ -24,12 +24,19 @@ export interface EditorOptions {
   onSourceImported?: () => void;
 }
 
+export interface EditorHandle {
+  /** Drop the editor's current source and selection. Used after loading a
+   *  fresh project at the shell level so the editor doesn't keep pointing
+   *  at an id that no longer exists. */
+  reset: () => Promise<void>;
+}
+
 export async function mountEditor(
   root: HTMLElement,
   client: EngineClient,
   playback: Playback,
   opts: EditorOptions = {},
-): Promise<void> {
+): Promise<EditorHandle> {
   const ui = buildUi(root);
 
   let currentSourceId: string | null = null;
@@ -138,6 +145,17 @@ export async function mountEditor(
     if (Math.abs(newLen - len) < 1) return;
     const fracAtPivot = (pivotFrame - viewport.startFrame) / len;
     const newStart = pivotFrame - fracAtPivot * newLen;
+    setViewport(newStart, newStart + newLen);
+  };
+
+  /** Zoom by `factor` and centre the pivot in the viewport. Used by the
+   *  zoom buttons so the selection's in-point (or playhead) stays under the
+   *  user's eye. */
+  const zoomCenterOn = (factor: number, pivotFrame: number): void => {
+    const len = viewportLength();
+    const newLen = Math.max(MIN_VIEWPORT_FRAMES, Math.min(sourceFrameCount, len * factor));
+    if (Math.abs(newLen - len) < 1) return;
+    const newStart = pivotFrame - newLen / 2;
     setViewport(newStart, newStart + newLen);
   };
 
@@ -506,15 +524,20 @@ export async function mountEditor(
 
   // ---- zoom controls ---------------------------------------------------
 
+  // Buttons zoom around the in-point if there is one (so the selection
+  // stays visible), else around the viewport centre. The wheel zoom below
+  // keeps its cursor-anchored behaviour.
+  const buttonZoomPivot = (): number => {
+    if (selection) return selection.inFrame;
+    return (viewport.startFrame + viewport.endFrame) / 2;
+  };
   ui.zoomInBtn.addEventListener("click", () => {
     if (sourceFrameCount === 0) return;
-    const mid = (viewport.startFrame + viewport.endFrame) / 2;
-    zoomBy(0.5, mid);
+    zoomCenterOn(0.5, buttonZoomPivot());
   });
   ui.zoomOutBtn.addEventListener("click", () => {
     if (sourceFrameCount === 0) return;
-    const mid = (viewport.startFrame + viewport.endFrame) / 2;
-    zoomBy(2, mid);
+    zoomCenterOn(2, buttonZoomPivot());
   });
   ui.zoomFullBtn.addEventListener("click", () => zoomFull());
   ui.zoomSelBtn.addEventListener("click", () => zoomToSelection());
@@ -616,6 +639,31 @@ export async function mountEditor(
   syncSelectionInputs();
   syncZoomButtons();
   syncScrollbar();
+
+  const reset = async (): Promise<void> => {
+    await playback.stop();
+    stopPlayheadLoop();
+    currentSourceId = null;
+    sourceFrameCount = 0;
+    sourceSampleRate = 0;
+    viewport = { startFrame: 0, endFrame: 0 };
+    cachedPeaks = null;
+    ui.gainSlider.value = "100";
+    ui.gainLabel.textContent = "100%";
+    setSelection(null);
+    setTransportEnabled(false);
+    ui.undoBtn.disabled = true;
+    ui.redoBtn.disabled = true;
+    ui.fileInput.value = "";
+    ui.status.textContent = "no source loaded";
+    const ctx = ui.canvas.getContext("2d");
+    if (ctx) ctx.clearRect(0, 0, ui.canvas.width, ui.canvas.height);
+    redrawOverlay();
+    syncScrollbar();
+    syncZoomButtons();
+  };
+
+  return { reset };
 }
 
 interface UiHandles {

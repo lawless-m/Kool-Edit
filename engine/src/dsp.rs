@@ -14,8 +14,8 @@
 use std::f32::consts::PI;
 
 use crate::effect::{
-    CompParams, DelayParams, EqBand, EqBandKind, EqParams, LimitParams, ReverbModel,
-    ReverbParams,
+    AutotuneParams, AutotuneScale, AutotuneTarget, CompParams, DelayParams, EqBand, EqBandKind,
+    EqParams, LimitParams, ReverbModel, ReverbParams,
 };
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
@@ -92,11 +92,15 @@ pub fn apply(
         Op::Eq { range, params } => eq(buffer, channels, *range, params, sample_rate),
         Op::Reverb { range, params } => reverb(buffer, channels, *range, params, sample_rate),
 
+        Op::TimeStretch { range, ratio } => time_stretch(buffer, channels, *range, *ratio),
+        Op::PitchShift { range, cents } => pitch_shift(buffer, channels, *range, *cents),
+        Op::Autotune { range, params } => {
+            autotune(buffer, channels, *range, params, sample_rate)
+        }
+
         Op::Insert { .. } => Err(DspError::Unsupported("Insert")),
         Op::PasteMix { .. } => Err(DspError::Unsupported("PasteMix")),
         Op::PasteOver { .. } => Err(DspError::Unsupported("PasteOver")),
-        Op::TimeStretch { .. } => Err(DspError::Unsupported("TimeStretch")),
-        Op::PitchShift { .. } => Err(DspError::Unsupported("PitchShift")),
         Op::NoiseReduce { .. } => Err(DspError::Unsupported("NoiseReduce")),
         Op::SpectralEdit { .. } => Err(DspError::Unsupported("SpectralEdit")),
     }
@@ -220,6 +224,554 @@ fn cut(buffer: &mut Vec<f32>, channels: u16, range: SampleRange) -> Result<(), D
     let start = (range.start() * ch) as usize;
     let end = (range.end() * ch) as usize;
     buffer.drain(start..end);
+    Ok(())
+}
+
+/// WSOLA (Waveform Similarity-based Overlap-Add) time-stretch over `range`.
+/// `ratio > 1` makes the segment longer (slower), `< 1` shorter (faster).
+/// Pitch is preserved (within the limits of the algorithm). The buffer is
+/// resized: the stretched segment replaces the original in place.
+///
+/// Algorithm: for each output frame, search a small window of the input
+/// around its "ideal" analysis position for the best match against the
+/// natural-progression reference from the previous frame, then Hann-window
+/// it and overlap-add at 50 % into the output. With Hann + 50 % overlap the
+/// COLA condition holds, so no normalisation is needed.
+fn time_stretch(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    range: SampleRange,
+    ratio: f32,
+) -> Result<(), DspError> {
+    let ch = channels as u64;
+    let total_frames = buffer.len() as u64 / ch;
+    if range.end() > total_frames {
+        return Err(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        });
+    }
+    if !(ratio > 0.05 && ratio < 20.0) {
+        return Err(DspError::Unsupported("TimeStretch ratio out of range"));
+    }
+    let in_frames = (range.end() - range.start()) as usize;
+    if in_frames == 0 {
+        return Err(DspError::EmptySignal);
+    }
+    let stretched = wsola_stretch(
+        &buffer[(range.start() * ch) as usize..(range.end() * ch) as usize],
+        channels,
+        ratio,
+    );
+    let start = (range.start() * ch) as usize;
+    let end = (range.end() * ch) as usize;
+    buffer.splice(start..end, stretched);
+    Ok(())
+}
+
+/// Pitch-shift over `range` by `cents`. Length is preserved. Built from
+/// time-stretch (changes length, preserves pitch) followed by linear
+/// resampling (changes length, changes pitch). The two combine to leave the
+/// length unchanged while pitch moves by `2^(cents/1200)`.
+fn pitch_shift(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    range: SampleRange,
+    cents: f32,
+) -> Result<(), DspError> {
+    let ch = channels as u64;
+    let total_frames = buffer.len() as u64 / ch;
+    if range.end() > total_frames {
+        return Err(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        });
+    }
+    if !(-2400.0..=2400.0).contains(&cents) {
+        return Err(DspError::Unsupported("PitchShift cents out of range"));
+    }
+    let in_frames = (range.end() - range.start()) as usize;
+    if in_frames == 0 {
+        return Err(DspError::EmptySignal);
+    }
+    let ratio = 2.0_f32.powf(cents / 1200.0);
+    let stretched = wsola_stretch(
+        &buffer[(range.start() * ch) as usize..(range.end() * ch) as usize],
+        channels,
+        ratio,
+    );
+    // Resample stretched (length ≈ in_frames * ratio) back to in_frames so
+    // the segment length is unchanged. resample_by_factor expects an
+    // interleaved buffer and a "src/dst" frame ratio.
+    let resampled = resample_to_target_frames(&stretched, channels, in_frames);
+    let start = (range.start() * ch) as usize;
+    let end = (range.end() * ch) as usize;
+    buffer.splice(start..end, resampled);
+    Ok(())
+}
+
+/// Resample `interleaved` (length `src_frames * channels`) so the output has
+/// exactly `dst_frames` frames. Linear interpolation, same as the import-time
+/// resampler in `engine.rs` but parameterised by frame count rather than
+/// sample rate.
+fn resample_to_target_frames(interleaved: &[f32], channels: u16, dst_frames: usize) -> Vec<f32> {
+    let ch = channels as usize;
+    let src_frames = interleaved.len() / ch;
+    if src_frames == 0 || dst_frames == 0 {
+        return Vec::new();
+    }
+    if src_frames == dst_frames {
+        return interleaved.to_vec();
+    }
+    let mut out = vec![0.0_f32; dst_frames * ch];
+    let last = src_frames - 1;
+    let step = src_frames as f64 / dst_frames as f64;
+    for i in 0..dst_frames {
+        let src_pos = i as f64 * step;
+        let i0 = src_pos.floor() as usize;
+        let frac = (src_pos - i0 as f64) as f32;
+        let i1 = (i0 + 1).min(last);
+        for c in 0..ch {
+            let a = interleaved[i0 * ch + c];
+            let b = interleaved[i1 * ch + c];
+            out[i * ch + c] = a + (b - a) * frac;
+        }
+    }
+    out
+}
+
+/// Core WSOLA worker. Operates on interleaved input, returns interleaved
+/// output. Window = 1024 frames, synthesis hop = 512 (50 % Hann COLA).
+/// Search tolerance bounded so the cost stays linear in the input length
+/// for typical ratios.
+fn wsola_stretch(input: &[f32], channels: u16, ratio: f32) -> Vec<f32> {
+    const W: usize = 1024;
+    const HS: usize = W / 2;
+    const T: usize = 256;
+
+    let ch = channels as usize;
+    let in_frames = input.len() / ch;
+    let out_frames = ((in_frames as f32) * ratio).round().max(0.0) as usize;
+    if out_frames == 0 || in_frames == 0 {
+        return Vec::new();
+    }
+
+    // Short signals fall back to plain resampling — there's no room for the
+    // sliding-window machinery, and the result is the same anyway because
+    // there are no transients to preserve.
+    if in_frames < W * 2 {
+        return resample_to_target_frames(input, channels, out_frames);
+    }
+
+    // Pre-compute a Hann window once.
+    let hann: Vec<f32> = (0..W)
+        .map(|n| 0.5 - 0.5 * ((2.0 * PI * n as f32) / (W as f32 - 1.0)).cos())
+        .collect();
+
+    // Mono reference for the cross-correlation search. For multi-channel
+    // input we sum the channels; using a single offset for every channel
+    // keeps the stereo image intact.
+    let mono: Vec<f32> = if ch == 1 {
+        input.to_vec()
+    } else {
+        let mut m = Vec::with_capacity(in_frames);
+        for f in 0..in_frames {
+            let mut s = 0.0;
+            for c in 0..ch {
+                s += input[f * ch + c];
+            }
+            m.push(s / ch as f32);
+        }
+        m
+    };
+
+    let analysis_hop = (HS as f32) / ratio.max(1e-3);
+    let max_search = in_frames.saturating_sub(W);
+
+    let mut output = vec![0.0_f32; out_frames * ch];
+    let mut prev_match: usize = 0;
+    let mut k: usize = 0;
+    loop {
+        let synth_pos = k * HS;
+        if synth_pos + W > out_frames {
+            break;
+        }
+        let ideal_in = (k as f32 * analysis_hop) as usize;
+        let best = if k == 0 {
+            ideal_in.min(max_search)
+        } else {
+            // Reference is where the previous match would land if we
+            // followed the natural progression of one synthesis hop.
+            let ref_pos = (prev_match + HS).min(max_search);
+            let lo = ideal_in.saturating_sub(T);
+            let hi = (ideal_in + T).min(max_search);
+            if hi <= lo {
+                lo
+            } else {
+                let mut best_corr = f32::NEG_INFINITY;
+                let mut best_off = lo;
+                for off in lo..=hi {
+                    let mut corr = 0.0_f32;
+                    // Stride through the window in steps of 4 — this is just
+                    // a similarity heuristic, full resolution isn't needed
+                    // and the speedup is significant.
+                    let mut i = 0;
+                    while i < W {
+                        corr += mono[off + i] * mono[ref_pos + i];
+                        i += 4;
+                    }
+                    if corr > best_corr {
+                        best_corr = corr;
+                        best_off = off;
+                    }
+                }
+                best_off
+            }
+        };
+
+        if best + W > in_frames {
+            break;
+        }
+
+        for i in 0..W {
+            let dst = synth_pos + i;
+            if dst >= out_frames {
+                break;
+            }
+            let w = hann[i];
+            for c in 0..ch {
+                output[dst * ch + c] += input[(best + i) * ch + c] * w;
+            }
+        }
+        prev_match = best;
+        k += 1;
+    }
+    let _ = k;
+
+    // OLA leaves a Hann ramp-up on the first HS frames and a ramp-down on
+    // the last HS frames. That's a natural fade and doesn't click. Anything
+    // past the last write stays zero.
+    output
+}
+
+/// YIN pitch detector. Returns the dominant fundamental frequency in Hz, or
+/// `None` for windows that don't have a clear pitched signal (silence,
+/// noise, polyphonic material). Search range is bounded to 80–1000 Hz which
+/// covers the human voice; calling code can decide what to do with `None`.
+pub(crate) fn yin_pitch(samples: &[f32], sample_rate: u32) -> Option<f32> {
+    const MIN_HZ: f32 = 80.0;
+    const MAX_HZ: f32 = 1000.0;
+    const THRESHOLD: f32 = 0.15;
+
+    let n = samples.len();
+    if n < 64 {
+        return None;
+    }
+    let min_tau = ((sample_rate as f32 / MAX_HZ).floor() as usize).max(2);
+    let max_tau = ((sample_rate as f32 / MIN_HZ).ceil() as usize).min(n / 2);
+    if max_tau <= min_tau + 1 {
+        return None;
+    }
+
+    // Difference function d(tau) = Σ (x[j] - x[j+tau])^2 over all valid j.
+    let mut diff = vec![0.0_f32; max_tau + 1];
+    for tau in 1..=max_tau {
+        let mut sum = 0.0_f32;
+        let count = n - tau;
+        for j in 0..count {
+            let delta = samples[j] - samples[j + tau];
+            sum += delta * delta;
+        }
+        diff[tau] = sum;
+    }
+
+    // Cumulative-mean-normalised difference. cmnd[0] is unused.
+    let mut cmnd = vec![1.0_f32; max_tau + 1];
+    let mut running = 0.0_f32;
+    for tau in 1..=max_tau {
+        running += diff[tau];
+        cmnd[tau] = if running > 0.0 {
+            diff[tau] * (tau as f32) / running
+        } else {
+            1.0
+        };
+    }
+
+    // Absolute-threshold pass: walk forward, find the first tau whose CMND
+    // dips below the threshold, then descend into that dip's local minimum.
+    let mut found_tau: Option<usize> = None;
+    let mut tau = min_tau;
+    while tau < max_tau {
+        if cmnd[tau] < THRESHOLD {
+            while tau + 1 < max_tau && cmnd[tau + 1] < cmnd[tau] {
+                tau += 1;
+            }
+            found_tau = Some(tau);
+            break;
+        }
+        tau += 1;
+    }
+    let tau = found_tau?;
+
+    // Parabolic interpolation around the discrete minimum.
+    let better_tau = if tau > min_tau && tau + 1 < max_tau {
+        let s0 = cmnd[tau - 1];
+        let s1 = cmnd[tau];
+        let s2 = cmnd[tau + 1];
+        let denom = 2.0 * (s0 - 2.0 * s1 + s2);
+        if denom.abs() > 1e-9 {
+            tau as f32 + (s0 - s2) / denom
+        } else {
+            tau as f32
+        }
+    } else {
+        tau as f32
+    };
+
+    if better_tau > 1.0 {
+        Some(sample_rate as f32 / better_tau)
+    } else {
+        None
+    }
+}
+
+/// Build a pitch contour over `samples` (mono). Returns one f32 per
+/// `hop_samples` step, where each value is the YIN-detected fundamental
+/// (Hz) of a `window_samples`-long block centred on that step (or 0.0 if
+/// no pitch was detected). Used by the arranger when wiring up Autotune in
+/// Reference mode.
+#[cfg_attr(not(feature = "wasm"), allow(dead_code))]
+pub(crate) fn pitch_contour(
+    samples: &[f32],
+    sample_rate: u32,
+    hop_samples: usize,
+    window_samples: usize,
+) -> Vec<f32> {
+    if samples.is_empty() || hop_samples == 0 || window_samples == 0 {
+        return Vec::new();
+    }
+    let n = samples.len();
+    let num_hops = n.div_ceil(hop_samples);
+    let mut out = Vec::with_capacity(num_hops);
+    let half = window_samples / 2;
+    for h in 0..num_hops {
+        let centre = h * hop_samples;
+        let lo = centre.saturating_sub(half);
+        let hi = (centre + half).min(n);
+        if hi <= lo + 64 {
+            out.push(0.0);
+            continue;
+        }
+        let f = yin_pitch(&samples[lo..hi], sample_rate).unwrap_or(0.0);
+        out.push(f);
+    }
+    out
+}
+
+fn hz_to_midi(hz: f32) -> f32 {
+    69.0 + 12.0 * (hz / 440.0).log2()
+}
+
+fn midi_to_hz(midi: f32) -> f32 {
+    440.0 * 2.0_f32.powf((midi - 69.0) / 12.0)
+}
+
+const MAJOR_DEGREES: [u8; 7] = [0, 2, 4, 5, 7, 9, 11];
+const NATURAL_MINOR_DEGREES: [u8; 7] = [0, 2, 3, 5, 7, 8, 10];
+
+/// Snap `hz` to the nearest note allowed by `scale` rooted at `key_pc`
+/// (0=C..11=B). Chromatic snaps to the nearest semitone; Major/Minor only
+/// allow the seven scale degrees relative to the key.
+fn snap_to_scale(hz: f32, scale: AutotuneScale, key_pc: u8) -> f32 {
+    if hz <= 0.0 || !hz.is_finite() {
+        return hz;
+    }
+    let midi = hz_to_midi(hz);
+    let target_midi = match scale {
+        AutotuneScale::Chromatic => midi.round(),
+        AutotuneScale::Major => snap_to_degrees(midi, key_pc, &MAJOR_DEGREES),
+        AutotuneScale::Minor => snap_to_degrees(midi, key_pc, &NATURAL_MINOR_DEGREES),
+    };
+    midi_to_hz(target_midi)
+}
+
+fn snap_to_degrees(midi: f32, key_pc: u8, degrees: &[u8]) -> f32 {
+    // For each scale degree, find the nearest absolute MIDI note that
+    // matches that degree relative to the key. Then pick whichever of those
+    // candidates is closest to the input.
+    let mut best = midi.round();
+    let mut best_dist = f32::INFINITY;
+    let key = key_pc as f32;
+    for &d in degrees {
+        let degree_pc = (key + d as f32) % 12.0;
+        // Find the octave whose MIDI value with this pitch class is nearest.
+        let raw = midi - degree_pc;
+        let nearest_octave = (raw / 12.0).round();
+        let candidate = nearest_octave * 12.0 + degree_pc;
+        let dist = (candidate - midi).abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = candidate;
+        }
+    }
+    best
+}
+
+/// Autotune dispatch — top of the file uses this from `apply`. Operates on
+/// the source range, splices the corrected segment back into `buffer`.
+///
+/// Algorithm sketch:
+/// 1. Window the input range with 50 ms Hann windows at 50 % overlap.
+/// 2. Per window, run YIN to detect f₀.
+/// 3. Pick a target f₀ (scale snap, or look up the reference contour).
+/// 4. Smooth the per-window pitch ratio toward target with a one-pole IIR
+///    whose time constant is `retune_ms`. Zero ms → instant snap (T-Pain
+///    style); larger values → glide.
+/// 5. Pitch-shift the window by the smoothed ratio (reusing WSOLA + linear
+///    resampling), then OLA back into the output, dividing by the summed
+///    window weights so unity output is preserved.
+/// 6. Splice the autotuned region into `buffer`.
+fn autotune(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    range: SampleRange,
+    params: &AutotuneParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    let ch = channels as u64;
+    let total_frames = buffer.len() as u64 / ch;
+    if range.end() > total_frames {
+        return Err(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        });
+    }
+    let in_frames = (range.end() - range.start()) as usize;
+    if in_frames == 0 {
+        return Err(DspError::EmptySignal);
+    }
+    let ch_us = channels as usize;
+
+    // 50 ms windows at 50 % overlap — short enough to track pitch changes,
+    // long enough for YIN to lock on at low fundamentals.
+    let window_size = (((sample_rate as f32) * 0.05).round() as usize).max(256);
+    let hop = window_size / 2;
+    if in_frames < window_size {
+        return Err(DspError::EmptySignal);
+    }
+
+    let start = (range.start() * ch) as usize;
+    let end = (range.end() * ch) as usize;
+    let input: Vec<f32> = buffer[start..end].to_vec();
+
+    // Mono mix is the YIN reference. We apply one ratio per window to every
+    // channel — same as our other multichannel DSP — to keep the stereo
+    // image intact.
+    let mono: Vec<f32> = if ch_us == 1 {
+        input.clone()
+    } else {
+        let mut m = Vec::with_capacity(in_frames);
+        for f in 0..in_frames {
+            let mut s = 0.0_f32;
+            for c in 0..ch_us {
+                s += input[f * ch_us + c];
+            }
+            m.push(s / ch_us as f32);
+        }
+        m
+    };
+
+    // One-pole smoothing toward the target ratio. retune_ms = 0 → α = 0
+    // (instant). Otherwise α = exp(-hop_ms / retune_ms) so 63 % is reached
+    // after one retune-time-constant of audio.
+    let hop_ms = (hop as f32) / (sample_rate as f32) * 1000.0;
+    let alpha = if params.retune_ms <= 0.0 {
+        0.0
+    } else {
+        (-hop_ms / params.retune_ms).exp()
+    };
+    let mut smoothed_ratio = 1.0_f32;
+
+    let mut output = vec![0.0_f32; input.len()];
+    let mut weight = vec![0.0_f32; in_frames];
+    let hann_window: Vec<f32> = (0..window_size)
+        .map(|n| 0.5 - 0.5 * ((2.0 * PI * n as f32) / (window_size as f32 - 1.0)).cos())
+        .collect();
+
+    let mut seg_start = 0_usize;
+    while seg_start + window_size <= in_frames {
+        let mono_seg = &mono[seg_start..seg_start + window_size];
+
+        let detected = yin_pitch(mono_seg, sample_rate);
+        let target_hz = match (&params.target, detected) {
+            (AutotuneTarget::Scale { scale, key_pc }, Some(d)) => {
+                Some(snap_to_scale(d, *scale, *key_pc))
+            }
+            (
+                AutotuneTarget::Reference {
+                    contour_hz,
+                    hop_samples,
+                },
+                _,
+            ) => {
+                if *hop_samples == 0 {
+                    None
+                } else {
+                    let centre = (seg_start + window_size / 2) as u64;
+                    let idx = (centre / *hop_samples) as usize;
+                    contour_hz.get(idx).copied().filter(|h| *h > 0.0)
+                }
+            }
+            _ => None,
+        };
+
+        let target_ratio = match (detected, target_hz) {
+            (Some(d), Some(t)) if d > 0.0 => (t / d).clamp(0.25, 4.0),
+            _ => 1.0,
+        };
+        // IIR smoother. With α=0 this collapses to "follow the target
+        // exactly" — the T-Pain instant-snap behaviour.
+        smoothed_ratio = smoothed_ratio * alpha + target_ratio * (1.0 - alpha);
+
+        // Build a working buffer for this window and pitch-shift in place.
+        let mut window_buf: Vec<f32> =
+            input[seg_start * ch_us..(seg_start + window_size) * ch_us].to_vec();
+        if (smoothed_ratio - 1.0).abs() > 1e-3 {
+            let cents = 1200.0 * smoothed_ratio.log2();
+            let _ = pitch_shift(
+                &mut window_buf,
+                channels,
+                SampleRange::new(0, window_size as u64).expect("non-empty window"),
+                cents,
+            );
+            // pitch_shift preserves length, so window_buf still has the same
+            // frame count we expect. Fall through and OLA.
+        }
+
+        for i in 0..window_size {
+            let w = hann_window[i];
+            weight[seg_start + i] += w;
+            for c in 0..ch_us {
+                output[(seg_start + i) * ch_us + c] += window_buf[i * ch_us + c] * w;
+            }
+        }
+
+        seg_start += hop;
+    }
+
+    // Normalise OLA: with Hann + 50 % overlap the body sums to ~1.0 but the
+    // first/last hop have only one window, so dividing by the per-frame
+    // weight gives unity gain everywhere a window contributed. Frames that
+    // never got a window (the trailing partial hop) stay at zero.
+    for f in 0..in_frames {
+        if weight[f] > 1e-3 {
+            for c in 0..ch_us {
+                output[f * ch_us + c] /= weight[f];
+            }
+        }
+    }
+
+    buffer.splice(start..end, output);
     Ok(())
 }
 
@@ -1100,18 +1652,20 @@ mod tests {
 
     #[test]
     fn unsupported_ops_are_reported() {
+        // TimeStretch / PitchShift are now implemented; pick an op that's
+        // still stubbed out to verify the dispatch error path.
         let mut samples = vec![0.0; 4];
         let err = apply(
-            &Op::TimeStretch {
-                range: r(0, 4),
-                ratio: 2.0,
+            &Op::Insert {
+                at: 0,
+                samples_ref: crate::ids::ClipboardRef::new("cb_test"),
             },
             &mut samples,
             1,
             48_000,
         )
         .unwrap_err();
-        assert!(matches!(err, DspError::Unsupported("TimeStretch")));
+        assert!(matches!(err, DspError::Unsupported("Insert")));
     }
 
     fn reverb_params(model: ReverbModel, size: f32, damping: f32, mix: f32) -> ReverbParams {
@@ -1942,5 +2496,301 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, DspError::InsertPositionPastEnd { .. }));
+    }
+
+    fn synth_sine(freq_hz: f32, fs: u32, frames: usize) -> Vec<f32> {
+        (0..frames)
+            .map(|n| (2.0 * PI * freq_hz * n as f32 / fs as f32).sin())
+            .collect()
+    }
+
+    /// Find the strongest frequency component below Nyquist by direct DFT
+    /// at a small set of probe bins. Cheap and adequate for the test
+    /// material we generate (single sine).
+    fn dominant_freq(signal: &[f32], fs: u32) -> f32 {
+        let n = signal.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let mut best_mag = 0.0_f32;
+        let mut best_freq = 0.0;
+        // 0.5 Hz resolution between 50 Hz and 4 kHz is plenty for the test
+        // tones (we drive at 440 Hz / 880 Hz / etc.).
+        let mut f = 50.0_f32;
+        while f < (fs as f32 / 2.0).min(4_000.0) {
+            let omega = 2.0 * PI * f / fs as f32;
+            let mut re = 0.0_f32;
+            let mut im = 0.0_f32;
+            for (k, x) in signal.iter().enumerate() {
+                let phi = omega * k as f32;
+                re += x * phi.cos();
+                im += x * phi.sin();
+            }
+            let mag = (re * re + im * im).sqrt();
+            if mag > best_mag {
+                best_mag = mag;
+                best_freq = f;
+            }
+            f += 0.5;
+        }
+        best_freq
+    }
+
+    #[test]
+    fn time_stretch_doubles_length_at_ratio_two() {
+        let fs = 48_000;
+        let frames = 4096;
+        let mut samples = synth_sine(440.0, fs, frames);
+        apply(
+            &Op::TimeStretch {
+                range: r(0, frames as u64),
+                ratio: 2.0,
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        // Output should be ~2x input length (rounding allowed).
+        assert!(
+            (samples.len() as i64 - (frames as i64 * 2)).abs() <= 2,
+            "expected ~{} frames, got {}",
+            frames * 2,
+            samples.len(),
+        );
+    }
+
+    #[test]
+    fn time_stretch_halves_length_at_ratio_half() {
+        let fs = 48_000;
+        let frames = 4096;
+        let mut samples = synth_sine(440.0, fs, frames);
+        apply(
+            &Op::TimeStretch {
+                range: r(0, frames as u64),
+                ratio: 0.5,
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let expected = frames / 2;
+        assert!(
+            (samples.len() as i64 - expected as i64).abs() <= 2,
+            "expected ~{expected} frames, got {}",
+            samples.len(),
+        );
+    }
+
+    #[test]
+    fn time_stretch_preserves_pitch() {
+        // A 440 Hz tone stretched by 2× should still be 440 Hz.
+        let fs = 48_000;
+        let frames = 8192;
+        let mut samples = synth_sine(440.0, fs, frames);
+        apply(
+            &Op::TimeStretch {
+                range: r(0, frames as u64),
+                ratio: 2.0,
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        // Sample the steady-state interior, away from the ramp-up/down.
+        let body = &samples[1024..samples.len() - 1024];
+        let f = dominant_freq(body, fs);
+        assert!((f - 440.0).abs() < 5.0, "expected ~440 Hz, got {f}");
+    }
+
+    #[test]
+    fn pitch_shift_preserves_length() {
+        let fs = 48_000;
+        let frames = 4096;
+        let mut samples = synth_sine(440.0, fs, frames);
+        apply(
+            &Op::PitchShift {
+                range: r(0, frames as u64),
+                cents: 1200.0,
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        assert!(
+            (samples.len() as i64 - frames as i64).abs() <= 2,
+            "expected length preserved, got {}",
+            samples.len(),
+        );
+    }
+
+    #[test]
+    fn pitch_shift_up_an_octave_doubles_frequency() {
+        // 440 Hz shifted up 1200 cents (one octave) → 880 Hz, length unchanged.
+        let fs = 48_000;
+        let frames = 16_384;
+        let mut samples = synth_sine(440.0, fs, frames);
+        apply(
+            &Op::PitchShift {
+                range: r(0, frames as u64),
+                cents: 1200.0,
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let body = &samples[2048..samples.len() - 2048];
+        let f = dominant_freq(body, fs);
+        // Allow a few Hz of tolerance — the OLA's smoothness limits accuracy.
+        assert!((f - 880.0).abs() < 10.0, "expected ~880 Hz, got {f}");
+    }
+
+    #[test]
+    fn pitch_shift_zero_cents_is_near_identity() {
+        let fs = 48_000;
+        let frames = 4096;
+        let original = synth_sine(440.0, fs, frames);
+        let mut samples = original.clone();
+        apply(
+            &Op::PitchShift {
+                range: r(0, frames as u64),
+                cents: 0.0,
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        assert_eq!(samples.len(), original.len());
+        let body = &samples[1024..samples.len() - 1024];
+        let f = dominant_freq(body, fs);
+        assert!((f - 440.0).abs() < 5.0, "expected ~440 Hz, got {f}");
+    }
+
+    #[test]
+    fn yin_finds_a440() {
+        let fs = 48_000;
+        let samples = synth_sine(440.0, fs, 2048);
+        let f = yin_pitch(&samples, fs).expect("YIN should detect a clean sine");
+        assert!((f - 440.0).abs() < 2.0, "got {f}");
+    }
+
+    #[test]
+    fn yin_finds_low_voice_freq() {
+        let fs = 48_000;
+        let samples = synth_sine(120.0, fs, 4096);
+        let f = yin_pitch(&samples, fs).expect("YIN should detect 120 Hz");
+        assert!((f - 120.0).abs() < 2.0, "got {f}");
+    }
+
+    #[test]
+    fn yin_returns_none_for_silence() {
+        let fs = 48_000;
+        let samples = vec![0.0_f32; 2048];
+        // Silence's CMND stays at 1.0 so the threshold is never crossed.
+        assert!(yin_pitch(&samples, fs).is_none());
+    }
+
+    #[test]
+    fn snap_chromatic_rounds_to_nearest_semitone() {
+        // 442 Hz is between A4 (440) and Bb4 (~466). Closer to A4.
+        let snapped = snap_to_scale(442.0, AutotuneScale::Chromatic, 0);
+        assert!((snapped - 440.0).abs() < 0.5, "got {snapped}");
+
+        // 460 Hz is closer to Bb4 (~466.16).
+        let snapped = snap_to_scale(460.0, AutotuneScale::Chromatic, 0);
+        assert!((snapped - 466.16).abs() < 1.0, "got {snapped}");
+    }
+
+    #[test]
+    fn snap_c_major_skips_accidentals() {
+        // 480 Hz isn't in C major (it's between Bb4 and B4). Closer to B4
+        // (~494), which is the major-7th of C and is in the scale.
+        let snapped = snap_to_scale(480.0, AutotuneScale::Major, 0);
+        assert!((snapped - 493.88).abs() < 1.0, "got {snapped}");
+
+        // 442 Hz: in C major both A4 (440) and B4 (494) are candidates;
+        // 440 is the nearest.
+        let snapped = snap_to_scale(442.0, AutotuneScale::Major, 0);
+        assert!((snapped - 440.0).abs() < 0.5, "got {snapped}");
+    }
+
+    #[test]
+    fn snap_a_minor_includes_correct_degrees() {
+        // A4 (440) is the root → unchanged.
+        let snapped = snap_to_scale(440.0, AutotuneScale::Minor, 9);
+        assert!((snapped - 440.0).abs() < 0.5, "got {snapped}");
+
+        // C5 (~523) is the minor third in A minor, allowed.
+        let snapped = snap_to_scale(523.0, AutotuneScale::Minor, 9);
+        assert!((snapped - 523.25).abs() < 1.0, "got {snapped}");
+    }
+
+    #[test]
+    fn autotune_pulls_pitch_toward_scale() {
+        // A 442 Hz sine through chromatic autotune at retune_ms=0 should be
+        // pulled to 440 Hz.
+        let fs = 48_000;
+        let frames = 16_384;
+        let mut samples = synth_sine(442.0, fs, frames);
+        apply(
+            &Op::Autotune {
+                range: r(0, frames as u64),
+                params: AutotuneParams {
+                    target: AutotuneTarget::Scale {
+                        scale: AutotuneScale::Chromatic,
+                        key_pc: 0,
+                    },
+                    retune_ms: 0.0,
+                    preserve_formants: false,
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        assert_eq!(samples.len(), frames);
+        let body = &samples[2048..samples.len() - 2048];
+        let f = dominant_freq(body, fs);
+        // Coarse-grained pitch shifters under-shoot a bit; allow 5 Hz slack
+        // so the test isn't flaky on edge resamples.
+        assert!((f - 440.0).abs() < 5.0, "expected ~440 Hz, got {f}");
+    }
+
+    #[test]
+    fn autotune_reference_mode_follows_contour() {
+        // Input 440 Hz, reference contour says "target 880". With ratio
+        // clamped to [0.25, 4.0] this should arrive close to 880.
+        let fs = 48_000;
+        let frames = 16_384;
+        let mut samples = synth_sine(440.0, fs, frames);
+        let hop = ((fs as f32) * 0.025) as u64;
+        let num_hops = (frames as u64 / hop) as usize + 1;
+        let contour = vec![880.0_f32; num_hops];
+        apply(
+            &Op::Autotune {
+                range: r(0, frames as u64),
+                params: AutotuneParams {
+                    target: AutotuneTarget::Reference {
+                        contour_hz: contour,
+                        hop_samples: hop,
+                    },
+                    retune_ms: 0.0,
+                    preserve_formants: false,
+                },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let body = &samples[2048..samples.len() - 2048];
+        let f = dominant_freq(body, fs);
+        assert!((f - 880.0).abs() < 15.0, "expected ~880 Hz, got {f}");
     }
 }

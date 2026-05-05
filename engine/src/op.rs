@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    CompParams, DelayParams, EqParams, LimitParams, NrParams, ReverbParams,
+    AutotuneParams, CompParams, DelayParams, EqParams, LimitParams, NrParams, ReverbParams,
 };
 use crate::ids::{ClipboardRef, ProfileId};
 use crate::range::SampleRange;
@@ -148,6 +148,11 @@ pub enum Op {
         range: SampleRange,
         profile: ProfileId,
         params: NrParams,
+    },
+
+    Autotune {
+        range: SampleRange,
+        params: AutotuneParams,
     },
 
     SpectralEdit {
