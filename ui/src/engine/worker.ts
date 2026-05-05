@@ -37,6 +37,26 @@ type WasmEngine = {
   applyOp: (sourceId: string, opJson: string, nowIso: string) => void;
   undo: (sourceId: string) => boolean;
   redo: (sourceId: string) => boolean;
+  // Multitrack
+  projectSampleRate: () => number;
+  listSources: () => string;
+  addTrack: (name: string) => bigint;
+  listTracks: () => string;
+  removeTrack: (trackId: bigint) => boolean;
+  setTrackGain: (trackId: bigint, gainDb: number) => void;
+  setTrackMute: (trackId: bigint, mute: boolean) => void;
+  setTrackSolo: (trackId: bigint, solo: boolean) => void;
+  addClip: (
+    trackId: bigint,
+    sourceId: string,
+    positionFrame: bigint,
+    sourceIn: bigint,
+    sourceOut: bigint,
+  ) => bigint;
+  listClips: (trackId: bigint) => string | undefined;
+  moveClip: (trackId: bigint, clipId: bigint, newPositionFrame: bigint) => void;
+  removeClip: (trackId: bigint, clipId: bigint) => boolean;
+  mixdownWav: () => Uint8Array;
 };
 
 type EngineModule = {
@@ -216,6 +236,101 @@ let playback: PlaybackState | null = null;
         case "redo": {
           const didRedo = engine.redo(cmd.sourceId);
           send({ kind: "redo_ok", req: cmd.req, didRedo });
+          return;
+        }
+
+        case "list_sources": {
+          send({ kind: "list_sources_ok", req: cmd.req, json: engine.listSources() });
+          return;
+        }
+
+        case "project_sample_rate": {
+          send({
+            kind: "project_sample_rate_ok",
+            req: cmd.req,
+            sampleRate: engine.projectSampleRate(),
+          });
+          return;
+        }
+
+        case "add_track": {
+          const trackId = Number(engine.addTrack(cmd.name));
+          send({ kind: "add_track_ok", req: cmd.req, trackId });
+          return;
+        }
+
+        case "list_tracks": {
+          send({ kind: "list_tracks_ok", req: cmd.req, json: engine.listTracks() });
+          return;
+        }
+
+        case "remove_track": {
+          const removed = engine.removeTrack(BigInt(cmd.trackId));
+          send({ kind: "remove_track_ok", req: cmd.req, removed });
+          return;
+        }
+
+        case "set_track_gain": {
+          engine.setTrackGain(BigInt(cmd.trackId), cmd.gainDb);
+          send({ kind: "set_track_gain_ok", req: cmd.req });
+          return;
+        }
+
+        case "set_track_mute": {
+          engine.setTrackMute(BigInt(cmd.trackId), cmd.mute);
+          send({ kind: "set_track_mute_ok", req: cmd.req });
+          return;
+        }
+
+        case "set_track_solo": {
+          engine.setTrackSolo(BigInt(cmd.trackId), cmd.solo);
+          send({ kind: "set_track_solo_ok", req: cmd.req });
+          return;
+        }
+
+        case "add_clip": {
+          const clipId = Number(
+            engine.addClip(
+              BigInt(cmd.trackId),
+              cmd.sourceId,
+              BigInt(Math.floor(cmd.positionFrame)),
+              BigInt(Math.floor(cmd.sourceIn)),
+              BigInt(Math.floor(cmd.sourceOut)),
+            ),
+          );
+          send({ kind: "add_clip_ok", req: cmd.req, clipId });
+          return;
+        }
+
+        case "list_clips": {
+          const json = engine.listClips(BigInt(cmd.trackId));
+          if (json === undefined) {
+            send({ kind: "error", req: cmd.req, reason: `unknown track ${cmd.trackId}` });
+            return;
+          }
+          send({ kind: "list_clips_ok", req: cmd.req, json });
+          return;
+        }
+
+        case "move_clip": {
+          engine.moveClip(
+            BigInt(cmd.trackId),
+            BigInt(cmd.clipId),
+            BigInt(Math.floor(cmd.newPositionFrame)),
+          );
+          send({ kind: "move_clip_ok", req: cmd.req });
+          return;
+        }
+
+        case "remove_clip": {
+          const removed = engine.removeClip(BigInt(cmd.trackId), BigInt(cmd.clipId));
+          send({ kind: "remove_clip_ok", req: cmd.req, removed });
+          return;
+        }
+
+        case "mixdown_wav": {
+          const bytes = engine.mixdownWav();
+          send({ kind: "mixdown_wav_ok", req: cmd.req, bytes });
           return;
         }
       }

@@ -43,9 +43,9 @@ mod wasm_api {
     use wasm_bindgen::prelude::*;
 
     use crate::engine::Engine;
-    use crate::ids::{ProfileId, SourceId};
+    use crate::ids::{ClipId, ProfileId, SourceId, TrackId};
     use crate::op::Op;
-    use crate::project::Project;
+    use crate::project::{Clip, Fade, Project, Track};
     use crate::range::SampleRange;
     use crate::source::Timestamp;
 
@@ -292,6 +292,250 @@ mod wasm_api {
             let project = Project::from_json(json).map_err(|e| JsError::new(&e.to_string()))?;
             self.inner.replace_project(project);
             Ok(())
+        }
+
+        // ---- multitrack: sources / tracks / clips ------------------------
+
+        #[wasm_bindgen(js_name = projectSampleRate)]
+        pub fn project_sample_rate(&self) -> u32 {
+            self.inner.project().sample_rate()
+        }
+
+        /// List all imported sources as a JSON array. Each entry is
+        /// `{id, name, frames, sampleRate, channels}` so the multitrack UI
+        /// can populate its source picker without extra round trips.
+        #[wasm_bindgen(js_name = listSources)]
+        pub fn list_sources(&self) -> String {
+            let arr: Vec<serde_json::Value> = self
+                .inner
+                .project()
+                .sources
+                .values()
+                .map(|s| {
+                    serde_json::json!({
+                        "id": s.id.as_str(),
+                        "name": s.name,
+                        "frames": s.base_length,
+                        "sampleRate": s.sample_rate,
+                        "channels": s.channel_count,
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        }
+
+        #[wasm_bindgen(js_name = addTrack)]
+        pub fn add_track(&mut self, name: &str) -> u64 {
+            let next = self
+                .inner
+                .project()
+                .tracks
+                .iter()
+                .map(|t| t.id.0)
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1);
+            let track = Track {
+                id: TrackId(next),
+                name: name.to_string(),
+                height: 80.0,
+                mute: false,
+                solo: false,
+                arm: false,
+                gain_db: 0.0,
+                pan: 0.0,
+                inserts: Vec::new(),
+                automation: Vec::new(),
+                clips: Vec::new(),
+            };
+            self.inner.project_mut().tracks.push(track);
+            next
+        }
+
+        /// JSON: `[{id, name, mute, solo, gainDb, pan, clipCount}]`.
+        #[wasm_bindgen(js_name = listTracks)]
+        pub fn list_tracks(&self) -> String {
+            let arr: Vec<serde_json::Value> = self
+                .inner
+                .project()
+                .tracks
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "id": t.id.0,
+                        "name": t.name,
+                        "mute": t.mute,
+                        "solo": t.solo,
+                        "gainDb": t.gain_db,
+                        "pan": t.pan,
+                        "clipCount": t.clips.len(),
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        }
+
+        #[wasm_bindgen(js_name = setTrackGain)]
+        pub fn set_track_gain(&mut self, track_id: u64, gain_db: f32) -> Result<(), JsError> {
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            track.gain_db = gain_db;
+            Ok(())
+        }
+
+        #[wasm_bindgen(js_name = setTrackMute)]
+        pub fn set_track_mute(&mut self, track_id: u64, mute: bool) -> Result<(), JsError> {
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            track.mute = mute;
+            Ok(())
+        }
+
+        #[wasm_bindgen(js_name = setTrackSolo)]
+        pub fn set_track_solo(&mut self, track_id: u64, solo: bool) -> Result<(), JsError> {
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            track.solo = solo;
+            Ok(())
+        }
+
+        #[wasm_bindgen(js_name = removeTrack)]
+        pub fn remove_track(&mut self, track_id: u64) -> bool {
+            let tracks = &mut self.inner.project_mut().tracks;
+            let before = tracks.len();
+            tracks.retain(|t| t.id.0 != track_id);
+            tracks.len() != before
+        }
+
+        /// Add a clip to `track_id`. The clip places `[source_in, source_out)`
+        /// of `source_id` at `position_frame` on the track's timeline. Returns
+        /// the new clip id.
+        #[wasm_bindgen(js_name = addClip)]
+        pub fn add_clip(
+            &mut self,
+            track_id: u64,
+            source_id: &str,
+            position_frame: u64,
+            source_in: u64,
+            source_out: u64,
+        ) -> Result<u64, JsError> {
+            if source_out < source_in {
+                return Err(JsError::new("source_out < source_in"));
+            }
+            let len = source_out - source_in;
+            let track_position = SampleRange::new(position_frame, position_frame + len)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            // Verify the source exists so callers get a typed error instead of
+            // a silent no-op.
+            let source_id_typed = SourceId::new(source_id);
+            if !self
+                .inner
+                .project()
+                .sources
+                .contains_key(&source_id_typed)
+            {
+                return Err(JsError::new(&format!("unknown source {source_id}")));
+            }
+            // Mint a clip ID unique across the whole project.
+            let next = self
+                .inner
+                .project()
+                .tracks
+                .iter()
+                .flat_map(|t| t.clips.iter().map(|c| c.id.0))
+                .max()
+                .map(|m| m + 1)
+                .unwrap_or(1);
+            let clip = Clip {
+                id: ClipId(next),
+                source_id: source_id_typed,
+                name: "Clip".to_string(),
+                track_position,
+                source_in,
+                source_out,
+                gain_db: 0.0,
+                pan: 0.0,
+                fade_in: Fade::none(),
+                fade_out: Fade::none(),
+                time_stretch: 1.0,
+                pitch_shift_cents: 0.0,
+                envelopes: Vec::new(),
+                locked: false,
+                group: None,
+            };
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            track.clips.push(clip);
+            Ok(next)
+        }
+
+        /// JSON: `[{id, sourceId, position, sourceIn, sourceOut, gainDb, pan, name}]`.
+        #[wasm_bindgen(js_name = listClips)]
+        pub fn list_clips(&self, track_id: u64) -> Option<String> {
+            let track = self.inner.project().track(TrackId(track_id))?;
+            let arr: Vec<serde_json::Value> = track
+                .clips
+                .iter()
+                .map(|c| {
+                    serde_json::json!({
+                        "id": c.id.0,
+                        "sourceId": c.source_id.as_str(),
+                        "name": c.name,
+                        "position": c.track_position.start(),
+                        "endPosition": c.track_position.end(),
+                        "sourceIn": c.source_in,
+                        "sourceOut": c.source_out,
+                        "gainDb": c.gain_db,
+                        "pan": c.pan,
+                    })
+                })
+                .collect();
+            Some(serde_json::Value::Array(arr).to_string())
+        }
+
+        #[wasm_bindgen(js_name = moveClip)]
+        pub fn move_clip(
+            &mut self,
+            track_id: u64,
+            clip_id: u64,
+            new_position_frame: u64,
+        ) -> Result<(), JsError> {
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            let clip = track
+                .clips
+                .iter_mut()
+                .find(|c| c.id.0 == clip_id)
+                .ok_or_else(|| JsError::new(&format!("unknown clip {clip_id}")))?;
+            let len = clip.track_position.len();
+            clip.track_position = SampleRange::new(new_position_frame, new_position_frame + len)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            Ok(())
+        }
+
+        #[wasm_bindgen(js_name = removeClip)]
+        pub fn remove_clip(&mut self, track_id: u64, clip_id: u64) -> bool {
+            let Some(track) = self.inner.project_mut().track_mut(TrackId(track_id)) else {
+                return false;
+            };
+            let before = track.clips.len();
+            track.clips.retain(|c| c.id.0 != clip_id);
+            track.clips.len() != before
         }
     }
 }

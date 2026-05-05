@@ -5,6 +5,36 @@ type Pending = (ev: EngineEvent) => void;
 
 export class EngineUnavailable extends Error {}
 
+export interface SourceInfo {
+  id: string;
+  name: string;
+  frames: number;
+  sampleRate: number;
+  channels: number;
+}
+
+export interface TrackInfo {
+  id: number;
+  name: string;
+  mute: boolean;
+  solo: boolean;
+  gainDb: number;
+  pan: number;
+  clipCount: number;
+}
+
+export interface ClipInfo {
+  id: number;
+  sourceId: string;
+  name: string;
+  position: number;
+  endPosition: number;
+  sourceIn: number;
+  sourceOut: number;
+  gainDb: number;
+  pan: number;
+}
+
 /**
  * Promise-returning wrapper around the engine Worker. A single client owns
  * one worker; concurrent calls are correlated by request id.
@@ -151,6 +181,122 @@ export class EngineClient {
     );
     if (ev.kind !== "redo_ok") throw new Error("unexpected event");
     return ev.didRedo;
+  }
+
+  // ---- multitrack ------------------------------------------------------
+
+  async projectSampleRate(): Promise<number> {
+    const ev = await this.request<EngineCommand & { kind: "project_sample_rate" }>(
+      (req) => ({ kind: "project_sample_rate", req }),
+    );
+    if (ev.kind !== "project_sample_rate_ok") throw new Error("unexpected event");
+    return ev.sampleRate;
+  }
+
+  async listSources(): Promise<SourceInfo[]> {
+    const ev = await this.request<EngineCommand & { kind: "list_sources" }>(
+      (req) => ({ kind: "list_sources", req }),
+    );
+    if (ev.kind !== "list_sources_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as SourceInfo[];
+  }
+
+  async addTrack(name: string): Promise<number> {
+    const ev = await this.request<EngineCommand & { kind: "add_track" }>(
+      (req) => ({ kind: "add_track", req, name }),
+    );
+    if (ev.kind !== "add_track_ok") throw new Error("unexpected event");
+    return ev.trackId;
+  }
+
+  async listTracks(): Promise<TrackInfo[]> {
+    const ev = await this.request<EngineCommand & { kind: "list_tracks" }>(
+      (req) => ({ kind: "list_tracks", req }),
+    );
+    if (ev.kind !== "list_tracks_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as TrackInfo[];
+  }
+
+  async removeTrack(trackId: number): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "remove_track" }>(
+      (req) => ({ kind: "remove_track", req, trackId }),
+    );
+    if (ev.kind !== "remove_track_ok") throw new Error("unexpected event");
+    return ev.removed;
+  }
+
+  async setTrackGain(trackId: number, gainDb: number): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_track_gain" }>(
+      (req) => ({ kind: "set_track_gain", req, trackId, gainDb }),
+    );
+    if (ev.kind !== "set_track_gain_ok") throw new Error("unexpected event");
+  }
+
+  async setTrackMute(trackId: number, mute: boolean): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_track_mute" }>(
+      (req) => ({ kind: "set_track_mute", req, trackId, mute }),
+    );
+    if (ev.kind !== "set_track_mute_ok") throw new Error("unexpected event");
+  }
+
+  async setTrackSolo(trackId: number, solo: boolean): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_track_solo" }>(
+      (req) => ({ kind: "set_track_solo", req, trackId, solo }),
+    );
+    if (ev.kind !== "set_track_solo_ok") throw new Error("unexpected event");
+  }
+
+  async addClip(
+    trackId: number,
+    sourceId: string,
+    positionFrame: number,
+    sourceIn: number,
+    sourceOut: number,
+  ): Promise<number> {
+    const ev = await this.request<EngineCommand & { kind: "add_clip" }>(
+      (req) => ({
+        kind: "add_clip",
+        req,
+        trackId,
+        sourceId,
+        positionFrame,
+        sourceIn,
+        sourceOut,
+      }),
+    );
+    if (ev.kind !== "add_clip_ok") throw new Error("unexpected event");
+    return ev.clipId;
+  }
+
+  async listClips(trackId: number): Promise<ClipInfo[]> {
+    const ev = await this.request<EngineCommand & { kind: "list_clips" }>(
+      (req) => ({ kind: "list_clips", req, trackId }),
+    );
+    if (ev.kind !== "list_clips_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as ClipInfo[];
+  }
+
+  async moveClip(trackId: number, clipId: number, newPositionFrame: number): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "move_clip" }>(
+      (req) => ({ kind: "move_clip", req, trackId, clipId, newPositionFrame }),
+    );
+    if (ev.kind !== "move_clip_ok") throw new Error("unexpected event");
+  }
+
+  async removeClip(trackId: number, clipId: number): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "remove_clip" }>(
+      (req) => ({ kind: "remove_clip", req, trackId, clipId }),
+    );
+    if (ev.kind !== "remove_clip_ok") throw new Error("unexpected event");
+    return ev.removed;
+  }
+
+  async mixdownWav(): Promise<Uint8Array> {
+    const ev = await this.request<EngineCommand & { kind: "mixdown_wav" }>(
+      (req) => ({ kind: "mixdown_wav", req }),
+    );
+    if (ev.kind !== "mixdown_wav_ok") throw new Error("unexpected event");
+    return ev.bytes;
   }
 
   terminate(): void {

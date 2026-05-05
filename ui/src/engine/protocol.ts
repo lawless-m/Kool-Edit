@@ -42,7 +42,34 @@ export type EngineCommand =
       nowIso: string;
     }
   | { kind: "undo"; req: RequestId; sourceId: string }
-  | { kind: "redo"; req: RequestId; sourceId: string };
+  | { kind: "redo"; req: RequestId; sourceId: string }
+  | { kind: "list_sources"; req: RequestId }
+  | { kind: "project_sample_rate"; req: RequestId }
+  | { kind: "add_track"; req: RequestId; name: string }
+  | { kind: "list_tracks"; req: RequestId }
+  | { kind: "remove_track"; req: RequestId; trackId: number }
+  | { kind: "set_track_gain"; req: RequestId; trackId: number; gainDb: number }
+  | { kind: "set_track_mute"; req: RequestId; trackId: number; mute: boolean }
+  | { kind: "set_track_solo"; req: RequestId; trackId: number; solo: boolean }
+  | {
+      kind: "add_clip";
+      req: RequestId;
+      trackId: number;
+      sourceId: string;
+      positionFrame: number;
+      sourceIn: number;
+      sourceOut: number;
+    }
+  | { kind: "list_clips"; req: RequestId; trackId: number }
+  | {
+      kind: "move_clip";
+      req: RequestId;
+      trackId: number;
+      clipId: number;
+      newPositionFrame: number;
+    }
+  | { kind: "remove_clip"; req: RequestId; trackId: number; clipId: number }
+  | { kind: "mixdown_wav"; req: RequestId };
 
 export type EngineEvent =
   | { kind: "ready" }
@@ -62,4 +89,17 @@ export type EngineEvent =
   | { kind: "apply_op_ok"; req: RequestId }
   | { kind: "undo_ok"; req: RequestId; didUndo: boolean }
   | { kind: "redo_ok"; req: RequestId; didRedo: boolean }
+  | { kind: "list_sources_ok"; req: RequestId; json: string }
+  | { kind: "project_sample_rate_ok"; req: RequestId; sampleRate: number }
+  | { kind: "add_track_ok"; req: RequestId; trackId: number }
+  | { kind: "list_tracks_ok"; req: RequestId; json: string }
+  | { kind: "remove_track_ok"; req: RequestId; removed: boolean }
+  | { kind: "set_track_gain_ok"; req: RequestId }
+  | { kind: "set_track_mute_ok"; req: RequestId }
+  | { kind: "set_track_solo_ok"; req: RequestId }
+  | { kind: "add_clip_ok"; req: RequestId; clipId: number }
+  | { kind: "list_clips_ok"; req: RequestId; json: string }
+  | { kind: "move_clip_ok"; req: RequestId }
+  | { kind: "remove_clip_ok"; req: RequestId; removed: boolean }
+  | { kind: "mixdown_wav_ok"; req: RequestId; bytes: Uint8Array }
   | { kind: "error"; req: RequestId; reason: string };

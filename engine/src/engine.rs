@@ -139,18 +139,36 @@ impl Engine {
         let decoded = wav::decode(bytes)?;
         let id = content_derived_id(bytes);
         let path = format!("sources/{id}/base.f32");
-        self.storage.write_all(&path, &decoded.samples)?;
+
+        // Resample to the project's rate at import time so mixdown and any
+        // other downstream consumer can treat every source uniformly. Linear
+        // interpolation is good enough for v1; a windowed-sinc upgrade slots
+        // into this same call site later.
+        let project_rate = self.project.sample_rate();
+        let (samples, frames, stored_rate) = if decoded.sample_rate == project_rate {
+            (decoded.samples, decoded.frames, decoded.sample_rate)
+        } else {
+            let (resampled, new_frames) = resample_linear(
+                &decoded.samples,
+                decoded.channel_count,
+                decoded.sample_rate,
+                project_rate,
+            );
+            (resampled, new_frames, project_rate)
+        };
+
+        self.storage.write_all(&path, &samples)?;
 
         let source = Source::new(
             id.clone(),
             name,
             decoded.channel_count,
-            decoded.sample_rate,
+            stored_rate,
             StoragePath::new(path),
-            decoded.frames,
+            frames,
             now,
         );
-        let peaks = PeakCache::from_decoded(&decoded, DEFAULT_DECIMATION);
+        let peaks = PeakCache::from_samples(&samples, decoded.channel_count, DEFAULT_DECIMATION);
 
         self.project.sources.insert(id.clone(), source);
         self.peaks.insert(id.clone(), peaks);
@@ -562,6 +580,42 @@ fn mono_sum(interleaved: &[f32], channels: usize) -> Vec<f32> {
     out
 }
 
+/// Linear-interpolation resampler. Returns `(interleaved_samples, frame_count)`
+/// at `dst_rate`. Pass-through when src_rate == dst_rate; empty input yields
+/// empty output. Channel order is preserved.
+fn resample_linear(
+    interleaved: &[f32],
+    channels: u16,
+    src_rate: u32,
+    dst_rate: u32,
+) -> (Vec<f32>, u64) {
+    if src_rate == dst_rate || interleaved.is_empty() {
+        let frames = interleaved.len() as u64 / channels.max(1) as u64;
+        return (interleaved.to_vec(), frames);
+    }
+    let ch = channels as usize;
+    let src_frames = interleaved.len() / ch;
+    if src_frames == 0 {
+        return (Vec::new(), 0);
+    }
+    let ratio = src_rate as f64 / dst_rate as f64;
+    let dst_frames = ((src_frames as f64) / ratio).floor() as usize;
+    let mut out = vec![0.0_f32; dst_frames * ch];
+    let last = src_frames - 1;
+    for i in 0..dst_frames {
+        let src_pos = i as f64 * ratio;
+        let i0 = src_pos.floor() as usize;
+        let frac = (src_pos - i0 as f64) as f32;
+        let i1 = (i0 + 1).min(last);
+        for c in 0..ch {
+            let a = interleaved[i0 * ch + c];
+            let b = interleaved[i1 * ch + c];
+            out[i * ch + c] = a + (b - a) * frac;
+        }
+    }
+    (out, dst_frames as u64)
+}
+
 /// Doc 04 §"Identifier conventions": `src_xxxx` where xxxx is the first 4 hex
 /// digits of the content hash. We use `DefaultHasher` (FNV-style); collision
 /// risk inside a single project is fine for v1, and content-addressing is
@@ -602,7 +656,7 @@ mod tests {
     #[test]
     fn import_wav_writes_samples_through_storage() {
         let bytes = synth_mono_wav(&[0.0, 0.5, -0.5, 1.0, -1.0, 0.0, 0.0, 0.0], 48_000);
-        let mut engine = Engine::new(96_000);
+        let mut engine = Engine::new(48_000);
         let id = engine.import_wav("test.wav", &bytes, now()).unwrap();
         assert_eq!(engine.source_frame_count(&id), Some(8));
         let samples = engine
@@ -615,7 +669,7 @@ mod tests {
     #[test]
     fn read_base_samples_handles_subrange_for_mono() {
         let bytes = synth_mono_wav(&[10.0, 20.0, 30.0, 40.0, 50.0], 48_000);
-        let mut engine = Engine::new(96_000);
+        let mut engine = Engine::new(48_000);
         let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
         let buf = engine
             .read_base_samples(&id, SampleRange::new(1, 4).unwrap())
@@ -643,7 +697,7 @@ mod tests {
         }
         let bytes = buf.into_inner();
 
-        let mut engine = Engine::new(96_000);
+        let mut engine = Engine::new(48_000);
         let id = engine.import_wav("stereo.wav", &bytes, now()).unwrap();
         let samples = engine
             .read_base_samples(&id, SampleRange::new(1, 3).unwrap())
@@ -686,7 +740,7 @@ mod tests {
         use crate::storage::NativeStorage;
         let dir = tempfile::tempdir().unwrap();
         let storage = Box::new(NativeStorage::new(dir.path()).unwrap());
-        let mut engine = Engine::with_storage(96_000, storage);
+        let mut engine = Engine::with_storage(48_000, storage);
 
         let bytes = synth_mono_wav(&[0.25, -0.25, 0.5, -0.5], 48_000);
         let id = engine.import_wav("n.wav", &bytes, now()).unwrap();
@@ -700,7 +754,7 @@ mod tests {
     #[test]
     fn query_samples_with_no_ops_matches_base() {
         let bytes = synth_mono_wav(&[0.1, 0.2, 0.3, 0.4, 0.5], 48_000);
-        let mut engine = Engine::new(96_000);
+        let mut engine = Engine::new(48_000);
         let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
         let q = engine
             .query_samples(&id, SampleRange::new(1, 4).unwrap())
@@ -823,7 +877,7 @@ mod tests {
     #[test]
     fn flatten_regenerates_peak_cache() {
         let bytes = synth_mono_wav(&[1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0], 48_000);
-        let mut engine = Engine::new(96_000);
+        let mut engine = Engine::new(48_000);
         let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
         engine
             .apply_op(
@@ -993,6 +1047,24 @@ mod tests {
             .query_samples(&id, SampleRange::new(0, 100).unwrap())
             .unwrap();
         assert_eq!(pre_query, post_query);
+    }
+
+    #[test]
+    fn import_resamples_to_project_rate_when_rates_differ() {
+        // 8 frames at 48 kHz imported into a 96 kHz project should land as
+        // ~16 frames at 96 kHz, with the source's recorded rate now 96 kHz.
+        let bytes = synth_mono_wav(&[0.0, 0.5, 1.0, 0.5, 0.0, -0.5, -1.0, -0.5], 48_000);
+        let mut engine = Engine::new(96_000);
+        let id = engine.import_wav("a.wav", &bytes, now()).unwrap();
+        let frames = engine.source_frame_count(&id).unwrap();
+        assert!(frames >= 15 && frames <= 17, "expected ~16 frames, got {frames}");
+        assert_eq!(engine.source_sample_rate(&id), Some(96_000));
+        // The first resampled frame should still be the first original sample
+        // (linear interp at t=0 hits the original point exactly).
+        let read = engine
+            .read_base_samples(&id, SampleRange::new(0, 1).unwrap())
+            .unwrap();
+        assert_eq!(read[0], 0.0);
     }
 
     #[test]

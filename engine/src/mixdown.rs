@@ -91,8 +91,12 @@ pub fn mixdown_stereo(engine: &Engine) -> Result<Vec<f32>, MixdownError> {
     let total_frames = project_length_frames(project);
     let mut master = vec![0.0_f32; (total_frames * 2) as usize];
 
+    // Solo overrides mute: if any track is soloed, only solo'd tracks play;
+    // otherwise the usual mute filter applies.
+    let any_solo = project.tracks.iter().any(|t| t.solo);
     for track in &project.tracks {
-        if track.mute {
+        let audible = if any_solo { track.solo } else { !track.mute };
+        if !audible {
             continue;
         }
         let track_buf = render_track(engine, track, total_frames)?;
@@ -581,12 +585,53 @@ mod tests {
     }
 
     #[test]
+    fn solo_silences_unsoloed_tracks() {
+        let mut engine = Engine::new(48_000);
+        let a = engine
+            .import_wav("a.wav", &synth_mono_wav(&[0.5_f32; 8], 48_000), now())
+            .unwrap();
+        let b = engine
+            .import_wav("b.wav", &synth_mono_wav(&[0.5_f32; 8], 48_000), now())
+            .unwrap();
+
+        let mut t1 = empty_track(1, "Loud");
+        t1.clips.push(clip_for(1, a, 0, 8));
+        t1.solo = true;
+        let mut t2 = empty_track(2, "Quiet");
+        t2.clips.push(clip_for(2, b, 0, 8));
+        engine.project_mut().tracks.push(t1);
+        engine.project_mut().tracks.push(t2);
+
+        let out = mixdown_stereo(&engine).unwrap();
+        // Only the soloed track contributes. With one centre-panned mono
+        // 0.5 source we expect ~0.354 per channel — half of what two tracks
+        // would produce.
+        let expected = 0.5 * std::f32::consts::FRAC_1_SQRT_2;
+        for f in 0..8 {
+            assert!(
+                (out[f * 2] - expected).abs() < 1e-3,
+                "L mismatch at frame {f}: got {}",
+                out[f * 2],
+            );
+        }
+    }
+
+    #[test]
     fn rejects_clip_at_mismatched_sample_rate() {
-        // Project at 96k, source at 48k.
+        // import_wav now resamples to the project rate, so the path that
+        // produces a mismatch is one where a source was loaded out-of-band
+        // (e.g. a project file with stale rates). Reproduce that by mutating
+        // the source's sample_rate after import.
         let mut engine = Engine::new(96_000);
         let id = engine
             .import_wav("a.wav", &synth_mono_wav(&[0.5_f32; 8], 48_000), now())
             .unwrap();
+        engine
+            .project_mut()
+            .sources
+            .get_mut(&id)
+            .unwrap()
+            .sample_rate = 48_000;
 
         let mut t = empty_track(1, "T");
         t.clips.push(clip_for(1, id, 0, 8));
