@@ -7,7 +7,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::effect::{
-    AutotuneParams, CompParams, DelayParams, EqParams, LimitParams, NrParams, ReverbParams,
+    AutotuneParams, ChorusParams, CompParams, DelayParams, DistortionParams, EqParams, LimitParams,
+    NrParams, ReverbParams,
 };
 use crate::ids::{ClipboardRef, ProfileId};
 use crate::range::SampleRange;
@@ -140,6 +141,14 @@ pub enum Op {
     Delay {
         range: SampleRange,
         params: DelayParams,
+    },
+    Distortion {
+        range: SampleRange,
+        params: DistortionParams,
+    },
+    Chorus {
+        range: SampleRange,
+        params: ChorusParams,
     },
 
     TimeStretch {

@@ -824,6 +824,95 @@ export async function mountEditor(
       }),
     },
     {
+      id: "Distortion",
+      label: "Distortion",
+      params: [
+        { kind: "number", key: "drive_db", label: "drive dB", min: 0, max: 48, step: 0.5, default: 12 },
+        { kind: "number", key: "tone_hz", label: "tone Hz", min: 0, max: 20000, step: 100, default: 0 },
+        { kind: "number", key: "mix", label: "mix", min: 0, max: 1, step: 0.05, default: 1.0 },
+      ],
+      // tone_hz=0 means "no lowpass" — pass null on the wire so the
+      // engine's optional field reads as None.
+      build: (range, vals) => {
+        const tone = num(vals, "tone_hz", 0);
+        return {
+          Distortion: {
+            range,
+            params: {
+              drive_db: num(vals, "drive_db", 12),
+              tone_hz: tone > 0 ? tone : null,
+              mix: num(vals, "mix", 1.0),
+            },
+          },
+        };
+      },
+    },
+    {
+      id: "Chorus",
+      label: "Chorus",
+      params: [
+        { kind: "number", key: "rate_hz", label: "rate Hz", min: 0.05, max: 8, step: 0.05, default: 1.0 },
+        { kind: "number", key: "depth_ms", label: "depth ms", min: 0.5, max: 20, step: 0.5, default: 4.0 },
+        { kind: "number", key: "mix", label: "mix", min: 0, max: 1, step: 0.05, default: 0.5 },
+        { kind: "number", key: "voices", label: "voices", min: 1, max: 6, step: 1, default: 2 },
+      ],
+      build: (range, vals) => ({
+        Chorus: {
+          range,
+          params: {
+            rate_hz: num(vals, "rate_hz", 1.0),
+            depth_ms: num(vals, "depth_ms", 4.0),
+            mix: num(vals, "mix", 0.5),
+            voices: Math.round(num(vals, "voices", 2)),
+          },
+        },
+      }),
+    },
+    {
+      id: "Compressor",
+      label: "Compressor",
+      params: [
+        { kind: "number", key: "threshold_db", label: "thresh dB", min: -60, max: 0, step: 0.5, default: -18 },
+        { kind: "number", key: "ratio", label: "ratio", min: 1, max: 20, step: 0.5, default: 4 },
+        { kind: "number", key: "attack_ms", label: "atk ms", min: 0.1, max: 100, step: 0.5, default: 5 },
+        { kind: "number", key: "release_ms", label: "rel ms", min: 5, max: 1000, step: 5, default: 80 },
+        { kind: "number", key: "knee_db", label: "knee dB", min: 0, max: 24, step: 0.5, default: 6 },
+        { kind: "number", key: "makeup_db", label: "makeup dB", min: 0, max: 24, step: 0.5, default: 0 },
+      ],
+      build: (range, vals) => ({
+        Compress: {
+          range,
+          params: {
+            threshold_db: num(vals, "threshold_db", -18),
+            ratio: num(vals, "ratio", 4),
+            attack_ms: num(vals, "attack_ms", 5),
+            release_ms: num(vals, "release_ms", 80),
+            knee_db: num(vals, "knee_db", 6),
+            makeup_db: num(vals, "makeup_db", 0),
+          },
+        },
+      }),
+    },
+    {
+      id: "Limiter",
+      label: "Limiter",
+      params: [
+        { kind: "number", key: "ceiling_db", label: "ceiling dB", min: -12, max: 0, step: 0.1, default: -0.3 },
+        { kind: "number", key: "lookahead_ms", label: "lookahead ms", min: 0, max: 20, step: 0.5, default: 2 },
+        { kind: "number", key: "release_ms", label: "release ms", min: 10, max: 500, step: 5, default: 50 },
+      ],
+      build: (range, vals) => ({
+        Limit: {
+          range,
+          params: {
+            ceiling_db: num(vals, "ceiling_db", -0.3),
+            lookahead_ms: num(vals, "lookahead_ms", 2),
+            release_ms: num(vals, "release_ms", 50),
+          },
+        },
+      }),
+    },
+    {
       id: "TimeStretch",
       label: "Time Stretch",
       params: [
@@ -1165,19 +1254,24 @@ export async function mountEditor(
     for (const [k, el] of Object.entries(currentFxInputs)) vals[k] = el.value;
     const op = def.build(range, vals);
     ui.fxApplyBtn.disabled = true;
+    const lenBefore = sourceFrameCount;
     try {
       await client.applyOp(currentSourceId, JSON.stringify(op));
-      // Length-changing ops: refresh source frame count from the engine,
-      // since the buffer now spans more or fewer frames.
-      if (def.id === "TimeStretch") {
-        const ratio = num(vals, "ratio", 1.0);
-        if (Math.abs(ratio - 1.0) > 1e-3) {
-          await refreshLibrary();
-          await loadSource(currentSourceId);
-          opts.onSourceImported?.();
-          ui.status.textContent = `Time Stretch ×${ratio.toFixed(2)} applied`;
-          return;
-        }
+      // Generic length-change detection: anything that grew or shrank
+      // the source (Trim/Cut/TimeStretch, but also Delay's tail
+      // extension and similar) needs a full reload so the viewport,
+      // selection, and cached frame count line up with the new buffer.
+      await refreshLibrary();
+      const fresh = sources.find((s) => s.id === currentSourceId);
+      const lenAfter = fresh?.frames ?? lenBefore;
+      if (lenAfter !== lenBefore) {
+        await loadSource(currentSourceId);
+        opts.onSourceImported?.();
+        ui.status.textContent =
+          def.id === "TimeStretch"
+            ? `Time Stretch ×${num(vals, "ratio", 1.0).toFixed(2)} applied`
+            : `${def.label} applied (length ${lenBefore.toLocaleString()} → ${lenAfter.toLocaleString()})`;
+        return;
       }
       await refreshAfterEdit();
       // Source content changed — let the arranger refresh its peak cache

@@ -232,6 +232,24 @@ impl<'a> Emitter<'a> {
                 fmt_range(*range, sample_rate),
                 fmt_delay_params(params)
             )),
+            Op::Distortion { range, params } => self.line(&format!(
+                "{}  distortion drive_db:{} mix:{}{}",
+                fmt_range(*range, sample_rate),
+                fmt_db(params.drive_db),
+                fmt_float(params.mix),
+                match params.tone_hz {
+                    Some(hz) => format!(" tone_hz:{}", fmt_float(hz)),
+                    None => String::new(),
+                }
+            )),
+            Op::Chorus { range, params } => self.line(&format!(
+                "{}  chorus rate_hz:{} depth_ms:{} mix:{} voices:{}",
+                fmt_range(*range, sample_rate),
+                fmt_float(params.rate_hz),
+                fmt_float(params.depth_ms),
+                fmt_float(params.mix),
+                params.voices
+            )),
             Op::Compress { range, params } => self.line(&format!(
                 "{}  compress {}",
                 fmt_range(*range, sample_rate),

@@ -16,8 +16,8 @@ use std::f32::consts::PI;
 use rustfft::{FftPlanner, num_complex::Complex};
 
 use crate::effect::{
-    AutotuneParams, AutotuneScale, AutotuneTarget, CompParams, DelayParams, EqBand, EqBandKind,
-    EqParams, LimitParams, ReverbModel, ReverbParams,
+    AutotuneParams, AutotuneScale, AutotuneTarget, ChorusParams, CompParams, DelayParams,
+    DistortionParams, EqBand, EqBandKind, EqParams, LimitParams, ReverbModel, ReverbParams,
 };
 use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
@@ -88,6 +88,12 @@ pub fn apply(
         }
         Op::Delay { range, params } => {
             delay(buffer, channels, *range, params, sample_rate)
+        }
+        Op::Distortion { range, params } => {
+            distortion(buffer, channels, *range, params, sample_rate)
+        }
+        Op::Chorus { range, params } => {
+            chorus(buffer, channels, *range, params, sample_rate)
         }
         Op::Compress { range, params } => {
             compress(buffer, channels, *range, params, sample_rate)
@@ -1590,16 +1596,22 @@ fn time_const_coef(time_ms: f32, sample_rate: u32) -> f32 {
 }
 
 fn delay(
-    buffer: &mut [f32],
+    buffer: &mut Vec<f32>,
     channels: u16,
     range: SampleRange,
     params: &DelayParams,
     sample_rate: u32,
 ) -> Result<(), DspError> {
-    let s = slice_for(buffer, channels, range)?;
-    let ch = channels as usize;
-    let frames = s.len() / ch;
-    if frames == 0 {
+    let ch_u = channels as u64;
+    let total_frames = buffer.len() as u64 / ch_u;
+    if range.end() > total_frames {
+        return Err(DspError::RangeOutsideBuffer {
+            range,
+            frames: total_frames,
+        });
+    }
+    let frames_in = (range.end() - range.start()) as usize;
+    if frames_in == 0 {
         return Ok(());
     }
     let delay_frames = ((params.time_ms / 1000.0) * sample_rate as f32) as usize;
@@ -1608,31 +1620,235 @@ fn delay(
     }
     let feedback = params.feedback.clamp(0.0, 0.99);
     let mix = params.mix.clamp(0.0, 1.0);
+    if mix <= 0.0 {
+        return Ok(());
+    }
     let dry = 1.0 - mix;
-    let mut lines: Vec<Vec<f32>> = (0..ch).map(|_| vec![0.0_f32; delay_frames]).collect();
-    let mut head = 0_usize;
+    let ch = channels as usize;
     let ping_pong = params.ping_pong && ch == 2;
 
-    for f in 0..frames {
-        // Snapshot every channel's delayed sample before any writes — both
-        // the feedback path and the output mix can read across channels in
+    // Tail: how many extra frames to process after the selection so the
+    // feedback echoes ring out instead of getting cut off at the boundary.
+    // For zero feedback that's one delay_frames; otherwise enough repeats
+    // for the geometric series to drop below ~-60 dB. Capped at 4 s so a
+    // very-high-feedback delay doesn't blow up the source length.
+    let tail_repeats = if feedback <= 1e-6 {
+        1
+    } else {
+        let n = (-6.91_f32 / feedback.ln()).ceil() as usize;
+        n.clamp(2, 32)
+    };
+    let max_tail_frames = (sample_rate * 4) as usize;
+    let tail_wanted = (delay_frames * tail_repeats).min(max_tail_frames);
+
+    // Bleed the wet tail into existing post-range audio first; if the
+    // tail outruns what's already in the buffer, append zeros so the
+    // ringing still has somewhere to land.
+    let post_avail = (total_frames - range.end()) as usize;
+    let extend_by = tail_wanted.saturating_sub(post_avail);
+    if extend_by > 0 {
+        buffer.extend(std::iter::repeat(0.0_f32).take(extend_by * ch));
+    }
+    let total_proc = frames_in + tail_wanted;
+
+    let start_sample = (range.start() * ch_u) as usize;
+    let work_end = start_sample + total_proc * ch;
+    // Snapshot the dry signal *before* we start writing so the output mix
+    // sees the original samples (in-range) and the original post-range
+    // audio (in-tail) rather than partially-overwritten content.
+    let dry_signal: Vec<f32> = buffer[start_sample..work_end].to_vec();
+    let work = &mut buffer[start_sample..work_end];
+
+    let mut lines: Vec<Vec<f32>> = (0..ch).map(|_| vec![0.0_f32; delay_frames]).collect();
+    let mut head = 0_usize;
+
+    for f in 0..total_proc {
+        let in_range = f < frames_in;
+        // Snapshot every channel's delayed sample first — both the
+        // feedback path and the output mix can read across channels in
         // ping-pong mode, so we want a consistent view of the lines.
-        let mut delayed = vec![0.0_f32; ch];
-        for c in 0..ch {
-            delayed[c] = lines[c][head];
+        let mut delayed = [0.0_f32; 2];
+        for (c, d) in delayed.iter_mut().enumerate().take(ch) {
+            *d = lines[c][head];
         }
 
         for c in 0..ch {
-            let input = s[f * ch + c];
-            // Ping-pong cross-couples both the feedback into the line and
-            // the wet output. Without it, each channel is its own delay.
+            // Sample fed into the delay line: the live audio while we're
+            // inside the range, silence in the tail (don't pump post-range
+            // content into the line and create new echoes from it).
+            let line_in = if in_range { dry_signal[f * ch + c] } else { 0.0 };
             let cross = if ping_pong { 1 - c } else { c };
-            let to_store = input + delayed[cross] * feedback;
-            lines[c][head] = to_store;
-            s[f * ch + c] = input * dry + delayed[cross] * mix;
+            lines[c][head] = line_in + delayed[cross] * feedback;
+            // In-range output mixes dry+wet at the configured ratio.
+            // In the tail, leave the original post-range audio at unity
+            // and add the wet on top — that's the "bleed past selection"
+            // behaviour Cool Edit-style delay tails want.
+            let out = if in_range {
+                dry_signal[f * ch + c] * dry + delayed[cross] * mix
+            } else {
+                dry_signal[f * ch + c] + delayed[cross] * mix
+            };
+            work[f * ch + c] = out;
         }
 
         head = (head + 1) % delay_frames;
+    }
+    Ok(())
+}
+
+/// Tanh waveshaper. Boost the input by `drive_db`, push it through tanh
+/// (which soft-saturates around ±1), and optionally lowpass the wet path
+/// before mixing back with the dry. With drive=0 dB and mix=1 the output
+/// is approximately the input scaled by ~0.76 because tanh's slope at 0
+/// is 1 but it compresses the peaks; we apply a make-up gain of
+/// `1 / tanh(drive_lin)` so unity drive feels close to unity output.
+fn distortion(
+    buffer: &mut [f32],
+    channels: u16,
+    range: SampleRange,
+    params: &DistortionParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    let s = slice_for(buffer, channels, range)?;
+    let ch = channels as usize;
+    let frames = s.len() / ch;
+    if frames == 0 {
+        return Ok(());
+    }
+    let drive = db_to_linear(params.drive_db).max(0.0);
+    let mix = params.mix.clamp(0.0, 1.0);
+    if mix <= 0.0 {
+        return Ok(());
+    }
+    let dry = 1.0 - mix;
+
+    // Make-up: at small drive, tanh is near-linear so makeup ≈ 1; at high
+    // drive, tanh saturates so makeup pulls peaks back into headroom.
+    let makeup = if drive > 1e-6 {
+        // Use a unity-input reference: how much does tanh compress an
+        // input of magnitude 1? Inverse that so a peak input still maps
+        // to ~1 at the output.
+        let probe = (drive).tanh();
+        if probe > 1e-6 { 1.0 / probe } else { 1.0 }
+    } else {
+        1.0
+    };
+
+    // One-pole lowpass on the wet path, per channel. y[n] = a*x + (1-a)*y[n-1].
+    // Cutoff frequency uses the standard exponential mapping.
+    let lp_alpha = params.tone_hz.map(|hz| {
+        let hz = hz.clamp(20.0, sample_rate as f32 * 0.45);
+        let rc = 1.0 / (2.0 * PI * hz);
+        let dt = 1.0 / sample_rate as f32;
+        dt / (rc + dt)
+    });
+    let mut lp_state = vec![0.0_f32; ch];
+
+    for f in 0..frames {
+        for c in 0..ch {
+            let x = s[f * ch + c];
+            let driven = (x * drive).tanh() * makeup;
+            let wet = if let Some(a) = lp_alpha {
+                lp_state[c] = a * driven + (1.0 - a) * lp_state[c];
+                lp_state[c]
+            } else {
+                driven
+            };
+            s[f * ch + c] = x * dry + wet * mix;
+        }
+    }
+    Ok(())
+}
+
+/// Stereo chorus. A small bank of `voices` modulated delay lines, each
+/// driven by an LFO at `rate_hz` with a phase offset of `2π * v / voices`
+/// so the voices stagger. The delay-line length is `centre_ms + depth_ms`
+/// (so the modulated tap can sweep from `centre - depth` up to
+/// `centre + depth`). Linear interpolation reads the fractional tap.
+/// Stereo voices alternate phase polarity for L/R to spread the image.
+fn chorus(
+    buffer: &mut [f32],
+    channels: u16,
+    range: SampleRange,
+    params: &ChorusParams,
+    sample_rate: u32,
+) -> Result<(), DspError> {
+    let s = slice_for(buffer, channels, range)?;
+    let ch = channels as usize;
+    let frames = s.len() / ch;
+    if frames == 0 {
+        return Ok(());
+    }
+    let mix = params.mix.clamp(0.0, 1.0);
+    if mix <= 0.0 {
+        return Ok(());
+    }
+    let dry = 1.0 - mix;
+    let voices = params.voices.clamp(1, 8) as usize;
+    let rate = params.rate_hz.max(0.0);
+    let depth_ms = params.depth_ms.max(0.0);
+
+    // Centre delay sits 12 ms back so the modulation has room to swing
+    // both ways even at zero depth without folding negative.
+    let centre_ms = 12.0_f32;
+    let max_delay_frames =
+        (((centre_ms + depth_ms) / 1000.0) * sample_rate as f32).ceil() as usize + 2;
+    if max_delay_frames < 2 {
+        return Ok(());
+    }
+
+    let centre_frames = (centre_ms / 1000.0) * sample_rate as f32;
+    let depth_frames = (depth_ms / 1000.0) * sample_rate as f32;
+    let phase_inc = 2.0 * PI * rate / sample_rate as f32;
+
+    let mut lines: Vec<Vec<f32>> = (0..ch).map(|_| vec![0.0_f32; max_delay_frames]).collect();
+    let mut head = 0_usize;
+    // Per-voice phase counters; staggered by 2π/voices so the LFOs don't
+    // line up in time. Stereo channels flip phase polarity (offset by π)
+    // so the L/R wets sweep against each other for width.
+    let mut phases: Vec<f32> = (0..voices)
+        .map(|v| 2.0 * PI * (v as f32) / voices as f32)
+        .collect();
+
+    for f in 0..frames {
+        // Write input into every per-channel line at the current head.
+        for c in 0..ch {
+            lines[c][head] = s[f * ch + c];
+        }
+        // Sum per-voice modulated reads into the wet bus per channel.
+        let mut wet = vec![0.0_f32; ch];
+        for v in 0..voices {
+            for c in 0..ch {
+                let polarity = if c == 1 { -1.0 } else { 1.0 };
+                let lfo = (phases[v] * polarity).sin();
+                let tap = centre_frames + lfo * depth_frames;
+                // Read `tap` frames behind the head, with linear interp
+                // between the floor and ceil samples.
+                let read_pos = head as f32 - tap;
+                // Wrap into [0, max_delay_frames).
+                let n = max_delay_frames as f32;
+                let mut wrapped = read_pos % n;
+                if wrapped < 0.0 {
+                    wrapped += n;
+                }
+                let i0 = wrapped.floor() as usize % max_delay_frames;
+                let i1 = (i0 + 1) % max_delay_frames;
+                let frac = wrapped - wrapped.floor();
+                wet[c] += lines[c][i0] * (1.0 - frac) + lines[c][i1] * frac;
+            }
+        }
+        let voice_norm = 1.0 / voices as f32;
+        for c in 0..ch {
+            let dry_in = s[f * ch + c];
+            s[f * ch + c] = dry_in * dry + wet[c] * voice_norm * mix;
+        }
+        head = (head + 1) % max_delay_frames;
+        for p in &mut phases {
+            *p += phase_inc;
+            if *p > 2.0 * PI {
+                *p -= 2.0 * PI;
+            }
+        }
     }
     Ok(())
 }
@@ -2366,6 +2582,44 @@ mod tests {
     }
 
     #[test]
+    fn delay_bleeds_wet_tail_past_selection_end() {
+        // Selection covers only the first half (200 frames). Without the
+        // tail extension this used to play as gain-only because the wet
+        // path needed `delay_frames` headroom past the impulse before
+        // anything wet could land. The tail should now ring out into the
+        // existing post-range audio.
+        let mut samples = vec![0.0_f32; 400];
+        samples[0] = 1.0;
+        apply(
+            &Op::Delay {
+                range: r(0, 200),
+                params: delay_params(1.0, 0.5, 1.0),
+            },
+            &mut samples,
+            1,
+            48_000,
+        )
+        .unwrap();
+        // First echo at frame 48 (one delay-line away).
+        assert!(
+            (samples[48] - 1.0).abs() < 1e-4,
+            "first echo missing at frame 48 (got {})",
+            samples[48]
+        );
+        // Second echo at frame 96 — past the selection boundary at 200,
+        // still inside the original buffer because tail bleeds past.
+        // Actually 96 is still inside the selection; check 240, well
+        // beyond the 200 selection boundary, where a feedback echo lands.
+        // With feedback=0.5 the echo train is 1.0, 0.5, 0.25, 0.125, ...
+        // at frames 48, 96, 144, 192, 240, ...
+        assert!(
+            samples[240].abs() > 1e-3,
+            "tail echo at frame 240 (past selection) lost (got {})",
+            samples[240]
+        );
+    }
+
+    #[test]
     fn delay_ping_pong_swaps_channels() {
         // Stereo impulse on the L channel. With ping-pong, the first echo
         // should appear on R, the second back on L.
@@ -2389,6 +2643,107 @@ mod tests {
         // Frame 96: L gets the bounce.
         assert!((samples[96 * 2] - 0.5).abs() < 1e-3);
         assert!(samples[96 * 2 + 1].abs() < 1e-3);
+    }
+
+    #[test]
+    fn distortion_with_zero_mix_is_identity() {
+        let mut samples = buf(&[0.1, -0.2, 0.5, -0.4]);
+        let original = samples.clone();
+        apply(
+            &Op::Distortion {
+                range: r(0, 4),
+                params: DistortionParams { drive_db: 24.0, tone_hz: None, mix: 0.0 },
+            },
+            &mut samples,
+            1,
+            48_000,
+        )
+        .unwrap();
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn distortion_high_drive_clips_peaks() {
+        // A loud sine should saturate near ±1 with high drive + full wet.
+        let fs = 48_000_u32;
+        let frames = 480;
+        let mut samples: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / fs as f32;
+                0.6 * (2.0 * PI * 440.0 * t).sin()
+            })
+            .collect();
+        apply(
+            &Op::Distortion {
+                range: r(0, frames as u64),
+                params: DistortionParams { drive_db: 30.0, tone_hz: None, mix: 1.0 },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let peak = samples.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+        // Should be very close to 1.0 — the make-up gain pulls a saturated
+        // signal back into headroom but tanh keeps it bounded.
+        assert!(peak > 0.9 && peak <= 1.05, "peak after distortion = {peak}");
+    }
+
+    #[test]
+    fn chorus_with_zero_mix_is_identity() {
+        let mut samples = buf(&[0.1, -0.2, 0.5, -0.4]);
+        let original = samples.clone();
+        apply(
+            &Op::Chorus {
+                range: r(0, 4),
+                params: ChorusParams { rate_hz: 1.0, depth_ms: 5.0, mix: 0.0, voices: 2 },
+            },
+            &mut samples,
+            1,
+            48_000,
+        )
+        .unwrap();
+        assert_eq!(samples, original);
+    }
+
+    #[test]
+    fn chorus_modulates_a_steady_tone() {
+        // Run a 200 Hz sine through the chorus; the wet path should shift
+        // some energy off the fundamental into nearby sidebands. Crude
+        // check: the per-frame magnitude no longer matches the dry sine
+        // exactly, beyond what the delay-line warm-up alone would do.
+        let fs = 48_000_u32;
+        let frames = fs as usize / 4; // 250 ms
+        let dry: Vec<f32> = (0..frames)
+            .map(|i| {
+                let t = i as f32 / fs as f32;
+                0.5 * (2.0 * PI * 200.0 * t).sin()
+            })
+            .collect();
+        let mut samples = dry.clone();
+        apply(
+            &Op::Chorus {
+                range: r(0, frames as u64),
+                params: ChorusParams { rate_hz: 1.5, depth_ms: 4.0, mix: 0.5, voices: 2 },
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        // Past the delay-line warm-up (~16 ms), the wet sample should
+        // diverge from the dry by more than rounding noise.
+        let warmup = (fs as usize) / 50; // skip first 20 ms
+        let mut diff_count = 0;
+        for i in warmup..frames {
+            if (samples[i] - dry[i]).abs() > 1e-3 {
+                diff_count += 1;
+            }
+        }
+        assert!(
+            diff_count > frames / 4,
+            "chorus barely modulates the input ({diff_count} divergent frames)"
+        );
     }
 
     #[test]

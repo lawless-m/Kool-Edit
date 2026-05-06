@@ -88,6 +88,30 @@ pub struct DelayParams {
     pub feedback_lp_hz: Option<f32>,
 }
 
+/// Tanh waveshaping distortion. `drive_db` boosts the input pre-shaper —
+/// 0 dB is clean, ~20 dB is moderate crunch, 40 dB is square-wave fuzz.
+/// `tone_hz` is an optional one-pole lowpass on the wet path so the
+/// harshness can be tamed (None = no filtering). `mix` blends dry and wet.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DistortionParams {
+    pub drive_db: f32,
+    pub tone_hz: Option<f32>,
+    pub mix: f32,
+}
+
+/// Stereo chorus: `voices` short delay lines whose lengths are modulated
+/// by phase-offset LFOs. `rate_hz` is the LFO frequency, `depth_ms` the
+/// peak delay-time deviation around the centre tap. `mix` blends dry and
+/// wet. Multiple voices stagger their LFO phases so the modulation feels
+/// thicker than a single chorus voice.
+#[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChorusParams {
+    pub rate_hz: f32,
+    pub depth_ms: f32,
+    pub mix: f32,
+    pub voices: u32,
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NrParams {
     pub amount_db: f32,
