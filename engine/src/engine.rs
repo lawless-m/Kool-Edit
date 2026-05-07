@@ -582,6 +582,23 @@ impl Engine {
         Ok(new_id)
     }
 
+    /// Remove a source from the project, evicting it from the peak cache
+    /// and dropping every clip that referenced it on every track. Returns
+    /// `true` if the source existed (and was removed), `false` otherwise.
+    /// The on-disk base file is not deleted from storage — kepz exports
+    /// after a remove will skip it because the project no longer lists it.
+    pub fn remove_source(&mut self, id: &SourceId) -> bool {
+        let removed = self.project.sources.remove(id).is_some();
+        if !removed {
+            return false;
+        }
+        for track in &mut self.project.tracks {
+            track.clips.retain(|c| c.source_id != *id);
+        }
+        self.peaks.remove(id);
+        true
+    }
+
     /// Set the display name of a source. Empty/whitespace names are rejected.
     pub fn rename_source(&mut self, id: &SourceId, new_name: &str) -> Result<(), QueryError> {
         let trimmed = new_name.trim();
@@ -594,6 +611,23 @@ impl Engine {
             .get_mut(id)
             .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
         source.name = trimmed.to_owned();
+        Ok(())
+    }
+
+    /// Set (or clear, when `None`) the library folder a source lives in.
+    /// Folders are a UI grouping construct — the engine treats them as
+    /// opaque labels.
+    pub fn set_source_folder(
+        &mut self,
+        id: &SourceId,
+        folder: Option<&str>,
+    ) -> Result<(), QueryError> {
+        let source = self
+            .project
+            .sources
+            .get_mut(id)
+            .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
+        source.folder = folder.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
         Ok(())
     }
 

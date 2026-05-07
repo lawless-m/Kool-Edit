@@ -45,6 +45,10 @@ pub struct Source {
     pub peak_cache: Option<StoragePath>,
     pub created_at: Timestamp,
     pub modified_at: Timestamp,
+    /// Optional library folder name. `None` means "at the root of the
+    /// library". Single-level for now; nested paths can come later.
+    #[serde(default)]
+    pub folder: Option<String>,
 }
 
 impl Source {
@@ -68,6 +72,7 @@ impl Source {
             peak_cache: None,
             modified_at: created_at.clone(),
             created_at,
+            folder: None,
         }
     }
 

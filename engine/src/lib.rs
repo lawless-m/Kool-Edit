@@ -299,6 +299,28 @@ mod wasm_api {
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
+        /// Remove a source. Also drops every clip referencing it on every
+        /// track (lossy — the user is expected to confirm). Returns true
+        /// if the source existed.
+        #[wasm_bindgen(js_name = removeSource)]
+        pub fn remove_source(&mut self, source_id: &str) -> bool {
+            self.inner.remove_source(&SourceId::new(source_id))
+        }
+
+        /// Move a source to a library folder (or to root when the folder
+        /// argument is empty / null-ish). Folders are a UI grouping
+        /// label; the engine treats them as opaque.
+        #[wasm_bindgen(js_name = setSourceFolder)]
+        pub fn set_source_folder(
+            &mut self,
+            source_id: &str,
+            folder: Option<String>,
+        ) -> Result<(), JsError> {
+            self.inner
+                .set_source_folder(&SourceId::new(source_id), folder.as_deref())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
         /// Render the arrangement over `[start_frame, end_frame)` (project
         /// frames at the project sample rate) and store the result as a
         /// new stereo source. Returns the new source id.
@@ -494,6 +516,7 @@ mod wasm_api {
                         "frames": effective,
                         "sampleRate": s.sample_rate,
                         "channels": s.channel_count,
+                        "folder": s.folder,
                     })
                 })
                 .collect();

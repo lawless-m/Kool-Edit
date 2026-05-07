@@ -11,6 +11,7 @@ export interface SourceInfo {
   frames: number;
   sampleRate: number;
   channels: number;
+  folder: string | null;
 }
 
 export interface TrackInfo {
@@ -402,6 +403,21 @@ export class EngineClient {
       (req) => ({ kind: "rename_source", req, sourceId, newName }),
     );
     if (ev.kind !== "rename_source_ok") throw new Error("unexpected event");
+  }
+
+  async removeSource(sourceId: string): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "remove_source" }>(
+      (req) => ({ kind: "remove_source", req, sourceId }),
+    );
+    if (ev.kind !== "remove_source_ok") throw new Error("unexpected event");
+    return ev.removed;
+  }
+
+  async setSourceFolder(sourceId: string, folder: string | null): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_source_folder" }>(
+      (req) => ({ kind: "set_source_folder", req, sourceId, folder }),
+    );
+    if (ev.kind !== "set_source_folder_ok") throw new Error("unexpected event");
   }
 
   async renderRangeToSource(

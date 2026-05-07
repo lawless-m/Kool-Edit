@@ -405,6 +405,10 @@ export async function mountEditor(
     renderLibrary();
   };
 
+  // Folders the user has collapsed in the library. Persists across
+  // refreshes within a session; folders default to expanded.
+  const collapsedFolders = new Set<string>();
+
   const renderLibrary = (): void => {
     ui.libraryList.innerHTML = "";
     if (sources.length === 0) {
@@ -418,9 +422,61 @@ export async function mountEditor(
       } satisfies Partial<CSSStyleDeclaration>);
       ui.libraryList.appendChild(empty);
     } else {
-      for (const s of sources) ui.libraryList.appendChild(makeLibraryRow(s));
+      // Group every source under a folder header, including a default
+      // "/" header for sources with no folder set — so the whole library
+      // is collapsible. Folders sort alphabetically; "/" sorts to the
+      // top because it's lexicographically before letters.
+      const byName = (a: SourceInfo, b: SourceInfo): number =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) ||
+        a.id.localeCompare(b.id);
+      const byFolder = new Map<string, SourceInfo[]>();
+      for (const s of sources) {
+        const key = s.folder && s.folder.length > 0 ? s.folder : "/";
+        const list = byFolder.get(key) ?? [];
+        list.push(s);
+        byFolder.set(key, list);
+      }
+      for (const list of byFolder.values()) list.sort(byName);
+      const folderNames = Array.from(byFolder.keys()).sort((a, b) =>
+        a.localeCompare(b, undefined, { sensitivity: "base" }),
+      );
+      for (const folder of folderNames) {
+        ui.libraryList.appendChild(makeFolderHeader(folder));
+        if (collapsedFolders.has(folder)) continue;
+        for (const s of byFolder.get(folder)!) {
+          const row = makeLibraryRow(s);
+          row.style.paddingLeft = "16px"; // visually nest folder children
+          ui.libraryList.appendChild(row);
+        }
+      }
     }
     ui.duplicateBtn.disabled = currentSourceId === null;
+  };
+
+  const makeFolderHeader = (folder: string): HTMLDivElement => {
+    const hdr = document.createElement("div");
+    const collapsed = collapsedFolders.has(folder);
+    Object.assign(hdr.style, {
+      padding: "4px 8px",
+      cursor: "pointer",
+      background: "#1a1a1a",
+      borderBottom: "1px solid #2a2a2a",
+      display: "flex",
+      alignItems: "center",
+      gap: "6px",
+      fontFamily: "var(--ff-mono)",
+      fontSize: "11px",
+      color: "var(--text-2)",
+      letterSpacing: "0.04em",
+    } satisfies Partial<CSSStyleDeclaration>);
+    hdr.textContent = `${collapsed ? "▸" : "▾"} ${folder}`;
+    hdr.title = "Click to collapse/expand";
+    hdr.addEventListener("click", () => {
+      if (collapsedFolders.has(folder)) collapsedFolders.delete(folder);
+      else collapsedFolders.add(folder);
+      renderLibrary();
+    });
+    return hdr;
   };
 
   const makeLibraryRow = (s: SourceInfo): HTMLDivElement => {
@@ -432,8 +488,21 @@ export async function mountEditor(
       borderBottom: "1px solid #1f1f1f",
       background: s.id === currentSourceId ? "#2a3a2a" : "transparent",
       display: "flex",
+      flexDirection: "row",
+      alignItems: "center",
+      gap: "6px",
+    } satisfies Partial<CSSStyleDeclaration>);
+
+    // Left: name + meta stacked. flex:1 + minWidth:0 lets the name
+    // ellipsis clip instead of pushing the action buttons off the row.
+    const text = document.createElement("div");
+    Object.assign(text.style, {
+      flex: "1 1 auto",
+      minWidth: "0",
+      display: "flex",
       flexDirection: "column",
       gap: "2px",
+      textAlign: "left",
     } satisfies Partial<CSSStyleDeclaration>);
 
     const nameEl = document.createElement("div");
@@ -445,6 +514,7 @@ export async function mountEditor(
       whiteSpace: "nowrap",
       fontSize: "12px",
       color: s.id === currentSourceId ? "#cfe9cf" : "#d8d8d8",
+      textAlign: "left",
     } satisfies Partial<CSSStyleDeclaration>);
 
     const meta = document.createElement("div");
@@ -454,10 +524,63 @@ export async function mountEditor(
       color: "#888",
       fontSize: "10px",
       fontFamily: "ui-monospace, monospace",
+      textAlign: "left",
     } satisfies Partial<CSSStyleDeclaration>);
 
-    row.appendChild(nameEl);
-    row.appendChild(meta);
+    text.appendChild(nameEl);
+    text.appendChild(meta);
+
+    // Right: action buttons. Tiny so they don't crowd the row; clicks
+    // don't propagate to the row's click-to-load handler.
+    const actions = document.createElement("div");
+    Object.assign(actions.style, {
+      display: "inline-flex",
+      gap: "2px",
+      flexShrink: "0",
+    } satisfies Partial<CSSStyleDeclaration>);
+    const mkActionBtn = (label: string, title: string): HTMLButtonElement => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.textContent = label;
+      b.title = title;
+      Object.assign(b.style, {
+        width: "20px",
+        height: "20px",
+        padding: "0",
+        background: "transparent",
+        color: "var(--text-3)",
+        border: "1px solid var(--line-1)",
+        borderRadius: "3px",
+        cursor: "pointer",
+        fontSize: "11px",
+        lineHeight: "1",
+      } satisfies Partial<CSSStyleDeclaration>);
+      b.addEventListener("mouseenter", () => {
+        b.style.color = "var(--text-1)";
+        b.style.borderColor = "var(--line-strong)";
+      });
+      b.addEventListener("mouseleave", () => {
+        b.style.color = "var(--text-3)";
+        b.style.borderColor = "var(--line-1)";
+      });
+      return b;
+    };
+    const folderBtn = mkActionBtn("📁", "Move to folder…");
+    folderBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      void promptMoveToFolder(s);
+    });
+    const delBtn = mkActionBtn("×", "Delete from library");
+    delBtn.style.fontSize = "14px";
+    delBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      void confirmDeleteSource(s);
+    });
+    actions.appendChild(folderBtn);
+    actions.appendChild(delBtn);
+
+    row.appendChild(text);
+    row.appendChild(actions);
 
     row.addEventListener("click", () => {
       if (s.id === currentSourceId) return;
@@ -468,6 +591,55 @@ export async function mountEditor(
       beginRename(s, nameEl);
     });
     return row;
+  };
+
+  const promptMoveToFolder = async (s: SourceInfo): Promise<void> => {
+    const current = s.folder ?? "";
+    const next = window.prompt(
+      `Move "${s.name}" to folder (blank = root):`,
+      current,
+    );
+    if (next === null) return;
+    const trimmed = next.trim();
+    try {
+      await client.setSourceFolder(s.id, trimmed === "" ? null : trimmed);
+      await refreshLibrary();
+      opts.onSourceImported?.();
+    } catch (err) {
+      ui.status.textContent = `move failed: ${String(err)}`;
+    }
+  };
+
+  const confirmDeleteSource = async (s: SourceInfo): Promise<void> => {
+    const ok = window.confirm(
+      `Delete "${s.name}" from the library?\n\nAny clips referencing it on the arranger will also be removed.`,
+    );
+    if (!ok) return;
+    try {
+      const removed = await client.removeSource(s.id);
+      if (!removed) {
+        ui.status.textContent = "delete: source not found";
+        return;
+      }
+      // If we just deleted the active source, clear the editor's view.
+      if (currentSourceId === s.id) {
+        currentSourceId = null;
+        sourceFrameCount = 0;
+        sourceSampleRate = 0;
+        viewport = { startFrame: 0, endFrame: 0 };
+        cachedPeaks = null;
+        setSelection(null);
+        setTransportEnabled(false);
+        const ctx = ui.canvas.getContext("2d");
+        if (ctx) ctx.clearRect(0, 0, ui.canvas.width, ui.canvas.height);
+        redrawOverlay();
+      }
+      await refreshLibrary();
+      opts.onSourceImported?.();
+      ui.status.textContent = `deleted ${s.name}`;
+    } catch (err) {
+      ui.status.textContent = `delete failed: ${String(err)}`;
+    }
   };
 
   const beginRename = (s: SourceInfo, nameEl: HTMLDivElement): void => {

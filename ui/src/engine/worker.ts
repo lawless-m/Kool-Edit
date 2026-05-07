@@ -70,6 +70,8 @@ type WasmEngine = {
   ) => Float32Array;
   duplicateSource: (sourceId: string, nowIso: string) => string;
   renameSource: (sourceId: string, newName: string) => void;
+  removeSource: (sourceId: string) => boolean;
+  setSourceFolder: (sourceId: string, folder: string | undefined) => void;
   createEmptySource: (
     lengthFrames: bigint,
     channels: number,
@@ -417,6 +419,18 @@ let playback: PlaybackState | null = null;
         case "rename_source": {
           engine.renameSource(cmd.sourceId, cmd.newName);
           send({ kind: "rename_source_ok", req: cmd.req });
+          return;
+        }
+
+        case "remove_source": {
+          const removed = engine.removeSource(cmd.sourceId);
+          send({ kind: "remove_source_ok", req: cmd.req, removed });
+          return;
+        }
+
+        case "set_source_folder": {
+          engine.setSourceFolder(cmd.sourceId, cmd.folder ?? undefined);
+          send({ kind: "set_source_folder_ok", req: cmd.req });
           return;
         }
 

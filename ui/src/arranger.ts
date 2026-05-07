@@ -101,6 +101,10 @@ export async function mountArranger(
   // breakpoint dot overlay; clicking on a clip adds a breakpoint, dragging
   // a dot moves it, double-clicking deletes. Values are dB; visual y maps
   // [DB_MIN, DB_MAX] across the clip's lane height.
+  // Folders the user has collapsed in the Sources panel. Persists across
+  // refreshes within a session; folders default to expanded.
+  const collapsedSourceFolders = new Set<string>();
+
   let envelopeMode = false;
   const ENV_DB_MIN = -24;
   const ENV_DB_MAX = 12;
@@ -308,11 +312,25 @@ export async function mountArranger(
       ui.sourceList.appendChild(empty);
       return;
     }
+    // Same grouping/sort as the editor library: every source under a
+    // folder header, with "/" as the default folder for sources with no
+    // folder set so the whole list is collapsible.
+    const byName = (a: SourceInfo, b: SourceInfo): number =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) ||
+      a.id.localeCompare(b.id);
+    const byFolder = new Map<string, SourceInfo[]>();
     for (const s of sources) {
+      const key = s.folder && s.folder.length > 0 ? s.folder : "/";
+      const list = byFolder.get(key) ?? [];
+      list.push(s);
+      byFolder.set(key, list);
+    }
+    for (const list of byFolder.values()) list.sort(byName);
+    const renderRow = (s: SourceInfo, indent: boolean): void => {
       const row = document.createElement("div");
       const staged = stagedSourceId === s.id;
       Object.assign(row.style, {
-        padding: "6px 8px",
+        padding: indent ? "6px 8px 6px 20px" : "6px 8px",
         borderBottom: "1px solid #222",
         cursor: "pointer",
         background: staged ? "#2a3f2a" : "transparent",
@@ -345,6 +363,33 @@ export async function mountArranger(
         setStatus(stagedSourceId ? `staged ${s.name} — click a lane to place` : "");
       });
       ui.sourceList.appendChild(row);
+    };
+    const folderNames = Array.from(byFolder.keys()).sort((a, b) =>
+      a.localeCompare(b, undefined, { sensitivity: "base" }),
+    );
+    for (const folder of folderNames) {
+      const collapsed = collapsedSourceFolders.has(folder);
+      const hdr = document.createElement("div");
+      hdr.textContent = `${collapsed ? "▸" : "▾"} ${folder}`;
+      hdr.title = "Click to collapse/expand";
+      Object.assign(hdr.style, {
+        padding: "4px 8px",
+        background: "#1a1a1a",
+        borderBottom: "1px solid #222",
+        fontFamily: "var(--ff-mono)",
+        fontSize: "11px",
+        color: "var(--text-2)",
+        letterSpacing: "0.04em",
+        cursor: "pointer",
+      } satisfies Partial<CSSStyleDeclaration>);
+      hdr.addEventListener("click", () => {
+        if (collapsedSourceFolders.has(folder)) collapsedSourceFolders.delete(folder);
+        else collapsedSourceFolders.add(folder);
+        drawSources();
+      });
+      ui.sourceList.appendChild(hdr);
+      if (collapsed) continue;
+      for (const s of byFolder.get(folder)!) renderRow(s, true);
     }
   };
 

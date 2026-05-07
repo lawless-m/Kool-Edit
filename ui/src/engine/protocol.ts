@@ -91,6 +91,8 @@ export type EngineCommand =
     }
   | { kind: "duplicate_source"; req: RequestId; sourceId: string; nowIso: string }
   | { kind: "rename_source"; req: RequestId; sourceId: string; newName: string }
+  | { kind: "remove_source"; req: RequestId; sourceId: string }
+  | { kind: "set_source_folder"; req: RequestId; sourceId: string; folder: string | null }
   | {
       kind: "create_empty_source";
       req: RequestId;
@@ -165,6 +167,8 @@ export type EngineEvent =
   | { kind: "detect_pitch_contour_ok"; req: RequestId; contour: Float32Array }
   | { kind: "duplicate_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "rename_source_ok"; req: RequestId }
+  | { kind: "remove_source_ok"; req: RequestId; removed: boolean }
+  | { kind: "set_source_folder_ok"; req: RequestId }
   | { kind: "create_empty_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "render_range_to_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "capture_noise_profile_ok"; req: RequestId }
