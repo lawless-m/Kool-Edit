@@ -266,6 +266,12 @@ impl Engine {
     /// Regenerates the peak cache so renderers (which read peaks) reflect
     /// the post-op state.
     pub fn apply_op(&mut self, id: &SourceId, op: Op, now: Timestamp) -> Result<(), QueryError> {
+        // Snapshot any range information we need *before* mutating the
+        // source — Trim needs the trim window to remap referencing clips.
+        let trim_range = match &op {
+            Op::Trim { range } => Some(*range),
+            _ => None,
+        };
         {
             let source = self
                 .project
@@ -274,7 +280,47 @@ impl Engine {
                 .ok_or_else(|| QueryError::UnknownSource(id.clone()))?;
             source.apply(op, now);
         }
-        self.regenerate_peaks(id)
+        self.regenerate_peaks(id)?;
+        if let Some(range) = trim_range {
+            self.reconcile_clips_for_trim(id, range);
+        }
+        Ok(())
+    }
+
+    /// Trim shortens a source to its `[a, b)` window. Walk every clip
+    /// referencing the source and remap its source range and timeline
+    /// length so the projection still makes sense:
+    ///   new_in  = max(0, old_in  - a)   clamped to [0, b-a]
+    ///   new_out = max(0, old_out - a)   clamped to [0, b-a]
+    /// Clips whose remapped range is empty (their content fell entirely
+    /// outside the trim window) are removed. The clip's timeline start
+    /// stays where it was; the timeline length shrinks/grows to match
+    /// the new source span.
+    fn reconcile_clips_for_trim(&mut self, source_id: &SourceId, trim: SampleRange) {
+        let new_len = trim.end() - trim.start();
+        for track in &mut self.project.tracks {
+            track.clips.retain_mut(|clip| {
+                if clip.source_id != *source_id {
+                    return true;
+                }
+                let new_in = clip.source_in.saturating_sub(trim.start()).min(new_len);
+                let new_out = clip.source_out.saturating_sub(trim.start()).min(new_len);
+                if new_out <= new_in {
+                    return false;
+                }
+                clip.source_in = new_in;
+                clip.source_out = new_out;
+                let span = new_out - new_in;
+                let stretched = (span as f64 * clip.time_stretch as f64).round() as u64;
+                let start = clip.track_position.start();
+                if let Ok(new_pos) =
+                    SampleRange::new(start, start + stretched.max(1))
+                {
+                    clip.track_position = new_pos;
+                }
+                true
+            });
+        }
     }
 
     pub fn undo(&mut self, id: &SourceId) -> Result<bool, QueryError> {
@@ -497,6 +543,40 @@ impl Engine {
             now,
         );
         let peaks = PeakCache::from_samples(&rendered, channel_count, DEFAULT_DECIMATION);
+        self.project.sources.insert(new_id.clone(), source);
+        self.peaks.insert(new_id.clone(), peaks);
+        Ok(new_id)
+    }
+
+    /// Create a new source of zeros with the given length and channel
+    /// count, registered under `desired_name` (auto-suffixed on collision)
+    /// at the project's sample rate. Useful as a blank canvas the
+    /// Generate op can splice content into.
+    pub fn create_empty_source(
+        &mut self,
+        length_frames: u64,
+        channels: u16,
+        desired_name: &str,
+        now: Timestamp,
+    ) -> Result<SourceId, QueryError> {
+        let channels = channels.max(1);
+        let total_samples = length_frames as usize * channels as usize;
+        let zeros = vec![0.0_f32; total_samples];
+        let new_id = self.next_id_with_prefix("src_blank");
+        let new_name = self.ensure_unique_name(desired_name);
+        let path = format!("sources/{new_id}/base.f32");
+        self.storage.write_all(&path, &zeros)?;
+
+        let source = Source::new(
+            new_id.clone(),
+            new_name,
+            channels,
+            self.project.sample_rate(),
+            StoragePath::new(path),
+            length_frames,
+            now,
+        );
+        let peaks = PeakCache::from_samples(&zeros, channels, DEFAULT_DECIMATION);
         self.project.sources.insert(new_id.clone(), source);
         self.peaks.insert(new_id.clone(), peaks);
         Ok(new_id)
@@ -1337,6 +1417,88 @@ mod tests {
         let b = engine.duplicate_source(&a, now()).unwrap();
         let name = engine.project().sources.get(&b).unwrap().name.clone();
         assert_eq!(name, "kick(1)");
+    }
+
+    #[test]
+    fn trim_reconciles_clips_referencing_the_trimmed_source() {
+        use crate::ids::{ClipId, TrackId};
+        use crate::project::{Clip, Fade, Track};
+
+        let bytes = synth_mono_wav(&[0.0_f32; 100], 48_000);
+        let mut engine = Engine::new(48_000);
+        let src = engine.import_wav("a.wav", &bytes, now()).unwrap();
+
+        let mut track = Track {
+            id: TrackId(1),
+            name: "T".into(),
+            height: 80.0,
+            mute: false,
+            solo: false,
+            arm: false,
+            gain_db: 0.0,
+            pan: 0.0,
+            inserts: Vec::new(),
+            automation: Vec::new(),
+            clips: Vec::new(),
+        };
+        let mk_clip = |id: u64, src: SourceId, in_: u64, out_: u64, at: u64| Clip {
+            id: ClipId(id),
+            source_id: src,
+            name: "clip".into(),
+            track_position: SampleRange::new(at, at + (out_ - in_)).unwrap(),
+            source_in: in_,
+            source_out: out_,
+            gain_db: 0.0,
+            pan: 0.0,
+            fade_in: Fade::none(),
+            fade_out: Fade::none(),
+            time_stretch: 1.0,
+            pitch_shift_cents: 0.0,
+            envelopes: Vec::new(),
+            locked: false,
+            group: None,
+        };
+        // Clip 1: fully inside the trim window [10, 60) — should keep.
+        track.clips.push(mk_clip(1, src.clone(), 0, 100, 0));
+        // Clip 2: entirely past the trim window — should be removed.
+        track.clips.push(mk_clip(2, src.clone(), 70, 90, 200));
+        engine.project_mut().tracks.push(track);
+
+        engine
+            .apply_op(
+                &src,
+                Op::Trim {
+                    range: SampleRange::new(10, 60).unwrap(),
+                },
+                now(),
+            )
+            .unwrap();
+
+        let clips = &engine.project().tracks[0].clips;
+        assert_eq!(clips.len(), 1, "clip 2 should have been removed");
+        let c = &clips[0];
+        assert_eq!(c.id, ClipId(1));
+        // Old [0, 100) → after Trim(10, 60), shifted by -10 and clamped to [0, 50): [0, 50).
+        assert_eq!(c.source_in, 0);
+        assert_eq!(c.source_out, 50);
+        assert_eq!(c.track_position.len(), 50);
+    }
+
+    #[test]
+    fn create_empty_source_yields_a_zeroed_buffer_of_the_requested_length() {
+        let mut engine = Engine::new(48_000);
+        let id = engine
+            .create_empty_source(1000, 2, "blank.wav", now())
+            .unwrap();
+        let s = engine.project().sources.get(&id).unwrap();
+        assert_eq!(s.base_length, 1000);
+        assert_eq!(s.channel_count, 2);
+        assert_eq!(s.name, "blank.wav");
+        let buf = engine
+            .read_base_samples(&id, SampleRange::new(0, 1000).unwrap())
+            .unwrap();
+        assert_eq!(buf.len(), 2000);
+        assert!(buf.iter().all(|&s| s == 0.0));
     }
 
     #[test]

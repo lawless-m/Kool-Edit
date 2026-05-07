@@ -70,12 +70,27 @@ type WasmEngine = {
   ) => Float32Array;
   duplicateSource: (sourceId: string, nowIso: string) => string;
   renameSource: (sourceId: string, newName: string) => void;
+  createEmptySource: (
+    lengthFrames: bigint,
+    channels: number,
+    desiredName: string,
+    nowIso: string,
+  ) => string;
   renderRangeToSource: (
     startFrame: bigint,
     endFrame: bigint,
     desiredName: string,
     nowIso: string,
   ) => string;
+  captureNoiseProfile: (
+    sourceId: string,
+    startFrame: bigint,
+    endFrame: bigint,
+    name: string,
+    profileId: string,
+    fftSize: number,
+  ) => void;
+  listNoiseProfiles: () => string;
 };
 
 type EngineModule = {
@@ -399,6 +414,17 @@ let playback: PlaybackState | null = null;
           return;
         }
 
+        case "create_empty_source": {
+          const newSourceId = engine.createEmptySource(
+            BigInt(Math.floor(cmd.lengthFrames)),
+            cmd.channels,
+            cmd.desiredName,
+            cmd.nowIso,
+          );
+          send({ kind: "create_empty_source_ok", req: cmd.req, newSourceId });
+          return;
+        }
+
         case "render_range_to_source": {
           const newSourceId = engine.renderRangeToSource(
             BigInt(Math.floor(cmd.startFrame)),
@@ -407,6 +433,28 @@ let playback: PlaybackState | null = null;
             cmd.nowIso,
           );
           send({ kind: "render_range_to_source_ok", req: cmd.req, newSourceId });
+          return;
+        }
+
+        case "capture_noise_profile": {
+          engine.captureNoiseProfile(
+            cmd.sourceId,
+            BigInt(Math.floor(cmd.startFrame)),
+            BigInt(Math.floor(cmd.endFrame)),
+            cmd.name,
+            cmd.profileId,
+            cmd.fftSize,
+          );
+          send({ kind: "capture_noise_profile_ok", req: cmd.req });
+          return;
+        }
+
+        case "list_noise_profiles": {
+          send({
+            kind: "list_noise_profiles_ok",
+            req: cmd.req,
+            json: engine.listNoiseProfiles(),
+          });
           return;
         }
       }

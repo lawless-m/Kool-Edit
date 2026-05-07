@@ -4,7 +4,7 @@
 // The shell (main.ts) boots the shared EngineClient and Playback and hands
 // them in.
 
-import type { EngineClient, SourceInfo } from "./engine/client";
+import type { EngineClient, NoiseProfileInfo, SourceInfo } from "./engine/client";
 import type { Playback } from "./audio/playback";
 import { drawWaveform } from "./waveform";
 
@@ -55,6 +55,7 @@ export async function mountEditor(
   let pendingPeakRequest = 0; // race guard for in-flight peakSummary calls
   let cachedPeaks: Float32Array | null = null;
   let sources: SourceInfo[] = [];
+  let noiseProfiles: NoiseProfileInfo[] = [];
 
   // ---- selection helpers ------------------------------------------------
 
@@ -566,6 +567,32 @@ export async function mountEditor(
     }
   });
 
+  // ---- new blank source ------------------------------------------------
+
+  ui.newSourceBtn.addEventListener("click", async () => {
+    const raw = window.prompt("Length of new blank source (seconds):", "5");
+    if (raw === null) return;
+    const seconds = parseFloat(raw);
+    if (!Number.isFinite(seconds) || seconds <= 0) {
+      ui.status.textContent = "new source: enter a positive duration";
+      return;
+    }
+    ui.newSourceBtn.disabled = true;
+    try {
+      const projectSr = await client.projectSampleRate();
+      const lengthFrames = Math.max(1, Math.round(seconds * projectSr));
+      const newId = await client.createEmptySource(lengthFrames, 2, "blank.wav");
+      await refreshLibrary();
+      await loadSource(newId);
+      opts.onSourceImported?.();
+      ui.status.textContent = `created blank source (${seconds.toFixed(2)}s @ ${projectSr} Hz)`;
+    } catch (err) {
+      ui.status.textContent = `new source failed: ${String(err)}`;
+    } finally {
+      ui.newSourceBtn.disabled = false;
+    }
+  });
+
   // ---- duplicate -------------------------------------------------------
 
   ui.duplicateBtn.addEventListener("click", async () => {
@@ -747,6 +774,7 @@ export async function mountEditor(
     { id: "Reverse", label: "Reverse", params: [], build: (range) => ({ Reverse: { range } }) },
     { id: "DcRemove", label: "DC Remove", params: [], build: (range) => ({ DcRemove: { range } }) },
     { id: "Silence", label: "Silence", params: [], build: (range) => ({ Silence: { range } }) },
+    { id: "Cut", label: "Cut", params: [], build: (range) => ({ Cut: { range } }) },
     {
       id: "Fade",
       label: "Fade",
@@ -936,13 +964,20 @@ export async function mountEditor(
     opt.textContent = def.label;
     ui.fxKindSelect.appendChild(opt);
   }
-  // Autotune is special: its UI depends on the chosen mode (Scale vs
-  // Reference). Reference mode picks another *source* from the library and
-  // aligns its pitch contour source-start to source-start.
-  {
+  // Autotune, EQ, Generate, and NoiseReduce are special cases that don't
+  // fit the simple fxDefs schema. Autotune has mode-dependent inputs, EQ
+  // uses a fixed set of three bands, Generate inserts at a position
+  // rather than processing a range, and NoiseReduce is a two-stage
+  // capture-then-apply workflow that needs the project's profile list.
+  for (const id of ["Eq", "Generate", "NoiseReduce", "Autotune"]) {
     const opt = document.createElement("option");
-    opt.value = "Autotune";
-    opt.textContent = "Autotune";
+    opt.value = id;
+    const labels: Record<string, string> = {
+      Eq: "EQ",
+      Generate: "Generate",
+      NoiseReduce: "Noise Reduction",
+    };
+    opt.textContent = labels[id] ?? id;
     ui.fxKindSelect.appendChild(opt);
   }
 
@@ -955,6 +990,45 @@ export async function mountEditor(
     refSource: HTMLSelectElement;
     retune: HTMLInputElement;
     formant: HTMLInputElement;
+  } | null = null;
+
+  /** Three fixed-shape EQ bands: lowshelf, peak, highshelf. Sufficient
+   *  for tonal sweeps without requiring a full variable band-list editor.
+   *  A free band list can land later with the same Op::Eq shape. */
+  let eqInputs: Array<{
+    freq: HTMLInputElement;
+    gain: HTMLInputElement;
+    q: HTMLInputElement;
+    kind: "Lowshelf" | "Peak" | "Highshelf";
+  }> | null = null;
+
+  /** Generate-op inputs. Only the Tone and Noise (white) variants are
+   *  exposed in v1 — pink/brown noise, DTMF, and sweeps return
+   *  Unsupported in the engine today. */
+  let generateInputs: {
+    mode: HTMLSelectElement;
+    toneRow: HTMLElement;
+    shape: HTMLSelectElement;
+    freq: HTMLInputElement;
+    toneAmp: HTMLInputElement;
+    noiseRow: HTMLElement;
+    noiseColor: HTMLSelectElement;
+    noiseAmp: HTMLInputElement;
+    length: HTMLInputElement;
+  } | null = null;
+
+  /** Noise-reduce two-stage workflow. Capture grabs an averaged spectrum
+   *  from a selection of pure-noise audio; Apply uses a captured profile
+   *  to subtract that spectrum from the working selection. */
+  let nrInputs: {
+    mode: HTMLSelectElement;
+    captureRow: HTMLElement;
+    captureName: HTMLInputElement;
+    applyRow: HTMLElement;
+    profile: HTMLSelectElement;
+    amountDb: HTMLInputElement;
+    floorDb: HTMLInputElement;
+    oversub: HTMLInputElement;
   } | null = null;
 
   let currentFxInputs: Record<string, HTMLInputElement | HTMLSelectElement> = {};
@@ -1112,6 +1186,369 @@ export async function mountEditor(
     });
   };
 
+  const buildEqInputs = (): void => {
+    ui.fxParamsRow.innerHTML = "";
+    currentFxInputs = {};
+    autotuneInputs = null;
+
+    const defaults: Array<{
+      kind: "Lowshelf" | "Peak" | "Highshelf";
+      label: string;
+      freq: number;
+      q: number;
+    }> = [
+      { kind: "Lowshelf", label: "low", freq: 100, q: 0.7 },
+      { kind: "Peak", label: "mid", freq: 1000, q: 1.0 },
+      { kind: "Highshelf", label: "high", freq: 8000, q: 0.7 },
+    ];
+
+    const bands: Array<{
+      freq: HTMLInputElement;
+      gain: HTMLInputElement;
+      q: HTMLInputElement;
+      kind: "Lowshelf" | "Peak" | "Highshelf";
+    }> = [];
+
+    for (const d of defaults) {
+      const bandWrap = document.createElement("span");
+      Object.assign(bandWrap.style, {
+        display: "inline-flex",
+        alignItems: "center",
+        gap: "4px",
+        padding: "2px 6px",
+        background: "var(--bg-sunken)",
+        border: "1px solid var(--line-1)",
+        borderRadius: "var(--r-2)",
+      } satisfies Partial<CSSStyleDeclaration>);
+
+      const tag = document.createElement("span");
+      tag.textContent = d.label;
+      tag.title = d.kind;
+      Object.assign(tag.style, {
+        fontFamily: "var(--ff-mono)",
+        fontSize: "10px",
+        color: "var(--text-3)",
+        textTransform: "uppercase",
+        letterSpacing: "0.1em",
+        marginRight: "2px",
+      } satisfies Partial<CSSStyleDeclaration>);
+      bandWrap.appendChild(tag);
+
+      const freq = makeNumberInput();
+      freq.min = "20";
+      freq.max = "20000";
+      freq.step = "10";
+      freq.value = String(d.freq);
+      freq.title = "Hz";
+      bandWrap.appendChild(freq);
+
+      const gain = makeNumberInput();
+      gain.min = "-24";
+      gain.max = "24";
+      gain.step = "0.5";
+      gain.value = "0";
+      gain.title = "dB";
+      bandWrap.appendChild(gain);
+      const gainLab = document.createElement("span");
+      gainLab.textContent = "dB";
+      gainLab.style.fontSize = "11px";
+      gainLab.style.color = "var(--text-4)";
+      bandWrap.appendChild(gainLab);
+
+      const q = makeNumberInput();
+      q.min = "0.1";
+      q.max = "10";
+      q.step = "0.1";
+      q.value = String(d.q);
+      q.title = "Q";
+      bandWrap.appendChild(q);
+      const qLab = document.createElement("span");
+      qLab.textContent = "Q";
+      qLab.style.fontSize = "11px";
+      qLab.style.color = "var(--text-4)";
+      bandWrap.appendChild(qLab);
+
+      ui.fxParamsRow.appendChild(bandWrap);
+      bands.push({ freq, gain, q, kind: d.kind });
+    }
+
+    eqInputs = bands;
+  };
+
+  const refreshNoiseProfiles = async (): Promise<void> => {
+    try {
+      noiseProfiles = await client.listNoiseProfiles();
+    } catch {
+      noiseProfiles = [];
+    }
+    if (nrInputs) populateNoiseProfilePicker();
+  };
+
+  const populateNoiseProfilePicker = (): void => {
+    if (!nrInputs) return;
+    const sel = nrInputs.profile;
+    sel.innerHTML = "";
+    if (noiseProfiles.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(no profiles — capture one first)";
+      opt.disabled = true;
+      sel.appendChild(opt);
+      return;
+    }
+    for (const p of noiseProfiles) {
+      const opt = document.createElement("option");
+      opt.value = p.id;
+      const src = sources.find((s) => s.id === p.sourceId);
+      opt.textContent = `${p.name} (${src?.name ?? p.sourceId})`;
+      sel.appendChild(opt);
+    }
+  };
+
+  const buildNrInputs = (): void => {
+    ui.fxParamsRow.innerHTML = "";
+    currentFxInputs = {};
+    autotuneInputs = null;
+    eqInputs = null;
+    generateInputs = null;
+
+    const modeWrap = document.createElement("label");
+    Object.assign(modeWrap.style, wrapStyle);
+    modeWrap.appendChild(document.createTextNode("mode"));
+    const mode = document.createElement("select");
+    Object.assign(mode.style, selStyle);
+    for (const m of ["Apply", "Capture"]) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      mode.appendChild(o);
+    }
+    modeWrap.appendChild(mode);
+
+    // Capture-mode controls.
+    const captureRow = document.createElement("span");
+    Object.assign(captureRow.style, { display: "none", gap: "6px", alignItems: "center" } satisfies Partial<CSSStyleDeclaration>);
+    const nameWrap = document.createElement("label");
+    Object.assign(nameWrap.style, wrapStyle);
+    nameWrap.appendChild(document.createTextNode("name"));
+    const captureName = document.createElement("input");
+    captureName.type = "text";
+    captureName.value = "noise";
+    captureName.title = "Profile name";
+    Object.assign(captureName.style, {
+      width: "100px",
+      padding: "2px 4px",
+      background: "var(--bg-sunken)",
+      color: "var(--text-2)",
+      border: "1px solid var(--line-2)",
+      borderRadius: "var(--r-2)",
+      fontSize: "12px",
+    } satisfies Partial<CSSStyleDeclaration>);
+    nameWrap.appendChild(captureName);
+    const captureHint = document.createElement("span");
+    captureHint.textContent = "select a region of pure noise, then Apply";
+    captureHint.style.color = "var(--text-4)";
+    captureHint.style.fontSize = "11px";
+    captureRow.appendChild(nameWrap);
+    captureRow.appendChild(captureHint);
+
+    // Apply-mode controls.
+    const applyRow = document.createElement("span");
+    Object.assign(applyRow.style, { display: "inline-flex", gap: "6px", alignItems: "center" } satisfies Partial<CSSStyleDeclaration>);
+    const profWrap = document.createElement("label");
+    Object.assign(profWrap.style, wrapStyle);
+    profWrap.appendChild(document.createTextNode("profile"));
+    const profile = document.createElement("select");
+    Object.assign(profile.style, selStyle);
+    profWrap.appendChild(profile);
+
+    const amountWrap = document.createElement("label");
+    Object.assign(amountWrap.style, wrapStyle);
+    amountWrap.appendChild(document.createTextNode("amount dB"));
+    const amountDb = makeNumberInput();
+    amountDb.min = "-30";
+    amountDb.max = "0";
+    amountDb.step = "0.5";
+    amountDb.value = "-12";
+    amountDb.title = "How aggressively to subtract the noise spectrum";
+    amountWrap.appendChild(amountDb);
+
+    const floorWrap = document.createElement("label");
+    Object.assign(floorWrap.style, wrapStyle);
+    floorWrap.appendChild(document.createTextNode("floor dB"));
+    const floorDb = makeNumberInput();
+    floorDb.min = "-90";
+    floorDb.max = "-10";
+    floorDb.step = "1";
+    floorDb.value = "-30";
+    floorDb.title = "Lowest gain a bin can be reduced to (musical-noise control)";
+    floorWrap.appendChild(floorDb);
+
+    const overWrap = document.createElement("label");
+    Object.assign(overWrap.style, wrapStyle);
+    overWrap.appendChild(document.createTextNode("oversub"));
+    const oversub = makeNumberInput();
+    oversub.min = "1";
+    oversub.max = "4";
+    oversub.step = "0.1";
+    oversub.value = "1.5";
+    oversub.title = "Over-subtraction factor (>1 reduces tonal residue)";
+    overWrap.appendChild(oversub);
+
+    applyRow.appendChild(profWrap);
+    applyRow.appendChild(amountWrap);
+    applyRow.appendChild(floorWrap);
+    applyRow.appendChild(overWrap);
+
+    ui.fxParamsRow.appendChild(modeWrap);
+    ui.fxParamsRow.appendChild(captureRow);
+    ui.fxParamsRow.appendChild(applyRow);
+
+    nrInputs = {
+      mode,
+      captureRow,
+      captureName,
+      applyRow,
+      profile,
+      amountDb,
+      floorDb,
+      oversub,
+    };
+
+    mode.addEventListener("change", () => {
+      const isCapture = mode.value === "Capture";
+      captureRow.style.display = isCapture ? "inline-flex" : "none";
+      applyRow.style.display = isCapture ? "none" : "inline-flex";
+    });
+
+    void refreshNoiseProfiles();
+  };
+
+  const buildGenerateInputs = (): void => {
+    ui.fxParamsRow.innerHTML = "";
+    currentFxInputs = {};
+    autotuneInputs = null;
+    eqInputs = null;
+
+    const modeWrap = document.createElement("label");
+    Object.assign(modeWrap.style, wrapStyle);
+    modeWrap.appendChild(document.createTextNode("kind"));
+    const mode = document.createElement("select");
+    Object.assign(mode.style, selStyle);
+    for (const m of ["Silence", "Tone", "Noise"]) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      mode.appendChild(o);
+    }
+    mode.value = "Tone";
+    modeWrap.appendChild(mode);
+
+    // Tone-only controls.
+    const toneRow = document.createElement("span");
+    Object.assign(toneRow.style, { display: "inline-flex", gap: "6px" } satisfies Partial<CSSStyleDeclaration>);
+    const shapeWrap = document.createElement("label");
+    Object.assign(shapeWrap.style, wrapStyle);
+    shapeWrap.appendChild(document.createTextNode("shape"));
+    const shape = document.createElement("select");
+    Object.assign(shape.style, selStyle);
+    for (const s of ["Sine", "Triangle", "Saw", "Square"]) {
+      const o = document.createElement("option");
+      o.value = s;
+      o.textContent = s;
+      shape.appendChild(o);
+    }
+    shapeWrap.appendChild(shape);
+    const freqWrap = document.createElement("label");
+    Object.assign(freqWrap.style, wrapStyle);
+    freqWrap.appendChild(document.createTextNode("Hz"));
+    const freq = makeNumberInput();
+    freq.min = "20";
+    freq.max = "20000";
+    freq.step = "10";
+    freq.value = "440";
+    freqWrap.appendChild(freq);
+    const ampWrap = document.createElement("label");
+    Object.assign(ampWrap.style, wrapStyle);
+    ampWrap.appendChild(document.createTextNode("dB"));
+    const toneAmp = makeNumberInput();
+    toneAmp.min = "-60";
+    toneAmp.max = "0";
+    toneAmp.step = "0.5";
+    toneAmp.value = "-6";
+    ampWrap.appendChild(toneAmp);
+    toneRow.appendChild(shapeWrap);
+    toneRow.appendChild(freqWrap);
+    toneRow.appendChild(ampWrap);
+
+    // Noise-only controls.
+    const noiseRow = document.createElement("span");
+    Object.assign(noiseRow.style, { display: "none", gap: "6px" } satisfies Partial<CSSStyleDeclaration>);
+    const colorWrap = document.createElement("label");
+    Object.assign(colorWrap.style, wrapStyle);
+    colorWrap.appendChild(document.createTextNode("color"));
+    const noiseColor = document.createElement("select");
+    Object.assign(noiseColor.style, selStyle);
+    for (const c of ["White", "Pink", "Brown"]) {
+      const o = document.createElement("option");
+      o.value = c;
+      o.textContent = c;
+      noiseColor.appendChild(o);
+    }
+    colorWrap.appendChild(noiseColor);
+    const noiseAmpWrap = document.createElement("label");
+    Object.assign(noiseAmpWrap.style, wrapStyle);
+    noiseAmpWrap.appendChild(document.createTextNode("dB"));
+    const noiseAmp = makeNumberInput();
+    noiseAmp.min = "-60";
+    noiseAmp.max = "0";
+    noiseAmp.step = "0.5";
+    noiseAmp.value = "-12";
+    noiseAmpWrap.appendChild(noiseAmp);
+    noiseRow.appendChild(colorWrap);
+    noiseRow.appendChild(noiseAmpWrap);
+
+    // Length applies to all kinds.
+    const lengthWrap = document.createElement("label");
+    Object.assign(lengthWrap.style, wrapStyle);
+    lengthWrap.appendChild(document.createTextNode("ms"));
+    const length = makeNumberInput();
+    length.min = "1";
+    length.max = "60000";
+    length.step = "10";
+    length.value = "500";
+    lengthWrap.appendChild(length);
+
+    const hint = document.createElement("span");
+    hint.textContent = "inserts at selection start, or end of source";
+    hint.style.color = "var(--text-4)";
+    hint.style.fontSize = "11px";
+
+    ui.fxParamsRow.appendChild(modeWrap);
+    ui.fxParamsRow.appendChild(toneRow);
+    ui.fxParamsRow.appendChild(noiseRow);
+    ui.fxParamsRow.appendChild(lengthWrap);
+    ui.fxParamsRow.appendChild(hint);
+
+    generateInputs = {
+      mode,
+      toneRow,
+      shape,
+      freq,
+      toneAmp,
+      noiseRow,
+      noiseColor,
+      noiseAmp,
+      length,
+    };
+
+    mode.addEventListener("change", () => {
+      const m = mode.value;
+      toneRow.style.display = m === "Tone" ? "inline-flex" : "none";
+      noiseRow.style.display = m === "Noise" ? "inline-flex" : "none";
+    });
+  };
+
   const buildFxParamInputs = (def: FxDef): void => {
     ui.fxParamsRow.innerHTML = "";
     currentFxInputs = {};
@@ -1153,12 +1590,23 @@ export async function mountEditor(
   };
 
   ui.fxKindSelect.addEventListener("change", () => {
-    if (ui.fxKindSelect.value === "Autotune") {
+    const v = ui.fxKindSelect.value;
+    // Reset every special-case state up front; whichever builder runs
+    // below sets its own back to a non-null value.
+    autotuneInputs = null;
+    eqInputs = null;
+    generateInputs = null;
+    nrInputs = null;
+    if (v === "Autotune") {
       buildAutotuneInputs();
-      // Initial UI state: Scale mode, so scaleRow is visible already.
+    } else if (v === "Eq") {
+      buildEqInputs();
+    } else if (v === "Generate") {
+      buildGenerateInputs();
+    } else if (v === "NoiseReduce") {
+      buildNrInputs();
     } else {
-      autotuneInputs = null;
-      const def = fxDefs.find((d) => d.id === ui.fxKindSelect.value);
+      const def = fxDefs.find((d) => d.id === v);
       if (def) buildFxParamInputs(def);
     }
     syncFxApplyEnabled();
@@ -1195,11 +1643,172 @@ export async function mountEditor(
 
   ui.fxApplyBtn.addEventListener("click", async () => {
     if (!currentSourceId) return;
+
+    // Generate is position-based (insert at `at` with `length`), not
+    // range-based — it doesn't need a non-empty range and works fine on
+    // an empty source. Handle it before the range check.
+    if (ui.fxKindSelect.value === "Generate") {
+      if (!generateInputs) return;
+      const lengthMs = parseFloat(generateInputs.length.value);
+      if (!Number.isFinite(lengthMs) || lengthMs <= 0) {
+        ui.status.textContent = "Generate: length must be positive";
+        return;
+      }
+      const lengthFrames = Math.max(1, Math.round((lengthMs / 1000) * sourceSampleRate));
+      // Insert at selection start when one exists; otherwise append at
+      // the source's current end. The Generate dsp path validates that
+      // `at` is in [0, total_frames].
+      const at = selection ? selection.inFrame : sourceFrameCount;
+      let params: unknown;
+      const m = generateInputs.mode.value;
+      if (m === "Silence") {
+        params = "Silence";
+      } else if (m === "Tone") {
+        const shape = generateInputs.shape.value;
+        const f = parseFloat(generateInputs.freq.value);
+        const a = parseFloat(generateInputs.toneAmp.value);
+        params = {
+          Tone: {
+            shape,
+            frequency_hz: Number.isFinite(f) ? f : 440,
+            amplitude_db: Number.isFinite(a) ? a : -6,
+          },
+        };
+      } else {
+        const a = parseFloat(generateInputs.noiseAmp.value);
+        params = {
+          Noise: {
+            color: generateInputs.noiseColor.value,
+            amplitude_db: Number.isFinite(a) ? a : -12,
+          },
+        };
+      }
+      ui.fxApplyBtn.disabled = true;
+      const lenBefore = sourceFrameCount;
+      try {
+        await client.applyOp(
+          currentSourceId,
+          JSON.stringify({ Generate: { at, length: lengthFrames, params } }),
+        );
+        await refreshLibrary();
+        await loadSource(currentSourceId);
+        opts.onSourceImported?.();
+        ui.status.textContent = `Generate ${m} applied (length ${lenBefore.toLocaleString()} → ${sourceFrameCount.toLocaleString()})`;
+      } catch (err) {
+        ui.status.textContent = `Generate failed: ${String(err)}`;
+      } finally {
+        syncFxApplyEnabled();
+      }
+      return;
+    }
+
+    // Every other op processes a range — selection if any, else whole source.
     const range = selection
       ? { start: selection.inFrame, end: selection.outFrame }
       : { start: 0, end: sourceFrameCount };
     if (range.end <= range.start) {
       ui.status.textContent = "fx: empty range";
+      return;
+    }
+
+    if (ui.fxKindSelect.value === "NoiseReduce") {
+      if (!nrInputs) return;
+      const FFT_SIZE = 2048;
+      ui.fxApplyBtn.disabled = true;
+      try {
+        if (nrInputs.mode.value === "Capture") {
+          if (!selection) {
+            ui.status.textContent = "NR capture: select a region of pure noise first";
+            return;
+          }
+          const name = nrInputs.captureName.value.trim() || "noise";
+          // Generate a unique-ish profile id from a timestamp; the engine
+          // doesn't care about format, just uniqueness within the project.
+          const profileId = `np_${Date.now().toString(36)}`;
+          await client.captureNoiseProfile(
+            currentSourceId,
+            range.start,
+            range.end,
+            name,
+            profileId,
+            FFT_SIZE,
+          );
+          await refreshNoiseProfiles();
+          // Switch the user to Apply mode and select their newly-captured
+          // profile so a follow-up Apply is one click away.
+          nrInputs.mode.value = "Apply";
+          nrInputs.mode.dispatchEvent(new Event("change"));
+          nrInputs.profile.value = profileId;
+          ui.status.textContent = `NR profile captured (${name})`;
+        } else {
+          const profileId = nrInputs.profile.value;
+          if (!profileId) {
+            ui.status.textContent = "NR apply: capture a profile first";
+            return;
+          }
+          const amount = parseFloat(nrInputs.amountDb.value);
+          const floor = parseFloat(nrInputs.floorDb.value);
+          const over = parseFloat(nrInputs.oversub.value);
+          await client.applyOp(
+            currentSourceId,
+            JSON.stringify({
+              NoiseReduce: {
+                range,
+                profile: profileId,
+                params: {
+                  amount_db: Number.isFinite(amount) ? amount : -12,
+                  floor_db: Number.isFinite(floor) ? floor : -30,
+                  oversubtraction: Number.isFinite(over) ? over : 1.5,
+                  attack_ms: 5.0,
+                  release_ms: 50.0,
+                  freq_smoothing: 1.0,
+                  fft_size: FFT_SIZE,
+                },
+              },
+            }),
+          );
+          await refreshAfterEdit();
+          opts.onSourceImported?.();
+          ui.status.textContent = `NR applied (${nrInputs.profile.options[nrInputs.profile.selectedIndex]?.textContent ?? profileId})`;
+        }
+      } catch (err) {
+        ui.status.textContent = `NR failed: ${String(err)}`;
+      } finally {
+        syncFxApplyEnabled();
+      }
+      return;
+    }
+
+    if (ui.fxKindSelect.value === "Eq") {
+      if (!eqInputs) return;
+      const bands = eqInputs
+        .map((b) => ({
+          kind: b.kind,
+          frequency_hz: parseFloat(b.freq.value),
+          gain_db: parseFloat(b.gain.value),
+          q: parseFloat(b.q.value),
+          enabled: true,
+        }))
+        // Drop bands with 0 dB gain so we don't pay biquad cost for a no-op.
+        .filter((b) => Number.isFinite(b.gain_db) && Math.abs(b.gain_db) > 1e-3);
+      if (bands.length === 0) {
+        ui.status.textContent = "EQ: every band is at 0 dB";
+        return;
+      }
+      ui.fxApplyBtn.disabled = true;
+      try {
+        await client.applyOp(
+          currentSourceId,
+          JSON.stringify({ Eq: { range, params: { bands } } }),
+        );
+        await refreshAfterEdit();
+        opts.onSourceImported?.();
+        ui.status.textContent = `EQ applied (${bands.length} band${bands.length === 1 ? "" : "s"})`;
+      } catch (err) {
+        ui.status.textContent = `EQ failed: ${String(err)}`;
+      } finally {
+        syncFxApplyEnabled();
+      }
       return;
     }
 
@@ -1415,6 +2024,7 @@ interface UiHandles {
   scrollbar: HTMLInputElement;
   libraryList: HTMLDivElement;
   duplicateBtn: HTMLButtonElement;
+  newSourceBtn: HTMLButtonElement;
   fxKindSelect: HTMLSelectElement;
   fxParamsRow: HTMLDivElement;
   fxApplyBtn: HTMLButtonElement;
@@ -1479,6 +2089,19 @@ function buildUi(root: HTMLElement): UiHandles {
   } satisfies Partial<CSSStyleDeclaration>);
   const libraryTitle = document.createElement("span");
   libraryTitle.textContent = "Library";
+  const libraryActions = document.createElement("span");
+  Object.assign(libraryActions.style, {
+    display: "inline-flex",
+    gap: "4px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const newSourceBtn = document.createElement("button");
+  newSourceBtn.type = "button";
+  newSourceBtn.textContent = "+ New";
+  newSourceBtn.title = "Create a new blank stereo source (asks for length in seconds)";
+  Object.assign(newSourceBtn.style, btnStyle(), {
+    padding: "2px 8px",
+    fontSize: "11px",
+  } satisfies Partial<CSSStyleDeclaration>);
   const duplicateBtn = document.createElement("button");
   duplicateBtn.type = "button";
   duplicateBtn.textContent = "Duplicate";
@@ -1488,8 +2111,10 @@ function buildUi(root: HTMLElement): UiHandles {
     padding: "2px 8px",
     fontSize: "11px",
   } satisfies Partial<CSSStyleDeclaration>);
+  libraryActions.appendChild(newSourceBtn);
+  libraryActions.appendChild(duplicateBtn);
   libraryHeader.appendChild(libraryTitle);
-  libraryHeader.appendChild(duplicateBtn);
+  libraryHeader.appendChild(libraryActions);
   libraryPane.appendChild(libraryHeader);
 
   const libraryList = document.createElement("div");
@@ -1792,6 +2417,7 @@ function buildUi(root: HTMLElement): UiHandles {
     scrollbar,
     libraryList,
     duplicateBtn,
+    newSourceBtn,
     fxKindSelect,
     fxParamsRow,
     fxApplyBtn,

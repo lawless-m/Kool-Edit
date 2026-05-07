@@ -266,6 +266,28 @@ mod wasm_api {
                 .map_err(|e| JsError::new(&e.to_string()))
         }
 
+        /// Create a new zero-filled source under `desired_name` at the
+        /// project's sample rate. Useful as a blank canvas the Generate
+        /// op can splice tone or noise into.
+        #[wasm_bindgen(js_name = createEmptySource)]
+        pub fn create_empty_source(
+            &mut self,
+            length_frames: u64,
+            channels: u32,
+            desired_name: &str,
+            now_iso8601: &str,
+        ) -> Result<String, JsError> {
+            self.inner
+                .create_empty_source(
+                    length_frames,
+                    channels as u16,
+                    desired_name,
+                    Timestamp(now_iso8601.into()),
+                )
+                .map(|id| id.as_str().to_owned())
+                .map_err(|e| JsError::new(&e.to_string()))
+        }
+
         #[wasm_bindgen(js_name = renameSource)]
         pub fn rename_source(
             &mut self,
@@ -363,6 +385,30 @@ mod wasm_api {
                     fft_size,
                 )
                 .map_err(|e| JsError::new(&e.to_string()))
+        }
+
+        /// List every captured noise profile in the project as JSON. Each
+        /// entry is `{id, name, sourceId, start, end, fftSize}` so the UI
+        /// can populate a profile picker for NoiseReduce.
+        #[wasm_bindgen(js_name = listNoiseProfiles)]
+        pub fn list_noise_profiles(&self) -> String {
+            let arr: Vec<serde_json::Value> = self
+                .inner
+                .project()
+                .noise_profiles
+                .values()
+                .map(|p| {
+                    serde_json::json!({
+                        "id": p.id.as_str(),
+                        "name": p.name,
+                        "sourceId": p.captured_from.as_str(),
+                        "start": p.range.start(),
+                        "end": p.range.end(),
+                        "magnitudeBins": p.magnitudes.len(),
+                    })
+                })
+                .collect();
+            serde_json::Value::Array(arr).to_string()
         }
 
         /// Build a `.kepz` portable archive (project JSON + every source's

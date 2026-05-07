@@ -92,13 +92,32 @@ export type EngineCommand =
   | { kind: "duplicate_source"; req: RequestId; sourceId: string; nowIso: string }
   | { kind: "rename_source"; req: RequestId; sourceId: string; newName: string }
   | {
+      kind: "create_empty_source";
+      req: RequestId;
+      lengthFrames: number;
+      channels: number;
+      desiredName: string;
+      nowIso: string;
+    }
+  | {
       kind: "render_range_to_source";
       req: RequestId;
       startFrame: number;
       endFrame: number;
       desiredName: string;
       nowIso: string;
-    };
+    }
+  | {
+      kind: "capture_noise_profile";
+      req: RequestId;
+      sourceId: string;
+      startFrame: number;
+      endFrame: number;
+      name: string;
+      profileId: string;
+      fftSize: number;
+    }
+  | { kind: "list_noise_profiles"; req: RequestId };
 
 export type EngineEvent =
   | { kind: "ready" }
@@ -138,5 +157,8 @@ export type EngineEvent =
   | { kind: "detect_pitch_contour_ok"; req: RequestId; contour: Float32Array }
   | { kind: "duplicate_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "rename_source_ok"; req: RequestId }
+  | { kind: "create_empty_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "render_range_to_source_ok"; req: RequestId; newSourceId: string }
+  | { kind: "capture_noise_profile_ok"; req: RequestId }
+  | { kind: "list_noise_profiles_ok"; req: RequestId; json: string }
   | { kind: "error"; req: RequestId; reason: string };

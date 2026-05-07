@@ -18,7 +18,18 @@ const HEADER_COL_WIDTH = 180;
 const MIN_LANE_PX = 800;
 
 type GridMode = "beats" | "time";
-type SnapDivision = "off" | "bar" | "beat" | "1/2" | "1/3" | "1/4" | "1/8";
+type SnapDivision =
+  | "off"
+  | "bar"
+  | "beat"
+  | "1/2"
+  | "1/3"
+  | "1/4"
+  | "1/8"
+  | "1/16"
+  | "1/32"
+  | "1/48"
+  | "1/64";
 
 const SNAP_OPTIONS: { value: SnapDivision; label: string }[] = [
   { value: "off", label: "Off" },
@@ -28,6 +39,10 @@ const SNAP_OPTIONS: { value: SnapDivision; label: string }[] = [
   { value: "1/3", label: "Triplet (1/3)" },
   { value: "1/4", label: "1/4 beat" },
   { value: "1/8", label: "1/8 beat" },
+  { value: "1/16", label: "1/16 beat" },
+  { value: "1/32", label: "1/32 beat" },
+  { value: "1/48", label: "1/48 beat" },
+  { value: "1/64", label: "1/64 beat" },
 ];
 
 export interface ArrangerHandle {
@@ -58,6 +73,21 @@ export async function mountArranger(
   const PEAK_COLS = 2048;
   let stagedSourceId: string | null = null;
   let selectedClip: { trackId: number; clipId: number } | null = null;
+
+  /** UI-side clipboard for "Copy Sel" / "Insert ×N". Each entry is one
+   *  clip-portion: cropped to fit inside the original selection so the
+   *  unit of repetition is exactly one selection length. `offset` is the
+   *  frame distance from the selection in-point to where the clip should
+   *  land in each pasted copy. */
+  type ClipboardEntry = {
+    trackId: number;
+    sourceId: string;
+    sourceIn: number;
+    sourceOut: number;
+    offset: number;
+  };
+  let clipboardEntries: ClipboardEntry[] = [];
+  let clipboardLength = 0;
   let audioCtx: AudioContext | null = null;
   let currentBufferSrc: AudioBufferSourceNode | null = null;
 
@@ -148,6 +178,14 @@ export async function mountArranger(
         return 0.25;
       case "1/8":
         return 0.125;
+      case "1/16":
+        return 1 / 16;
+      case "1/32":
+        return 1 / 32;
+      case "1/48":
+        return 1 / 48;
+      case "1/64":
+        return 1 / 64;
     }
   };
 
@@ -463,6 +501,8 @@ export async function mountArranger(
     const o = ui.selectionOverlay;
     const has = hasSelection();
     ui.renderToClipBtn.disabled = !has;
+    ui.copySelBtn.disabled = !has;
+    ui.insertCopiesBtn.disabled = !has || clipboardEntries.length === 0;
     if (!has) {
       o.style.display = "none";
       ui.inHandle.style.display = "none";
@@ -1399,6 +1439,72 @@ export async function mountArranger(
     }
   });
 
+  ui.copySelBtn.addEventListener("click", () => {
+    if (!hasSelection()) return;
+    const selStart = inFrame!;
+    const selEnd = outFrame!;
+    const entries: ClipboardEntry[] = [];
+    for (const [trackId, list] of clipsByTrack) {
+      for (const c of list) {
+        const overlapStart = Math.max(c.position, selStart);
+        const overlapEnd = Math.min(c.endPosition, selEnd);
+        if (overlapEnd <= overlapStart) continue;
+        // Map the overlap back into the source's frame range. Sources are
+        // resampled to the project rate at import time and time_stretch
+        // defaults to 1, so 1 project frame == 1 source frame here.
+        const sourceIn = c.sourceIn + (overlapStart - c.position);
+        const sourceOut = c.sourceIn + (overlapEnd - c.position);
+        entries.push({
+          trackId,
+          sourceId: c.sourceId,
+          sourceIn,
+          sourceOut,
+          offset: overlapStart - selStart,
+        });
+      }
+    }
+    clipboardEntries = entries;
+    clipboardLength = selEnd - selStart;
+    ui.insertCopiesBtn.disabled = entries.length === 0 || !hasSelection();
+    setStatus(
+      entries.length === 0
+        ? "copy: selection contains no clips"
+        : `copied ${entries.length} clip${entries.length === 1 ? "" : "s"} (${(clipboardLength / Math.max(1, projectSr)).toFixed(2)}s)`,
+    );
+  });
+
+  ui.insertCopiesBtn.addEventListener("click", async () => {
+    if (!hasSelection() || clipboardEntries.length === 0 || clipboardLength <= 0) return;
+    const at = inFrame!;
+    const n = Math.max(1, Math.min(256, Math.floor(parseFloat(ui.insertCountInput.value) || 1)));
+    ui.insertCopiesBtn.disabled = true;
+    setStatus(`inserting ${n} cop${n === 1 ? "y" : "ies"}…`);
+    try {
+      let added = 0;
+      for (let k = 0; k < n; k++) {
+        for (const e of clipboardEntries) {
+          // Skip if the source no longer exists (e.g. user deleted it
+          // between copy and insert).
+          if (!sources.find((s) => s.id === e.sourceId)) continue;
+          const position = at + k * clipboardLength + e.offset;
+          try {
+            await client.addClip(e.trackId, e.sourceId, position, e.sourceIn, e.sourceOut);
+            added++;
+          } catch (err) {
+            // Track may have been removed; carry on with remaining entries.
+            console.warn("insert ×N: addClip failed", err);
+          }
+        }
+      }
+      await refresh();
+      setStatus(`inserted ${added} clip${added === 1 ? "" : "s"} (${n}× ${clipboardEntries.length})`);
+    } catch (err) {
+      setStatus(`insert failed: ${String(err)}`);
+    } finally {
+      ui.insertCopiesBtn.disabled = clipboardEntries.length === 0 || !hasSelection();
+    }
+  });
+
   // Delete (not Backspace — browsers map that to navigate-back) removes the
   // selected clip. Skip when typing in inputs so digits can be edited freely.
   window.addEventListener("keydown", (ev) => {
@@ -1462,6 +1568,9 @@ interface ArrangerUi {
   stopBtn: HTMLButtonElement;
   clearSelBtn: HTMLButtonElement;
   renderToClipBtn: HTMLButtonElement;
+  copySelBtn: HTMLButtonElement;
+  insertCountInput: HTMLInputElement;
+  insertCopiesBtn: HTMLButtonElement;
   status: HTMLDivElement;
 }
 
@@ -1783,6 +1892,45 @@ function buildUi(root: HTMLElement): ArrangerUi {
   Object.assign(renderToClipBtn.style, btnStyle());
   transport.appendChild(renderToClipBtn);
 
+  // Copy / paste-N controls — capture the clips inside the selection and
+  // stamp them N times at the in-point as a quick loop tool.
+  const copySelBtn = document.createElement("button");
+  copySelBtn.textContent = "Copy Sel";
+  copySelBtn.type = "button";
+  copySelBtn.title =
+    "Capture every clip overlapping the selection (cropped to the selection bounds)";
+  copySelBtn.disabled = true;
+  Object.assign(copySelBtn.style, btnStyle());
+  transport.appendChild(copySelBtn);
+
+  const insertCountInput = document.createElement("input");
+  insertCountInput.type = "number";
+  insertCountInput.min = "1";
+  insertCountInput.max = "256";
+  insertCountInput.step = "1";
+  insertCountInput.value = "4";
+  insertCountInput.title = "Number of copies to stamp at the in-point";
+  Object.assign(insertCountInput.style, {
+    width: "56px",
+    padding: "4px 6px",
+    background: "var(--bg-sunken)",
+    color: "var(--text-2)",
+    border: "1px solid var(--line-2)",
+    borderRadius: "var(--r-2)",
+    fontFamily: "var(--ff-mono)",
+    fontSize: "12px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  transport.appendChild(insertCountInput);
+
+  const insertCopiesBtn = document.createElement("button");
+  insertCopiesBtn.textContent = "Insert ×N";
+  insertCopiesBtn.type = "button";
+  insertCopiesBtn.title =
+    "Stamp the captured selection N times starting at the current in-point";
+  insertCopiesBtn.disabled = true;
+  Object.assign(insertCopiesBtn.style, btnStyle());
+  transport.appendChild(insertCopiesBtn);
+
   const hint = document.createElement("span");
   hint.textContent =
     "(drag the ruler to make a selection, then drag its green edges to refine — Shift bypasses snap)";
@@ -1826,6 +1974,9 @@ function buildUi(root: HTMLElement): ArrangerUi {
     stopBtn,
     clearSelBtn,
     renderToClipBtn,
+    copySelBtn,
+    insertCountInput,
+    insertCopiesBtn,
     status,
   };
 }

@@ -1167,8 +1167,51 @@ fn synthesize(
                 NoiseColor::White => {
                     Ok((0..frames).map(|_| next_uniform() * amp).collect())
                 }
-                NoiseColor::Pink | NoiseColor::Brown => {
-                    Err(DspError::Unsupported("Generate/Noise non-white"))
+                NoiseColor::Pink => {
+                    // Paul Kellet's economy 7-pole IIR — well-known
+                    // approximation of 1/f spectrum out to ~10 kHz, much
+                    // cheaper than the Voss-McCartney variant.
+                    let mut b0 = 0.0_f32;
+                    let mut b1 = 0.0_f32;
+                    let mut b2 = 0.0_f32;
+                    let mut b3 = 0.0_f32;
+                    let mut b4 = 0.0_f32;
+                    let mut b5 = 0.0_f32;
+                    let mut b6 = 0.0_f32;
+                    // Empirical scale factor that brings the integrated
+                    // power back close to white-noise unity at the same
+                    // amplitude_db setting. ~0.11 in Kellet's own notes.
+                    let pink_norm = 0.11_f32;
+                    Ok((0..frames)
+                        .map(|_| {
+                            let white = next_uniform();
+                            b0 = 0.99886 * b0 + white * 0.0555179;
+                            b1 = 0.99332 * b1 + white * 0.0750759;
+                            b2 = 0.96900 * b2 + white * 0.1538520;
+                            b3 = 0.86650 * b3 + white * 0.3104856;
+                            b4 = 0.55000 * b4 + white * 0.5329522;
+                            b5 = -0.7616 * b5 - white * 0.0168980;
+                            let pink =
+                                (b0 + b1 + b2 + b3 + b4 + b5 + b6 + white * 0.5362) * pink_norm;
+                            b6 = white * 0.115926;
+                            pink * amp
+                        })
+                        .collect())
+                }
+                NoiseColor::Brown => {
+                    // Leaky integrator on white. The leak (0.997) keeps
+                    // the DC component bounded; the gain is tuned so
+                    // peak-to-peak stays roughly within ±1 at unity amp.
+                    let mut last = 0.0_f32;
+                    let leak = 0.997_f32;
+                    let brown_norm = 3.5_f32;
+                    Ok((0..frames)
+                        .map(|_| {
+                            let white = next_uniform();
+                            last = leak * last + white * 0.02;
+                            last.clamp(-1.0, 1.0) * brown_norm * amp
+                        })
+                        .collect())
                 }
             }
         }
@@ -2475,6 +2518,50 @@ mod tests {
         assert_eq!(a, b, "same op must produce same samples");
         let peak = a.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
         assert!(peak <= db_to_linear(-6.0) + 1e-5);
+    }
+
+    #[test]
+    fn generate_pink_and_brown_noise_taper_off_at_high_freq() {
+        // Spectral character check via frame-to-frame variance: white
+        // noise wiggles fastest, pink slower (more low-freq weight),
+        // brown slowest (1/f² is essentially integrated white). The
+        // variance of (sample[n] - sample[n-1]) is a cheap proxy for
+        // the high-frequency energy.
+        let frames = 8192;
+        let synth = |color: NoiseColor| -> Vec<f32> {
+            let mut s = vec![];
+            apply(
+                &Op::Generate {
+                    at: 0,
+                    length: frames as u64,
+                    params: GeneratorParams::Noise { color, amplitude_db: -6.0 },
+                },
+                &mut s,
+                1,
+                48_000,
+            )
+            .unwrap();
+            s
+        };
+        let var_diff = |xs: &[f32]| -> f32 {
+            let diffs: Vec<f32> = xs.windows(2).map(|w| w[1] - w[0]).collect();
+            let mean: f32 = diffs.iter().sum::<f32>() / diffs.len() as f32;
+            diffs.iter().map(|d| (d - mean).powi(2)).sum::<f32>() / diffs.len() as f32
+        };
+        let white = synth(NoiseColor::White);
+        let pink = synth(NoiseColor::Pink);
+        let brown = synth(NoiseColor::Brown);
+        let vw = var_diff(&white);
+        let vp = var_diff(&pink);
+        let vb = var_diff(&brown);
+        assert!(
+            vw > vp && vp > vb,
+            "high-freq energy: white={vw} pink={vp} brown={vb} (expected white > pink > brown)"
+        );
+        // And all three should produce non-trivial output.
+        let peak_p = pink.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+        let peak_b = brown.iter().fold(0.0_f32, |m, &x| m.max(x.abs()));
+        assert!(peak_p > 1e-3 && peak_b > 1e-3);
     }
 
     #[test]

@@ -35,6 +35,15 @@ export interface ClipInfo {
   pan: number;
 }
 
+export interface NoiseProfileInfo {
+  id: string;
+  name: string;
+  sourceId: string;
+  start: number;
+  end: number;
+  magnitudeBins: number;
+}
+
 /**
  * Promise-returning wrapper around the engine Worker. A single client owns
  * one worker; concurrent calls are correlated by request id.
@@ -360,6 +369,26 @@ export class EngineClient {
     return ev.newSourceId;
   }
 
+  async createEmptySource(
+    lengthFrames: number,
+    channels: number,
+    desiredName: string,
+  ): Promise<string> {
+    const nowIso = new Date().toISOString();
+    const ev = await this.request<EngineCommand & { kind: "create_empty_source" }>(
+      (req) => ({
+        kind: "create_empty_source",
+        req,
+        lengthFrames,
+        channels,
+        desiredName,
+        nowIso,
+      }),
+    );
+    if (ev.kind !== "create_empty_source_ok") throw new Error("unexpected event");
+    return ev.newSourceId;
+  }
+
   async renameSource(sourceId: string, newName: string): Promise<void> {
     const ev = await this.request<EngineCommand & { kind: "rename_source" }>(
       (req) => ({ kind: "rename_source", req, sourceId, newName }),
@@ -385,6 +414,37 @@ export class EngineClient {
     );
     if (ev.kind !== "render_range_to_source_ok") throw new Error("unexpected event");
     return ev.newSourceId;
+  }
+
+  async captureNoiseProfile(
+    sourceId: string,
+    startFrame: number,
+    endFrame: number,
+    name: string,
+    profileId: string,
+    fftSize: number,
+  ): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "capture_noise_profile" }>(
+      (req) => ({
+        kind: "capture_noise_profile",
+        req,
+        sourceId,
+        startFrame,
+        endFrame,
+        name,
+        profileId,
+        fftSize,
+      }),
+    );
+    if (ev.kind !== "capture_noise_profile_ok") throw new Error("unexpected event");
+  }
+
+  async listNoiseProfiles(): Promise<NoiseProfileInfo[]> {
+    const ev = await this.request<EngineCommand & { kind: "list_noise_profiles" }>(
+      (req) => ({ kind: "list_noise_profiles", req }),
+    );
+    if (ev.kind !== "list_noise_profiles_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as NoiseProfileInfo[];
   }
 
   terminate(): void {
