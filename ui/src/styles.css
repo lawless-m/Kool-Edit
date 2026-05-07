@@ -70,6 +70,7 @@
 html, body {
   margin: 0;
   padding: 0;
+  height: 100%;
   background: var(--bg-0);
   color: var(--text-1);
   font-family: var(--ff-ui);
@@ -78,6 +79,11 @@ html, body {
   letter-spacing: 0.005em;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  overflow: hidden;
+}
+
+#app {
+  height: 100%;
 }
 
 button {
@@ -99,7 +105,7 @@ input, select {
 .app {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100%;
   background: var(--bg-0);
 }
 

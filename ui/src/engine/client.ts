@@ -23,6 +23,12 @@ export interface TrackInfo {
   clipCount: number;
 }
 
+export interface Breakpoint {
+  time: number;
+  value: number;
+  curve: "Linear" | "Exponential" | "Logarithmic" | "Hold" | "SCurve";
+}
+
 export interface ClipInfo {
   id: number;
   sourceId: string;
@@ -33,6 +39,8 @@ export interface ClipInfo {
   sourceOut: number;
   gainDb: number;
   pan: number;
+  volumeEnvelope: Breakpoint[];
+  panEnvelope: Breakpoint[];
 }
 
 export interface NoiseProfileInfo {
@@ -437,6 +445,25 @@ export class EngineClient {
       }),
     );
     if (ev.kind !== "capture_noise_profile_ok") throw new Error("unexpected event");
+  }
+
+  async setClipEnvelope(
+    trackId: number,
+    clipId: number,
+    parameter: "volume" | "pan",
+    breakpoints: Breakpoint[],
+  ): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_clip_envelope" }>(
+      (req) => ({
+        kind: "set_clip_envelope",
+        req,
+        trackId,
+        clipId,
+        parameter,
+        breakpointsJson: JSON.stringify(breakpoints),
+      }),
+    );
+    if (ev.kind !== "set_clip_envelope_ok") throw new Error("unexpected event");
   }
 
   async listNoiseProfiles(): Promise<NoiseProfileInfo[]> {

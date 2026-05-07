@@ -91,6 +91,12 @@ type WasmEngine = {
     fftSize: number,
   ) => void;
   listNoiseProfiles: () => string;
+  setClipEnvelope: (
+    trackId: bigint,
+    clipId: bigint,
+    parameter: string,
+    breakpointsJson: string,
+  ) => void;
 };
 
 type EngineModule = {
@@ -455,6 +461,17 @@ let playback: PlaybackState | null = null;
             req: cmd.req,
             json: engine.listNoiseProfiles(),
           });
+          return;
+        }
+
+        case "set_clip_envelope": {
+          engine.setClipEnvelope(
+            BigInt(cmd.trackId),
+            BigInt(cmd.clipId),
+            cmd.parameter,
+            cmd.breakpointsJson,
+          );
+          send({ kind: "set_clip_envelope_ok", req: cmd.req });
           return;
         }
       }

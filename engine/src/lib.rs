@@ -657,14 +657,36 @@ mod wasm_api {
             Ok(next)
         }
 
-        /// JSON: `[{id, sourceId, position, sourceIn, sourceOut, gainDb, pan, name}]`.
+        /// JSON: `[{id, sourceId, position, sourceIn, sourceOut, gainDb, pan,
+        /// name, volumeEnvelope, panEnvelope}]`. Envelopes are arrays of
+        /// `{time, value, curve}` (omitted when there are no breakpoints).
         #[wasm_bindgen(js_name = listClips)]
         pub fn list_clips(&self, track_id: u64) -> Option<String> {
+            use crate::envelope::EnvelopeParam;
             let track = self.inner.project().track(TrackId(track_id))?;
             let arr: Vec<serde_json::Value> = track
                 .clips
                 .iter()
                 .map(|c| {
+                    let env_to_json = |param: EnvelopeParam| -> serde_json::Value {
+                        let env = c.envelopes.iter().find(|e| e.parameter == param);
+                        match env {
+                            Some(e) => serde_json::Value::Array(
+                                e.breakpoints
+                                    .points()
+                                    .iter()
+                                    .map(|bp| {
+                                        serde_json::json!({
+                                            "time": bp.time,
+                                            "value": bp.value,
+                                            "curve": format!("{:?}", bp.curve),
+                                        })
+                                    })
+                                    .collect(),
+                            ),
+                            None => serde_json::Value::Array(Vec::new()),
+                        }
+                    };
                     serde_json::json!({
                         "id": c.id.0,
                         "sourceId": c.source_id.as_str(),
@@ -675,10 +697,83 @@ mod wasm_api {
                         "sourceOut": c.source_out,
                         "gainDb": c.gain_db,
                         "pan": c.pan,
+                        "volumeEnvelope": env_to_json(EnvelopeParam::Volume),
+                        "panEnvelope": env_to_json(EnvelopeParam::Pan),
                     })
                 })
                 .collect();
             Some(serde_json::Value::Array(arr).to_string())
+        }
+
+        /// Replace a clip's envelope for `parameter` ("volume" or "pan").
+        /// `breakpoints_json` is `[{time, value, curve?}]`; an empty array
+        /// removes the envelope. `curve` defaults to "Linear".
+        #[wasm_bindgen(js_name = setClipEnvelope)]
+        pub fn set_clip_envelope(
+            &mut self,
+            track_id: u64,
+            clip_id: u64,
+            parameter: &str,
+            breakpoints_json: &str,
+        ) -> Result<(), JsError> {
+            use crate::envelope::{
+                Breakpoint, BreakpointSeq, ClipEnvelope, CurveKind, EnvelopeParam,
+            };
+            let param = match parameter {
+                "volume" | "Volume" => EnvelopeParam::Volume,
+                "pan" | "Pan" => EnvelopeParam::Pan,
+                other => {
+                    return Err(JsError::new(&format!("unknown envelope parameter `{other}`")));
+                }
+            };
+            #[derive(serde::Deserialize)]
+            struct InBp {
+                time: u64,
+                value: f32,
+                #[serde(default)]
+                curve: Option<String>,
+            }
+            let raw: Vec<InBp> = serde_json::from_str(breakpoints_json)
+                .map_err(|e| JsError::new(&format!("breakpoints parse: {e}")))?;
+            let parse_curve = |s: &str| match s {
+                "Linear" | "linear" => CurveKind::Linear,
+                "Exponential" | "exponential" => CurveKind::Exponential,
+                "Logarithmic" | "logarithmic" => CurveKind::Logarithmic,
+                "Hold" | "hold" => CurveKind::Hold,
+                "SCurve" | "scurve" | "s_curve" => CurveKind::SCurve,
+                _ => CurveKind::Linear,
+            };
+            let bps: Vec<Breakpoint> = raw
+                .into_iter()
+                .map(|b| Breakpoint {
+                    time: b.time,
+                    value: b.value,
+                    curve: b
+                        .curve
+                        .as_deref()
+                        .map(parse_curve)
+                        .unwrap_or(CurveKind::Linear),
+                })
+                .collect();
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            let clip = track
+                .clips
+                .iter_mut()
+                .find(|c| c.id.0 == clip_id)
+                .ok_or_else(|| JsError::new(&format!("unknown clip {clip_id}")))?;
+            clip.envelopes.retain(|e| e.parameter != param);
+            if !bps.is_empty() {
+                let seq = BreakpointSeq::new(bps).map_err(|e| JsError::new(&e.to_string()))?;
+                clip.envelopes.push(ClipEnvelope {
+                    parameter: param,
+                    breakpoints: seq,
+                });
+            }
+            Ok(())
         }
 
         #[wasm_bindgen(js_name = moveClip)]

@@ -117,7 +117,15 @@ export type EngineCommand =
       profileId: string;
       fftSize: number;
     }
-  | { kind: "list_noise_profiles"; req: RequestId };
+  | { kind: "list_noise_profiles"; req: RequestId }
+  | {
+      kind: "set_clip_envelope";
+      req: RequestId;
+      trackId: number;
+      clipId: number;
+      parameter: "volume" | "pan";
+      breakpointsJson: string;
+    };
 
 export type EngineEvent =
   | { kind: "ready" }
@@ -161,4 +169,5 @@ export type EngineEvent =
   | { kind: "render_range_to_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "capture_noise_profile_ok"; req: RequestId }
   | { kind: "list_noise_profiles_ok"; req: RequestId; json: string }
+  | { kind: "set_clip_envelope_ok"; req: RequestId }
   | { kind: "error"; req: RequestId; reason: string };

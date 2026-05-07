@@ -551,19 +551,40 @@ export async function mountEditor(
   // ---- file load -------------------------------------------------------
 
   ui.fileInput.addEventListener("change", async () => {
-    const file = ui.fileInput.files?.[0];
-    if (!file) return;
-    ui.status.textContent = `decoding ${file.name}…`;
-    try {
-      const buf = await file.arrayBuffer();
-      const imp = await client.importWav(file.name, new Uint8Array(buf));
-      await refreshLibrary();
-      await loadSource(imp.sourceId);
-      ui.fileInput.value = "";
-      opts.onSourceImported?.();
-    } catch (err) {
-      ui.status.textContent = `import failed: ${String(err)}`;
-      ui.fileInput.value = "";
+    const files = Array.from(ui.fileInput.files ?? []);
+    if (files.length === 0) return;
+    let lastImported: string | null = null;
+    let succeeded = 0;
+    const failures: string[] = [];
+    for (const file of files) {
+      ui.status.textContent =
+        files.length > 1
+          ? `decoding ${file.name} (${succeeded + failures.length + 1}/${files.length})…`
+          : `decoding ${file.name}…`;
+      try {
+        const buf = await file.arrayBuffer();
+        const imp = await client.importWav(file.name, new Uint8Array(buf));
+        lastImported = imp.sourceId;
+        succeeded++;
+      } catch (err) {
+        failures.push(`${file.name}: ${String(err)}`);
+      }
+    }
+    ui.fileInput.value = "";
+    await refreshLibrary();
+    if (lastImported !== null) {
+      await loadSource(lastImported);
+    }
+    opts.onSourceImported?.();
+    if (failures.length === 0) {
+      ui.status.textContent =
+        succeeded === 1
+          ? `imported ${files[0]!.name}`
+          : `imported ${succeeded} files`;
+    } else if (succeeded === 0) {
+      ui.status.textContent = `import failed: ${failures.join("; ")}`;
+    } else {
+      ui.status.textContent = `imported ${succeeded}, failed ${failures.length}: ${failures.join("; ")}`;
     }
   });
 
@@ -2050,16 +2071,21 @@ function buildUi(root: HTMLElement): UiHandles {
   const fileInput = document.createElement("input");
   fileInput.type = "file";
   fileInput.accept = ".wav,audio/wav,audio/x-wav";
+  fileInput.multiple = true;
   fileRow.appendChild(fileInput);
   root.appendChild(fileRow);
 
   // ---- horizontal split: library | main ----
+  // flex: 1 + minHeight: 0 lets the split absorb the editor's vertical
+  // space and shrink past content height — without those, a long source
+  // list pushes the FX/transport rows off the bottom.
   const split = document.createElement("div");
   Object.assign(split.style, {
     display: "flex",
     flexDirection: "row",
     gap: "12px",
     alignItems: "stretch",
+    flex: "1 1 auto",
     minHeight: "0",
   } satisfies Partial<CSSStyleDeclaration>);
   root.appendChild(split);
@@ -2121,7 +2147,9 @@ function buildUi(root: HTMLElement): UiHandles {
   Object.assign(libraryList.style, {
     flex: "1 1 auto",
     overflowY: "auto",
-    minHeight: "200px",
+    // Has to be 0 (not a positive floor) so the flex parent can shrink
+    // it below content height; the inner overflowY then handles scroll.
+    minHeight: "0",
   } satisfies Partial<CSSStyleDeclaration>);
   libraryPane.appendChild(libraryList);
 

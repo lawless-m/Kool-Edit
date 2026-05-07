@@ -113,8 +113,13 @@ async function main(): Promise<void> {
   const editorRoot = document.createElement("div");
   const arrangerRoot = document.createElement("div");
   arrangerRoot.style.display = "none";
-  editorRoot.style.flex = "1";
-  arrangerRoot.style.flex = "1";
+  // flex:1 + minHeight:0 lets the editor/arranger fill the workspace and
+  // shrink below content height — the inner library/source list relies
+  // on this cascade to scroll instead of pushing chrome off the bottom.
+  editorRoot.style.flex = "1 1 auto";
+  arrangerRoot.style.flex = "1 1 auto";
+  editorRoot.style.minHeight = "0";
+  arrangerRoot.style.minHeight = "0";
   workspace.appendChild(editorRoot);
   workspace.appendChild(arrangerRoot);
   root.appendChild(workspace);

@@ -5,7 +5,13 @@
 // clip so the beat alignment is preserved (a clip "at bar 3 beat 2" stays
 // "at bar 3 beat 2" — the time changes, the beat doesn't).
 
-import type { ClipInfo, EngineClient, SourceInfo, TrackInfo } from "./engine/client";
+import type {
+  Breakpoint,
+  ClipInfo,
+  EngineClient,
+  SourceInfo,
+  TrackInfo,
+} from "./engine/client";
 import { btnStyle } from "./editor";
 
 const DEFAULT_PIXELS_PER_SECOND = 60;
@@ -90,6 +96,31 @@ export async function mountArranger(
   let clipboardLength = 0;
   let audioCtx: AudioContext | null = null;
   let currentBufferSrc: AudioBufferSourceNode | null = null;
+
+  // Volume envelope edit mode. While on, every clip gets a polyline +
+  // breakpoint dot overlay; clicking on a clip adds a breakpoint, dragging
+  // a dot moves it, double-clicking deletes. Values are dB; visual y maps
+  // [DB_MIN, DB_MAX] across the clip's lane height.
+  let envelopeMode = false;
+  const ENV_DB_MIN = -24;
+  const ENV_DB_MAX = 12;
+  // Pixel-Y → dB and vice versa, inside a clip lane of height `h`.
+  const yToDb = (y: number, h: number): number => {
+    const t = Math.max(0, Math.min(1, 1 - y / Math.max(1, h)));
+    return ENV_DB_MIN + t * (ENV_DB_MAX - ENV_DB_MIN);
+  };
+  const dbToY = (db: number, h: number): number => {
+    const clamped = Math.max(ENV_DB_MIN, Math.min(ENV_DB_MAX, db));
+    const t = (clamped - ENV_DB_MIN) / (ENV_DB_MAX - ENV_DB_MIN);
+    return (1 - t) * h;
+  };
+  let envelopeDrag: {
+    trackId: number;
+    clipId: number;
+    bpIndex: number;
+    clipDiv: HTMLElement;
+    clipFrames: number;
+  } | null = null;
 
   // Transport / selection state. inFrame/outFrame are project-frame positions
   // (i.e. frames at projectSr). playheadFrame is where the next Play will
@@ -530,6 +561,155 @@ export async function mountArranger(
     o.style.left = `${framesToPx(playheadFrame)}px`;
   };
 
+  /** Build the SVG overlay that shows + edits a clip's volume envelope.
+   *  Drawn in clip-local coordinates. Click on empty space adds a
+   *  breakpoint, mousedown on a dot drags it (clamped to the clip's
+   *  bounds), double-click on a dot deletes. Persists via setClipEnvelope
+   *  and triggers a redraw. */
+  const renderEnvelopeOverlay = (
+    trackId: number,
+    clip: ClipInfo,
+    width: number,
+    height: number,
+  ): SVGSVGElement => {
+    const SVG = "http://www.w3.org/2000/svg";
+    const svg = document.createElementNS(SVG, "svg") as SVGSVGElement;
+    svg.setAttribute("width", String(width));
+    svg.setAttribute("height", String(height));
+    Object.assign(svg.style, {
+      position: "absolute",
+      top: "0",
+      left: "0",
+      width: `${width}px`,
+      height: `${height}px`,
+      cursor: "crosshair",
+    } satisfies Partial<CSSStyleDeclaration>);
+
+    const clipFrames = Math.max(1, clip.sourceOut - clip.sourceIn);
+    const env = clip.volumeEnvelope ?? [];
+
+    // 0 dB reference line so it's clear where unity is.
+    const zeroLine = document.createElementNS(SVG, "line");
+    zeroLine.setAttribute("x1", "0");
+    zeroLine.setAttribute("x2", String(width));
+    zeroLine.setAttribute("y1", String(dbToY(0, height)));
+    zeroLine.setAttribute("y2", String(dbToY(0, height)));
+    zeroLine.setAttribute("stroke", "rgba(255,255,255,0.18)");
+    zeroLine.setAttribute("stroke-dasharray", "2 3");
+    zeroLine.setAttribute("pointer-events", "none");
+    svg.appendChild(zeroLine);
+
+    const frameToX = (frame: number): number =>
+      Math.max(0, Math.min(width, (frame / clipFrames) * width));
+
+    // Polyline through all breakpoints, extended horizontally past the
+    // first/last so the implicit "hold" before/after is visible. With
+    // zero breakpoints we draw nothing — the click handler still works
+    // and the user gets a fresh start.
+    if (env.length > 0) {
+      const pts: Array<[number, number]> = [];
+      const firstY = dbToY(env[0]!.value, height);
+      pts.push([0, firstY]);
+      for (const bp of env) {
+        pts.push([frameToX(bp.time), dbToY(bp.value, height)]);
+      }
+      const lastY = dbToY(env[env.length - 1]!.value, height);
+      pts.push([width, lastY]);
+      const poly = document.createElementNS(SVG, "polyline");
+      poly.setAttribute("points", pts.map(([x, y]) => `${x},${y}`).join(" "));
+      poly.setAttribute("fill", "none");
+      poly.setAttribute("stroke", "var(--accent)");
+      poly.setAttribute("stroke-width", "1.5");
+      poly.setAttribute("pointer-events", "none");
+      svg.appendChild(poly);
+    }
+
+    // Background hit-area for "click to add". Below the dots so dots
+    // intercept their own events first.
+    const bg = document.createElementNS(SVG, "rect");
+    bg.setAttribute("x", "0");
+    bg.setAttribute("y", "0");
+    bg.setAttribute("width", String(width));
+    bg.setAttribute("height", String(height));
+    bg.setAttribute("fill", "transparent");
+    bg.addEventListener("mousedown", (ev) => {
+      if (ev.button !== 0) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      const rect = svg.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      const time = Math.max(0, Math.min(clipFrames - 1, Math.round((x / width) * clipFrames)));
+      const value = yToDb(y, height);
+      // Insert sorted by time; if a breakpoint already exists at this
+      // exact frame, skip (the engine rejects duplicate times).
+      const next = (clip.volumeEnvelope ?? []).slice();
+      if (next.some((bp) => bp.time === time)) return;
+      next.push({ time, value, curve: "Linear" });
+      next.sort((a, b) => a.time - b.time);
+      void persistEnvelope(trackId, clip.id, next);
+    });
+    svg.appendChild(bg);
+
+    // Dots + per-dot interaction.
+    for (let i = 0; i < env.length; i++) {
+      const bp = env[i]!;
+      const cx = frameToX(bp.time);
+      const cy = dbToY(bp.value, height);
+      const dot = document.createElementNS(SVG, "circle");
+      dot.setAttribute("cx", String(cx));
+      dot.setAttribute("cy", String(cy));
+      dot.setAttribute("r", "4");
+      dot.setAttribute("fill", "var(--accent)");
+      dot.setAttribute("stroke", "var(--bg-0)");
+      dot.setAttribute("stroke-width", "1.5");
+      dot.style.cursor = "grab";
+      dot.addEventListener("mousedown", (ev) => {
+        if (ev.button !== 0) return;
+        ev.stopPropagation();
+        ev.preventDefault();
+        envelopeDrag = {
+          trackId,
+          clipId: clip.id,
+          bpIndex: i,
+          clipDiv: svg.parentElement as HTMLElement,
+          clipFrames,
+        };
+        dot.style.cursor = "grabbing";
+      });
+      dot.addEventListener("dblclick", (ev) => {
+        ev.stopPropagation();
+        ev.preventDefault();
+        const next = (clip.volumeEnvelope ?? []).slice();
+        next.splice(i, 1);
+        void persistEnvelope(trackId, clip.id, next);
+      });
+      svg.appendChild(dot);
+    }
+
+    return svg;
+  };
+
+  const persistEnvelope = async (
+    trackId: number,
+    clipId: number,
+    breakpoints: Breakpoint[],
+  ): Promise<void> => {
+    try {
+      await client.setClipEnvelope(trackId, clipId, "volume", breakpoints);
+      // Update local cache so the redraw shows the new state without
+      // round-tripping through listClips. refresh() would also work but
+      // this keeps the interaction snappy.
+      const list = clipsByTrack.get(trackId) ?? [];
+      const clip = list.find((c) => c.id === clipId);
+      if (clip) clip.volumeEnvelope = breakpoints;
+      drawTracks();
+      rerenderIfPlaying();
+    } catch (err) {
+      setStatus(`envelope persist failed: ${String(err)}`);
+    }
+  };
+
   const drawTracks = (): void => {
     ui.headersCol.innerHTML = "";
     ui.lanesStack.innerHTML = "";
@@ -855,6 +1035,11 @@ export async function mountArranger(
           elt.appendChild(cv);
         }
 
+        if (envelopeMode) {
+          const overlay = renderEnvelopeOverlay(track.id, c, width, innerH);
+          elt.appendChild(overlay);
+        }
+
         // Label: source name with text shadow so it's readable over peaks.
         const label = document.createElement("div");
         label.textContent = src?.name ?? c.sourceId;
@@ -938,18 +1123,33 @@ export async function mountArranger(
   // ---- file load --------------------------------------------------------
 
   ui.fileInput.addEventListener("change", async () => {
-    const file = ui.fileInput.files?.[0];
-    if (!file) return;
-    setStatus(`importing ${file.name}…`);
-    try {
-      const buf = await file.arrayBuffer();
-      const imp = await client.importWav(file.name, new Uint8Array(buf));
-      setStatus(`imported ${file.name} as ${imp.sourceId}`);
-      ui.fileInput.value = "";
-      await refresh();
-      opts.onSourceImported?.();
-    } catch (err) {
-      setStatus(`import failed: ${String(err)}`);
+    const files = Array.from(ui.fileInput.files ?? []);
+    if (files.length === 0) return;
+    let succeeded = 0;
+    const failures: string[] = [];
+    for (const file of files) {
+      setStatus(
+        files.length > 1
+          ? `importing ${file.name} (${succeeded + failures.length + 1}/${files.length})…`
+          : `importing ${file.name}…`,
+      );
+      try {
+        const buf = await file.arrayBuffer();
+        await client.importWav(file.name, new Uint8Array(buf));
+        succeeded++;
+      } catch (err) {
+        failures.push(`${file.name}: ${String(err)}`);
+      }
+    }
+    ui.fileInput.value = "";
+    await refresh();
+    opts.onSourceImported?.();
+    if (failures.length === 0) {
+      setStatus(succeeded === 1 ? `imported ${files[0]!.name}` : `imported ${succeeded} files`);
+    } else if (succeeded === 0) {
+      setStatus(`import failed: ${failures.join("; ")}`);
+    } else {
+      setStatus(`imported ${succeeded}, failed ${failures.length}: ${failures.join("; ")}`);
     }
   });
 
@@ -1043,6 +1243,14 @@ export async function mountArranger(
   ui.modeTimeBtn.addEventListener("click", () => setMode("time"));
   setMode("beats");
 
+  const setEnvelopeMode = (on: boolean): void => {
+    envelopeMode = on;
+    ui.envelopeBtn.style.background = on ? "var(--accent-deep)" : "";
+    ui.envelopeBtn.style.color = on ? "var(--accent)" : "";
+    drawTracks();
+  };
+  ui.envelopeBtn.addEventListener("click", () => setEnvelopeMode(!envelopeMode));
+
   // Populate the snap dropdown and wire it. Changing the snap value
   // redraws tracks so the lane grid + ruler reflect the new resolution.
   for (const opt of SNAP_OPTIONS) {
@@ -1127,6 +1335,40 @@ export async function mountArranger(
   // ---- ruler drag selection / bare-click playhead ----------------------
 
   window.addEventListener("mousemove", (ev) => {
+    // Envelope-breakpoint drag: live-update the breakpoint's time + value,
+    // pin the dot visually, leave persistence to mouseup.
+    if (envelopeDrag) {
+      const list = clipsByTrack.get(envelopeDrag.trackId) ?? [];
+      const clip = list.find((c) => c.id === envelopeDrag!.clipId);
+      const bp = clip?.volumeEnvelope?.[envelopeDrag.bpIndex];
+      if (!clip || !bp) {
+        envelopeDrag = null;
+        return;
+      }
+      const rect = envelopeDrag.clipDiv.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      const w = rect.width;
+      const h = rect.height;
+      const time = Math.max(
+        0,
+        Math.min(envelopeDrag.clipFrames - 1, Math.round((x / w) * envelopeDrag.clipFrames)),
+      );
+      const value = yToDb(y, h);
+      // Don't let two breakpoints share a time.
+      const env = clip.volumeEnvelope ?? [];
+      const collides = env.some(
+        (other, idx) => idx !== envelopeDrag!.bpIndex && other.time === time,
+      );
+      if (collides) {
+        bp.value = value;
+      } else {
+        bp.time = time;
+        bp.value = value;
+      }
+      drawTracks();
+      return;
+    }
     // Clip drag takes precedence — its mousedown stops propagation, but the
     // window-level mousemove still fires, so we branch on which drag is live.
     if (clipDragState) {
@@ -1179,6 +1421,19 @@ export async function mountArranger(
     drawSelection();
   });
   window.addEventListener("mouseup", async () => {
+    if (envelopeDrag) {
+      const ed = envelopeDrag;
+      envelopeDrag = null;
+      const list = clipsByTrack.get(ed.trackId) ?? [];
+      const clip = list.find((c) => c.id === ed.clipId);
+      if (clip) {
+        // Re-sort because the dragged breakpoint may have crossed others
+        // in time. The engine requires strictly-increasing times.
+        const env = (clip.volumeEnvelope ?? []).slice().sort((a, b) => a.time - b.time);
+        await persistEnvelope(ed.trackId, ed.clipId, env);
+      }
+      return;
+    }
     if (clipDragState) {
       const ds = clipDragState;
       clipDragState = null;
@@ -1563,6 +1818,7 @@ interface ArrangerUi {
   zoomInBtn: HTMLButtonElement;
   zoomOutBtn: HTMLButtonElement;
   zoomFitBtn: HTMLButtonElement;
+  envelopeBtn: HTMLButtonElement;
   playBtn: HTMLButtonElement;
   loopBtn: HTMLButtonElement;
   stopBtn: HTMLButtonElement;
@@ -1593,15 +1849,20 @@ function buildUi(root: HTMLElement): ArrangerUi {
   const fileInput = document.createElement("input");
   fileInput.type = "file";
   fileInput.accept = ".wav,audio/wav,audio/x-wav";
+  fileInput.multiple = true;
   fileRow.appendChild(fileInput);
   root.appendChild(fileRow);
 
   // Two-pane: narrow Sources column + tracks pane.
+  // flex: 1 + minHeight: 0 lets the split absorb the arranger's vertical
+  // space; without those, a long source list pushes the transport bar
+  // and status line off the bottom of the viewport.
   const split = document.createElement("div");
   Object.assign(split.style, {
     display: "flex",
     gap: "12px",
-    minHeight: "320px",
+    flex: "1 1 auto",
+    minHeight: "0",
   } satisfies Partial<CSSStyleDeclaration>);
 
   const sourcesPane = document.createElement("div");
@@ -1716,6 +1977,11 @@ function buildUi(root: HTMLElement): ArrangerUi {
   const zoomOutBtn = makeToolbarBtn("−");
   const zoomFitBtn = makeToolbarBtn("Fit");
 
+  const sepEnv = makeSep();
+  const envelopeBtn = makeToolbarBtn("Envelopes");
+  envelopeBtn.title =
+    "Toggle envelope edit mode. Click on a clip to add a volume breakpoint, drag to move, double-click to delete.";
+
   toolbar.appendChild(tracksTitle);
   toolbar.appendChild(addTrackBtn);
   toolbar.appendChild(deleteClipBtn);
@@ -1738,6 +2004,8 @@ function buildUi(root: HTMLElement): ArrangerUi {
   toolbar.appendChild(zoomOutBtn);
   toolbar.appendChild(zoomInBtn);
   toolbar.appendChild(zoomFitBtn);
+  toolbar.appendChild(sepEnv);
+  toolbar.appendChild(envelopeBtn);
   tracksPane.appendChild(toolbar);
 
   // tracks-body: headers column on the left, lanes-scroll on the right.
@@ -1969,6 +2237,7 @@ function buildUi(root: HTMLElement): ArrangerUi {
     zoomInBtn,
     zoomOutBtn,
     zoomFitBtn,
+    envelopeBtn,
     playBtn,
     loopBtn,
     stopBtn,
