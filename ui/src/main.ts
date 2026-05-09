@@ -208,6 +208,22 @@ async function main(): Promise<void> {
   // ---- save / load wiring --------------------------------------------
 
   saveBtn.addEventListener("click", async () => {
+    // Export can take ~30s on a busy project. The status chip is easy to
+    // miss, so we also turn the button itself into a live progress
+    // indicator: disabled, label ticks elapsed seconds, gets a "busy"
+    // background. The button click is a strict mouse target so the user
+    // can't accidentally fire a second export mid-flight either.
+    const originalLabel = saveBtn.textContent ?? "Save .kepz";
+    const originalBg = saveBtn.style.background;
+    const startMs = performance.now();
+    saveBtn.disabled = true;
+    saveBtn.style.background = "var(--accent-deep, #2a3f2a)";
+    const tick = (): void => {
+      const elapsed = Math.floor((performance.now() - startMs) / 1000);
+      saveBtn.textContent = `Saving… ${elapsed}s`;
+    };
+    tick();
+    const tickTimer = window.setInterval(tick, 1000);
     statusContext.textContent = "exporting…";
     try {
       const bytes = await client.exportKepz();
@@ -223,15 +239,35 @@ async function main(): Promise<void> {
       document.body.removeChild(a);
       URL.revokeObjectURL(url);
       statusFile.textContent = filename;
-      statusContext.textContent = `saved (${bytes.byteLength.toLocaleString()} bytes)`;
+      const totalSec = ((performance.now() - startMs) / 1000).toFixed(1);
+      statusContext.textContent =
+        `saved (${bytes.byteLength.toLocaleString()} bytes in ${totalSec}s)`;
     } catch (err) {
       statusContext.textContent = `save failed: ${String(err)}`;
+    } finally {
+      clearInterval(tickTimer);
+      saveBtn.disabled = false;
+      saveBtn.textContent = originalLabel;
+      saveBtn.style.background = originalBg;
     }
   });
 
   loadInput.addEventListener("change", async () => {
     const file = loadInput.files?.[0];
     if (!file) return;
+    // Same in-button progress treatment as Save: load is also slow on
+    // large projects and the bottom status chip is easy to miss.
+    const originalLabel = loadBtn.textContent ?? "Load .kepz";
+    const originalBg = loadBtn.style.background;
+    const startMs = performance.now();
+    loadBtn.disabled = true;
+    loadBtn.style.background = "var(--accent-deep, #2a3f2a)";
+    const tick = (): void => {
+      const elapsed = Math.floor((performance.now() - startMs) / 1000);
+      loadBtn.textContent = `Loading… ${elapsed}s`;
+    };
+    tick();
+    const tickTimer = window.setInterval(tick, 1000);
     statusContext.textContent = `loading ${file.name}…`;
     try {
       const buf = await file.arrayBuffer();
@@ -240,10 +276,15 @@ async function main(): Promise<void> {
       await arranger.refresh();
       await drums.refresh();
       statusFile.textContent = file.name;
-      statusContext.textContent = "loaded";
+      const totalSec = ((performance.now() - startMs) / 1000).toFixed(1);
+      statusContext.textContent = `loaded in ${totalSec}s`;
     } catch (err) {
       statusContext.textContent = `load failed: ${String(err)}`;
     } finally {
+      clearInterval(tickTimer);
+      loadBtn.disabled = false;
+      loadBtn.textContent = originalLabel;
+      loadBtn.style.background = originalBg;
       loadInput.value = "";
     }
   });
