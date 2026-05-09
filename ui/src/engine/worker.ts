@@ -48,6 +48,7 @@ type WasmEngine = {
   setTrackGain: (trackId: bigint, gainDb: number) => void;
   setTrackMute: (trackId: bigint, mute: boolean) => void;
   setTrackSolo: (trackId: bigint, solo: boolean) => void;
+  setTrackName: (trackId: bigint, name: string) => void;
   addClip: (
     trackId: bigint,
     sourceId: string,
@@ -57,6 +58,12 @@ type WasmEngine = {
   ) => bigint;
   listClips: (trackId: bigint) => string | undefined;
   moveClip: (trackId: bigint, clipId: bigint, newPositionFrame: bigint) => void;
+  setClipSourceRange: (
+    trackId: bigint,
+    clipId: bigint,
+    sourceIn: bigint,
+    sourceOut: bigint,
+  ) => void;
   removeClip: (trackId: bigint, clipId: bigint) => boolean;
   mixdownWav: () => Uint8Array;
   exportKepz: () => Uint8Array;
@@ -341,6 +348,12 @@ let playback: PlaybackState | null = null;
           return;
         }
 
+        case "set_track_name": {
+          engine.setTrackName(BigInt(cmd.trackId), cmd.name);
+          send({ kind: "set_track_name_ok", req: cmd.req });
+          return;
+        }
+
         case "add_clip": {
           const clipId = Number(
             engine.addClip(
@@ -372,6 +385,17 @@ let playback: PlaybackState | null = null;
             BigInt(Math.floor(cmd.newPositionFrame)),
           );
           send({ kind: "move_clip_ok", req: cmd.req });
+          return;
+        }
+
+        case "set_clip_source_range": {
+          engine.setClipSourceRange(
+            BigInt(cmd.trackId),
+            BigInt(cmd.clipId),
+            BigInt(Math.floor(cmd.sourceIn)),
+            BigInt(Math.floor(cmd.sourceOut)),
+          );
+          send({ kind: "set_clip_source_range_ok", req: cmd.req });
           return;
         }
 

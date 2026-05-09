@@ -279,6 +279,13 @@ export class EngineClient {
     if (ev.kind !== "set_track_solo_ok") throw new Error("unexpected event");
   }
 
+  async setTrackName(trackId: number, name: string): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_track_name" }>(
+      (req) => ({ kind: "set_track_name", req, trackId, name }),
+    );
+    if (ev.kind !== "set_track_name_ok") throw new Error("unexpected event");
+  }
+
   async addClip(
     trackId: number,
     sourceId: string,
@@ -314,6 +321,18 @@ export class EngineClient {
       (req) => ({ kind: "move_clip", req, trackId, clipId, newPositionFrame }),
     );
     if (ev.kind !== "move_clip_ok") throw new Error("unexpected event");
+  }
+
+  async setClipSourceRange(
+    trackId: number,
+    clipId: number,
+    sourceIn: number,
+    sourceOut: number,
+  ): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_clip_source_range" }>(
+      (req) => ({ kind: "set_clip_source_range", req, trackId, clipId, sourceIn, sourceOut }),
+    );
+    if (ev.kind !== "set_clip_source_range_ok") throw new Error("unexpected event");
   }
 
   async removeClip(trackId: number, clipId: number): Promise<boolean> {

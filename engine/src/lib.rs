@@ -596,6 +596,17 @@ mod wasm_api {
             Ok(())
         }
 
+        #[wasm_bindgen(js_name = setTrackName)]
+        pub fn set_track_name(&mut self, track_id: u64, name: &str) -> Result<(), JsError> {
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            track.name = name.to_string();
+            Ok(())
+        }
+
         #[wasm_bindgen(js_name = setTrackSolo)]
         pub fn set_track_solo(&mut self, track_id: u64, solo: bool) -> Result<(), JsError> {
             let track = self
@@ -818,6 +829,40 @@ mod wasm_api {
                 .ok_or_else(|| JsError::new(&format!("unknown clip {clip_id}")))?;
             let len = clip.track_position.len();
             clip.track_position = SampleRange::new(new_position_frame, new_position_frame + len)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            Ok(())
+        }
+
+        /// Update a clip's source-frame window. The clip's `track_position` is
+        /// resized so its length stays equal to `source_out - source_in` (the
+        /// invariant established at addClip time). Used by the arranger's
+        /// Choke action and any future trim-handle drags.
+        #[wasm_bindgen(js_name = setClipSourceRange)]
+        pub fn set_clip_source_range(
+            &mut self,
+            track_id: u64,
+            clip_id: u64,
+            source_in: u64,
+            source_out: u64,
+        ) -> Result<(), JsError> {
+            if source_out <= source_in {
+                return Err(JsError::new("source_out must be > source_in"));
+            }
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            let clip = track
+                .clips
+                .iter_mut()
+                .find(|c| c.id.0 == clip_id)
+                .ok_or_else(|| JsError::new(&format!("unknown clip {clip_id}")))?;
+            let new_len = source_out - source_in;
+            let pos_start = clip.track_position.start();
+            clip.source_in = source_in;
+            clip.source_out = source_out;
+            clip.track_position = SampleRange::new(pos_start, pos_start + new_len)
                 .map_err(|e| JsError::new(&e.to_string()))?;
             Ok(())
         }

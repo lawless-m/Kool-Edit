@@ -59,6 +59,7 @@ export type EngineCommand =
   | { kind: "set_track_gain"; req: RequestId; trackId: number; gainDb: number }
   | { kind: "set_track_mute"; req: RequestId; trackId: number; mute: boolean }
   | { kind: "set_track_solo"; req: RequestId; trackId: number; solo: boolean }
+  | { kind: "set_track_name"; req: RequestId; trackId: number; name: string }
   | {
       kind: "add_clip";
       req: RequestId;
@@ -75,6 +76,14 @@ export type EngineCommand =
       trackId: number;
       clipId: number;
       newPositionFrame: number;
+    }
+  | {
+      kind: "set_clip_source_range";
+      req: RequestId;
+      trackId: number;
+      clipId: number;
+      sourceIn: number;
+      sourceOut: number;
     }
   | { kind: "remove_clip"; req: RequestId; trackId: number; clipId: number }
   | { kind: "mixdown_wav"; req: RequestId }
@@ -157,9 +166,11 @@ export type EngineEvent =
   | { kind: "set_track_gain_ok"; req: RequestId }
   | { kind: "set_track_mute_ok"; req: RequestId }
   | { kind: "set_track_solo_ok"; req: RequestId }
+  | { kind: "set_track_name_ok"; req: RequestId }
   | { kind: "add_clip_ok"; req: RequestId; clipId: number }
   | { kind: "list_clips_ok"; req: RequestId; json: string }
   | { kind: "move_clip_ok"; req: RequestId }
+  | { kind: "set_clip_source_range_ok"; req: RequestId }
   | { kind: "remove_clip_ok"; req: RequestId; removed: boolean }
   | { kind: "mixdown_wav_ok"; req: RequestId; bytes: Uint8Array }
   | { kind: "export_kepz_ok"; req: RequestId; bytes: Uint8Array }
