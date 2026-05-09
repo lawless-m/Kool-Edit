@@ -65,13 +65,6 @@ type WasmEngine = {
     sourceOut: bigint,
   ) => void;
   removeClip: (trackId: bigint, clipId: bigint) => boolean;
-  spectrogramTile: (
-    sourceId: string,
-    startFrame: bigint,
-    endFrame: bigint,
-    fftSize: number,
-    hopSize: number,
-  ) => Float32Array;
   setClipGroup: (trackId: bigint, clipId: bigint, groupId: bigint) => void;
   listGroups: () => string;
   setGroupName: (groupId: bigint, name: string) => void;
@@ -121,6 +114,13 @@ type WasmEngine = {
     parameter: string,
     breakpointsJson: string,
   ) => void;
+  spectrogramTile: (
+    sourceId: string,
+    startFrame: bigint,
+    endFrame: bigint,
+    fftSize: number,
+    hopSize: number,
+  ) => Float32Array;
 };
 
 type EngineModule = {
