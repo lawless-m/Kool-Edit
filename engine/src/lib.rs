@@ -126,6 +126,63 @@ mod wasm_api {
             Some(flat.into_boxed_slice())
         }
 
+        /// Compute STFT magnitudes for a source range, returning a flat
+        /// row-major buffer of `frame_count * bin_count` values, where
+        /// `bin_count = fft_size/2 + 1` (positive bins only) and
+        /// `frame_count = (end - start) / hop_size + 1`. Multichannel
+        /// sources are mixed to mono before analysis. Magnitudes are linear
+        /// (not log); the UI applies its own dB / colour mapping.
+        #[wasm_bindgen(js_name = spectrogramTile)]
+        pub fn spectrogram_tile(
+            &self,
+            source_id: &str,
+            start_frame: u64,
+            end_frame: u64,
+            fft_size: u32,
+            hop_size: u32,
+        ) -> Result<Box<[f32]>, JsError> {
+            use crate::stft::Stft;
+            if fft_size == 0 || hop_size == 0 || hop_size > fft_size {
+                return Err(JsError::new("invalid stft params"));
+            }
+            let id = SourceId::new(source_id);
+            let range = SampleRange::new(start_frame, end_frame)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let samples = self
+                .inner
+                .query_samples(&id, range)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let channels = self
+                .inner
+                .source_channel_count(&id)
+                .ok_or_else(|| JsError::new("unknown source"))?;
+            let mono: Vec<f32> = if channels == 1 {
+                samples
+            } else {
+                let ch = channels as usize;
+                let frames = samples.len() / ch;
+                (0..frames)
+                    .map(|f| {
+                        let mut s = 0.0_f32;
+                        for c in 0..ch {
+                            s += samples[f * ch + c];
+                        }
+                        s / ch as f32
+                    })
+                    .collect()
+            };
+            let stft = Stft::new_hann(fft_size as usize, hop_size as usize);
+            let frames = stft.analyze(&mono);
+            let bin_count = fft_size as usize / 2 + 1;
+            let mut out = Vec::with_capacity(frames.len() * bin_count);
+            for frame in &frames {
+                for k in 0..bin_count {
+                    out.push(frame[k].norm());
+                }
+            }
+            Ok(out.into_boxed_slice())
+        }
+
         #[wasm_bindgen(js_name = sourceFrameCount)]
         pub fn source_frame_count(&self, source_id: &str) -> Option<u64> {
             self.inner.source_frame_count(&SourceId::new(source_id))

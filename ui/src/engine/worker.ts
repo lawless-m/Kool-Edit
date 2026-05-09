@@ -65,6 +65,13 @@ type WasmEngine = {
     sourceOut: bigint,
   ) => void;
   removeClip: (trackId: bigint, clipId: bigint) => boolean;
+  spectrogramTile: (
+    sourceId: string,
+    startFrame: bigint,
+    endFrame: bigint,
+    fftSize: number,
+    hopSize: number,
+  ) => Float32Array;
   setClipGroup: (trackId: bigint, clipId: bigint, groupId: bigint) => void;
   listGroups: () => string;
   setGroupName: (groupId: bigint, name: string) => void;
@@ -585,6 +592,28 @@ let playback: PlaybackState | null = null;
             BigInt(Math.floor(cmd.endFrame)),
           );
           send({ kind: "query_samples_ok", req: cmd.req, samples, channels: ch });
+          return;
+        }
+
+        case "spectrogram_tile": {
+          const start = BigInt(Math.floor(cmd.startFrame));
+          const end = BigInt(Math.floor(cmd.endFrame));
+          const magnitudes = engine.spectrogramTile(
+            cmd.sourceId,
+            start,
+            end,
+            cmd.fftSize,
+            cmd.hopSize,
+          );
+          const binCount = (cmd.fftSize >>> 1) + 1;
+          const frameCount = magnitudes.length / binCount;
+          send({
+            kind: "spectrogram_tile_ok",
+            req: cmd.req,
+            magnitudes,
+            frameCount,
+            binCount,
+          });
           return;
         }
       }

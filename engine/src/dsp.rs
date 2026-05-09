@@ -23,6 +23,7 @@ use crate::op::{
     FadeDirection, FadeShape, GeneratorParams, NoiseColor, NormTarget, Op, ToneShape,
 };
 use crate::range::SampleRange;
+use crate::spectral::{SpectralOp, StftParams, TimeFreqRegion, WindowKind};
 use crate::stft::Stft;
 
 #[derive(Debug)]
@@ -112,7 +113,11 @@ pub fn apply(
         Op::PasteMix { .. } => Err(DspError::Unsupported("PasteMix")),
         Op::PasteOver { .. } => Err(DspError::Unsupported("PasteOver")),
         Op::NoiseReduce { .. } => Err(DspError::Unsupported("NoiseReduce")),
-        Op::SpectralEdit { .. } => Err(DspError::Unsupported("SpectralEdit")),
+        Op::SpectralEdit {
+            region,
+            operation,
+            stft,
+        } => spectral_edit(buffer, channels, sample_rate, region, operation, *stft),
     }
 }
 
@@ -2033,6 +2038,227 @@ fn fade_gain(t: f32, shape: FadeShape, direction: FadeDirection) -> f32 {
     }
 }
 
+/// Apply a [`SpectralOp`] to the bins inside a time–frequency rectangle.
+///
+/// The operation runs per channel: deinterleave, STFT-analyse, modify the
+/// frames whose centre falls inside `region.time` and the bins inside the
+/// frequency range, STFT-synthesise, reinterleave back. Frame centres are
+/// `f * hop + fft_size/2`; bin `k` is at `k * sample_rate / fft_size` Hz.
+/// Conjugate-mirror bins are kept consistent so the synthesised output is
+/// real.
+///
+/// Per spec 01, only Hann windows are used for spectral edits in v1; the
+/// `WindowKind` field of the `StftParams` is honoured but the alternative
+/// kinds aren't wired up yet.
+fn spectral_edit(
+    buffer: &mut Vec<f32>,
+    channels: u16,
+    sample_rate: u32,
+    region: &TimeFreqRegion,
+    operation: &SpectralOp,
+    params: StftParams,
+) -> Result<(), DspError> {
+    let TimeFreqRegion::Rect {
+        time,
+        freq_low_hz,
+        freq_high_hz,
+    } = region;
+
+    let ch = channels as usize;
+    if ch == 0 {
+        return Ok(());
+    }
+    let total_frames = buffer.len() / ch;
+    if time.end() > total_frames as u64 {
+        return Err(DspError::RangeOutsideBuffer {
+            range: *time,
+            frames: total_frames as u64,
+        });
+    }
+    if time.is_empty() {
+        return Ok(());
+    }
+
+    let fft_size = params.fft_size as usize;
+    let hop_size = params.hop_size as usize;
+    if fft_size == 0 || hop_size == 0 || hop_size > fft_size {
+        return Err(DspError::Unsupported("invalid STFT params"));
+    }
+    // Hann is the only window currently implemented in `Stft`. Accepting
+    // other variants here would silently lie about the analysis.
+    if !matches!(params.window, WindowKind::Hann) {
+        return Err(DspError::Unsupported("non-Hann spectral window"));
+    }
+
+    // Clamp the freq range into [0, Nyquist] before bin conversion so a
+    // selection that extends past Nyquist (or below DC) doesn't fold back.
+    let nyquist_hz = sample_rate as f32 / 2.0;
+    let (low, high) = if freq_low_hz <= freq_high_hz {
+        (*freq_low_hz, *freq_high_hz)
+    } else {
+        (*freq_high_hz, *freq_low_hz)
+    };
+    let low = low.max(0.0);
+    let high = high.min(nyquist_hz);
+    if high < low {
+        return Ok(());
+    }
+    let nyquist_bin = fft_size / 2;
+    let bin_low = ((low * fft_size as f32 / sample_rate as f32).ceil() as i64)
+        .clamp(0, nyquist_bin as i64) as usize;
+    let bin_high = ((high * fft_size as f32 / sample_rate as f32).floor() as i64)
+        .clamp(0, nyquist_bin as i64) as usize;
+    if bin_low > bin_high {
+        return Ok(());
+    }
+
+    let stft = Stft::new_hann(fft_size, hop_size);
+    let half = fft_size / 2;
+    let t_start = time.start() as usize;
+    let t_end = time.end() as usize;
+
+    for c in 0..ch {
+        let mono: Vec<f32> = (0..total_frames).map(|i| buffer[i * ch + c]).collect();
+        let mut frames = stft.analyze(&mono);
+        if frames.is_empty() {
+            continue;
+        }
+
+        // First and last selected frame indices, by frame centre.
+        let mut first: Option<usize> = None;
+        let mut last: Option<usize> = None;
+        for (f, _) in frames.iter().enumerate() {
+            let centre = f * hop_size + half;
+            if centre >= t_start && centre < t_end {
+                first.get_or_insert(f);
+                last = Some(f);
+            }
+        }
+        let (first, last) = match (first, last) {
+            (Some(a), Some(b)) => (a, b),
+            _ => continue,
+        };
+
+        match operation {
+            SpectralOp::Silence => {
+                for f in first..=last {
+                    edit_bin_band(&mut frames[f], bin_low, bin_high, fft_size, |_| {
+                        Complex::new(0.0, 0.0)
+                    });
+                }
+            }
+            SpectralOp::Attenuate { db } | SpectralOp::Amplify { db } => {
+                let g = db_to_linear(*db);
+                for f in first..=last {
+                    edit_bin_band(&mut frames[f], bin_low, bin_high, fft_size, |b| b * g);
+                }
+            }
+            SpectralOp::Repair => {
+                // Linear magnitude interpolation across the selection (the
+                // v1 spec). Endpoints are the first frame outside the range
+                // on each side; if an endpoint is missing (selection
+                // touches the buffer edge) the other side is reused.
+                //
+                // Phase: when both endpoints exist, derive the per-frame
+                // phase step from the actual phase difference between them,
+                // unwrapped to the integer multiple of 2π closest to the
+                // bin's nominal advance (`2π·k·hop/fft_size`). This is the
+                // phase-vocoder estimate of the true sinusoid frequency in
+                // that bin and it stops adjacent repaired frames from
+                // self-cancelling under overlap-add. With only one
+                // endpoint we fall back to the nominal advance; with
+                // neither, phase is zero (magnitude is zero anyway).
+                let pre_idx = if first > 0 { Some(first - 1) } else { None };
+                let post_idx = if last + 1 < frames.len() {
+                    Some(last + 1)
+                } else {
+                    None
+                };
+                let span = (last - first + 2) as f32;
+                let two_pi = std::f32::consts::TAU;
+                for k in bin_low..=bin_high {
+                    let pre_mag = pre_idx.map(|p| frames[p][k].norm());
+                    let post_mag = post_idx.map(|p| frames[p][k].norm());
+                    let (pre_mag, post_mag) = match (pre_mag, post_mag) {
+                        (Some(a), Some(b)) => (a, b),
+                        (Some(a), None) => (a, a),
+                        (None, Some(b)) => (b, b),
+                        (None, None) => (0.0, 0.0),
+                    };
+                    let nominal_step =
+                        two_pi * k as f32 * hop_size as f32 / fft_size as f32;
+                    let pre_phase = pre_idx.map(|p| frames[p][k].arg());
+                    let post_phase = post_idx.map(|p| frames[p][k].arg());
+                    let (anchor_phase, per_frame_step) = match (pre_phase, post_phase, pre_idx, post_idx) {
+                        (Some(pp), Some(qp), Some(pi), Some(qi)) => {
+                            let n = (qi - pi) as f32;
+                            let expected_total = nominal_step * n;
+                            let raw_diff = qp - pp;
+                            let m = ((expected_total - raw_diff) / two_pi).round();
+                            let unwrapped = raw_diff + two_pi * m;
+                            (pp, unwrapped / n)
+                        }
+                        (Some(pp), None, _, _) => (pp, nominal_step),
+                        (None, Some(qp), _, Some(qi)) => {
+                            // Anchor at the post side, walk backwards.
+                            let steps_back = (qi as i64 - first as i64) as f32;
+                            (qp - nominal_step * steps_back, nominal_step)
+                        }
+                        _ => (0.0, nominal_step),
+                    };
+                    for f in first..=last {
+                        let t = (f - first + 1) as f32 / span;
+                        let target_mag = pre_mag * (1.0 - t) + post_mag * t;
+                        // Always synthesise phase: in real use the
+                        // pre-existing phase inside the selection is
+                        // whatever artefact is being repaired (silence,
+                        // a click, leakage), not a meaningful continuation
+                        // of the tone. Using the phase-vocoder trajectory
+                        // keeps the repaired frames coherent.
+                        let steps = (f as i64
+                            - pre_idx.map(|p| p as i64).unwrap_or(first as i64 - 1))
+                            as f32;
+                        let phase = anchor_phase + per_frame_step * steps;
+                        let new = Complex::from_polar(target_mag, phase);
+                        frames[f][k] = new;
+                        if k > 0 && k * 2 < fft_size {
+                            frames[f][fft_size - k] = new.conj();
+                        }
+                    }
+                }
+            }
+        }
+
+        let processed = stft.synthesize(&frames, mono.len());
+        for i in 0..total_frames {
+            buffer[i * ch + c] = processed[i];
+        }
+    }
+    Ok(())
+}
+
+/// Apply `op` to bins `[bin_low..=bin_high]` of one frame, mirroring the
+/// result onto each bin's conjugate partner so the synthesised signal
+/// remains real.
+fn edit_bin_band<F>(
+    frame: &mut [Complex<f32>],
+    bin_low: usize,
+    bin_high: usize,
+    fft_size: usize,
+    op: F,
+) where
+    F: Fn(Complex<f32>) -> Complex<f32>,
+{
+    for k in bin_low..=bin_high {
+        let new = op(frame[k]);
+        frame[k] = new;
+        // DC (k=0) and Nyquist (k=fft_size/2) are their own mirrors.
+        if k > 0 && k * 2 < fft_size {
+            frame[fft_size - k] = new.conj();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3616,5 +3842,260 @@ mod tests {
         let body = &samples[4096..samples.len() - 4096];
         let f = dominant_freq(body, fs);
         assert!((f - 440.0).abs() < 4.0, "expected ~440 Hz, got {f}");
+    }
+
+    fn rect_region(start: u64, end: u64, low_hz: f32, high_hz: f32) -> TimeFreqRegion {
+        TimeFreqRegion::Rect {
+            time: r(start, end),
+            freq_low_hz: low_hz,
+            freq_high_hz: high_hz,
+        }
+    }
+
+    /// Hold the project default STFT params steady across spectral tests so a
+    /// regression in `StftParams::DEFAULT` doesn't silently alter expectations.
+    fn default_stft() -> StftParams {
+        StftParams::DEFAULT
+    }
+
+    #[test]
+    fn spectral_silence_removes_tone_in_band_and_time() {
+        // 1 kHz tone over 16384 frames at 48 kHz; silence the middle slice
+        // in a band straddling 1 kHz. The selected region should drop way
+        // below the original RMS while the unselected tail survives.
+        let fs = 48_000;
+        let total = 16_384_u64;
+        let mut samples = sine_at(1_000.0, fs, total as usize, 0.0);
+        let dry = samples.clone();
+        let sel_start = 6_000_u64;
+        let sel_end = 10_000_u64;
+        apply(
+            &Op::SpectralEdit {
+                region: rect_region(sel_start, sel_end, 800.0, 1_200.0),
+                operation: SpectralOp::Silence,
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+
+        // Use an interior slice of the selection that is more than fft_size
+        // from either edit boundary, so OLA bleed from windows that extend
+        // outside the selection doesn't dominate.
+        let inner_lo = (sel_start as usize) + 2_500;
+        let inner_hi = (sel_end as usize) - 100;
+        let inside = &samples[inner_lo..inner_hi];
+        let inside_dry = &dry[inner_lo..inner_hi];
+        let attenuation = rms_ratio_db(inside, inside_dry);
+        // Window leakage limits how cleanly a narrow band can be silenced;
+        // -18 dB is the realistic floor for a 400 Hz selection at fft 2048.
+        assert!(
+            attenuation < -18.0,
+            "expected strong attenuation inside selection, got {attenuation} dB"
+        );
+
+        // Tail well past the selection end (and past the analysis window
+        // length) should retain the tone close to its original level.
+        let tail = &samples[(sel_end as usize) + 2_500..total as usize];
+        let tail_dry = &dry[(sel_end as usize) + 2_500..total as usize];
+        let preserved = rms_ratio_db(tail, tail_dry);
+        assert!(
+            preserved > -1.0,
+            "tail outside selection should be intact, got {preserved} dB"
+        );
+    }
+
+    #[test]
+    fn spectral_silence_outside_band_preserves_tone() {
+        // Silencing 4–6 kHz must not touch a 1 kHz tone.
+        let fs = 48_000;
+        let total = 8_192_usize;
+        let mut samples = sine_at(1_000.0, fs, total, 0.0);
+        let dry = samples.clone();
+        apply(
+            &Op::SpectralEdit {
+                region: rect_region(0, total as u64, 4_000.0, 6_000.0),
+                operation: SpectralOp::Silence,
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        // Compare interior to skip COLA edges.
+        let body = &samples[2_048..total - 2_048];
+        let body_dry = &dry[2_048..total - 2_048];
+        let preserved = rms_ratio_db(body, body_dry);
+        assert!(
+            preserved > -0.5,
+            "out-of-band silence should leave tone intact, got {preserved} dB"
+        );
+    }
+
+    #[test]
+    fn spectral_attenuate_reduces_by_roughly_db() {
+        // Attenuate by -12 dB in a band covering 1 kHz across the whole
+        // time range. The interior RMS should drop by ~12 dB (within a
+        // window-leakage tolerance).
+        let fs = 48_000;
+        let total = 8_192_usize;
+        let mut samples = sine_at(1_000.0, fs, total, 0.0);
+        let dry = samples.clone();
+        apply(
+            &Op::SpectralEdit {
+                region: rect_region(0, total as u64, 800.0, 1_200.0),
+                operation: SpectralOp::Attenuate { db: -12.0 },
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let body = &samples[2_048..total - 2_048];
+        let body_dry = &dry[2_048..total - 2_048];
+        let delta = rms_ratio_db(body, body_dry);
+        assert!(
+            (delta + 12.0).abs() < 2.0,
+            "expected ~-12 dB, got {delta} dB"
+        );
+    }
+
+    #[test]
+    fn spectral_repair_recovers_more_level_than_silence_alone() {
+        // After silencing a band-limited middle slice, applying Repair
+        // should bring the level back up — not necessarily to dry (the
+        // boundary frames analysis sees are themselves degraded by the
+        // silence), but materially above the silenced floor. This is the
+        // observable promise of v1 linear-magnitude repair.
+        let fs = 48_000;
+        let total = 16_384_u64;
+        let mut samples = sine_at(1_000.0, fs, total as usize, 0.0);
+        let dry = samples.clone();
+        let sel_start = 7_000_u64;
+        let sel_end = 9_000_u64;
+        let region = rect_region(sel_start, sel_end, 800.0, 1_200.0);
+        apply(
+            &Op::SpectralEdit {
+                region: region.clone(),
+                operation: SpectralOp::Silence,
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+
+        let mid_lo = (sel_start as usize) + 600;
+        let mid_hi = (sel_end as usize) - 100;
+        let inside_dry = &dry[mid_lo..mid_hi];
+        let silenced_level = rms_ratio_db(&samples[mid_lo..mid_hi], inside_dry);
+
+        apply(
+            &Op::SpectralEdit {
+                region,
+                operation: SpectralOp::Repair,
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let repaired_level = rms_ratio_db(&samples[mid_lo..mid_hi], inside_dry);
+
+        assert!(
+            repaired_level > silenced_level + 6.0,
+            "repair should lift the level by >6 dB (was {silenced_level} dB, now {repaired_level} dB)"
+        );
+    }
+
+    #[test]
+    fn spectral_repair_on_clean_audio_is_near_no_op() {
+        // Repair applied to an undamaged region should leave the signal
+        // close to its original level — the per-frame magnitude
+        // interpolation is taken from clean neighbours and the synthesised
+        // phase trajectory tracks the bin's true frequency.
+        let fs = 48_000;
+        let total = 8_192_usize;
+        let mut samples = sine_at(1_000.0, fs, total, 0.0);
+        let dry = samples.clone();
+        apply(
+            &Op::SpectralEdit {
+                region: rect_region(3_000, 5_000, 800.0, 1_200.0),
+                operation: SpectralOp::Repair,
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap();
+        let body = &samples[2_048..total - 2_048];
+        let body_dry = &dry[2_048..total - 2_048];
+        let delta = rms_ratio_db(body, body_dry);
+        assert!(
+            delta.abs() < 3.0,
+            "clean-region repair should be near no-op, got {delta} dB"
+        );
+    }
+
+    #[test]
+    fn spectral_edit_stereo_processes_both_channels() {
+        // Same edit on a stereo buffer: silence in band on a 1 kHz tone in
+        // both channels. Both interiors must drop together — a bug treating
+        // the buffer as mono would leave the second channel intact.
+        let fs = 48_000;
+        let total = 8_192_usize;
+        let mono = sine_at(1_000.0, fs, total, 0.0);
+        let mut stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
+        let dry = stereo.clone();
+        apply(
+            &Op::SpectralEdit {
+                region: rect_region(0, total as u64, 800.0, 1_200.0),
+                operation: SpectralOp::Silence,
+                stft: default_stft(),
+            },
+            &mut stereo,
+            2,
+            fs,
+        )
+        .unwrap();
+        let body_lo = 2_048 * 2;
+        let body_hi = (total - 2_048) * 2;
+        let l_out: Vec<f32> = stereo[body_lo..body_hi].iter().step_by(2).copied().collect();
+        let r_out: Vec<f32> = stereo[body_lo + 1..body_hi]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect();
+        let l_dry: Vec<f32> = dry[body_lo..body_hi].iter().step_by(2).copied().collect();
+        let r_dry: Vec<f32> = dry[body_lo + 1..body_hi].iter().step_by(2).copied().collect();
+        let dl = rms_ratio_db(&l_out, &l_dry);
+        let dr = rms_ratio_db(&r_out, &r_dry);
+        assert!(dl < -25.0, "left should be silenced, got {dl} dB");
+        assert!(dr < -25.0, "right should be silenced, got {dr} dB");
+    }
+
+    #[test]
+    fn spectral_edit_rejects_time_range_past_buffer() {
+        let fs = 48_000;
+        let mut samples = vec![0.0_f32; 1_024];
+        let err = apply(
+            &Op::SpectralEdit {
+                region: rect_region(500, 5_000, 0.0, 24_000.0),
+                operation: SpectralOp::Silence,
+                stft: default_stft(),
+            },
+            &mut samples,
+            1,
+            fs,
+        )
+        .unwrap_err();
+        assert!(matches!(err, DspError::RangeOutsideBuffer { .. }));
     }
 }

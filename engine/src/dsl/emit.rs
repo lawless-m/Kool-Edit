@@ -281,7 +281,41 @@ impl<'a> Emitter<'a> {
             | Op::PasteOver { .. } => {
                 return Err(EmitError::Unsupported("clipboard ops"));
             }
-            Op::SpectralEdit { .. } => return Err(EmitError::Unsupported("spectral edit")),
+            Op::SpectralEdit {
+                region,
+                operation,
+                stft,
+            } => {
+                if *stft != crate::spectral::StftParams::DEFAULT {
+                    return Err(EmitError::Unsupported("non-default spectral stft params"));
+                }
+                let crate::spectral::TimeFreqRegion::Rect {
+                    time,
+                    freq_low_hz,
+                    freq_high_hz,
+                } = region;
+                let (op_name, amount) = match operation {
+                    crate::spectral::SpectralOp::Silence => ("silence", None),
+                    crate::spectral::SpectralOp::Repair => ("repair", None),
+                    crate::spectral::SpectralOp::Attenuate { db } => ("attenuate", Some(*db)),
+                    crate::spectral::SpectralOp::Amplify { db } => ("amplify", Some(*db)),
+                };
+                // Spaces around the dash so the lexer doesn't fold the
+                // upper bound into a negative literal.
+                let band = format!(
+                    "band:{} - {}",
+                    fmt_float(*freq_low_hz),
+                    fmt_float(*freq_high_hz)
+                );
+                let amount_part = match amount {
+                    Some(db) => format!("  amount:{}", fmt_db(db)),
+                    None => String::new(),
+                };
+                self.line(&format!(
+                    "{}  spectral {op_name}  {band}{amount_part}  stft:default",
+                    fmt_range(*time, sample_rate),
+                ));
+            }
             Op::Autotune { .. } => return Err(EmitError::Unsupported("autotune")),
         }
         Ok(())
@@ -1142,21 +1176,118 @@ mod tests {
 
     #[test]
     fn unsupported_features_report_clear_errors() {
-        use crate::spectral::{SpectralOp, StftParams, TimeFreqRegion};
+        use crate::effect::{AutotuneParams, AutotuneScale, AutotuneTarget};
         let mut p = Project::new(96_000);
         let mut s = fixture_source("src_a", 100, 96_000);
-        s.edits.apply(Op::SpectralEdit {
-            region: TimeFreqRegion::Rect {
-                time: SampleRange::new(0, 100).unwrap(),
-                freq_low_hz: 1_000.0,
-                freq_high_hz: 4_000.0,
+        s.edits.apply(Op::Autotune {
+            range: SampleRange::new(0, 100).unwrap(),
+            params: AutotuneParams {
+                target: AutotuneTarget::Scale {
+                    scale: AutotuneScale::Major,
+                    key_pc: 0,
+                },
+                retune_ms: 20.0,
+                preserve_formants: true,
             },
-            operation: SpectralOp::Silence,
-            stft: StftParams::DEFAULT,
         });
         p.sources.insert(s.id.clone(), s);
         let err = project_to_dsl(&p).unwrap_err();
         assert!(matches!(err, EmitError::Unsupported(_)));
+    }
+
+    #[test]
+    fn spectral_edit_round_trips_through_dsl() {
+        use crate::dsl::parse::parse_project;
+        use crate::spectral::{SpectralOp, StftParams, TimeFreqRegion};
+        let mut p = Project::new(48_000);
+        let mut s = fixture_source("src_a", 48_000 * 4, 48_000);
+        let region = TimeFreqRegion::Rect {
+            time: SampleRange::new(48_000, 48_000 * 2).unwrap(),
+            freq_low_hz: 2_400.0,
+            freq_high_hz: 3_800.0,
+        };
+        s.edits.apply(Op::SpectralEdit {
+            region: region.clone(),
+            operation: SpectralOp::Attenuate { db: -18.0 },
+            stft: StftParams::DEFAULT,
+        });
+        s.edits.apply(Op::SpectralEdit {
+            region: region.clone(),
+            operation: SpectralOp::Silence,
+            stft: StftParams::DEFAULT,
+        });
+        s.edits.apply(Op::SpectralEdit {
+            region: region.clone(),
+            operation: SpectralOp::Repair,
+            stft: StftParams::DEFAULT,
+        });
+        s.edits.apply(Op::SpectralEdit {
+            region,
+            operation: SpectralOp::Amplify { db: 6.0 },
+            stft: StftParams::DEFAULT,
+        });
+        p.sources.insert(s.id.clone(), s);
+
+        let dsl = project_to_dsl(&p).unwrap();
+        assert!(dsl.contains("spectral attenuate"), "missing attenuate:\n{dsl}");
+        assert!(dsl.contains("spectral silence"), "missing silence:\n{dsl}");
+        assert!(dsl.contains("spectral repair"), "missing repair:\n{dsl}");
+        assert!(dsl.contains("spectral amplify"), "missing amplify:\n{dsl}");
+        assert!(dsl.contains("band:2400 - 3800"), "missing band:\n{dsl}");
+        assert!(dsl.contains("amount:-18dB"), "missing attenuate amount:\n{dsl}");
+        assert!(dsl.contains("amount:+6dB"), "missing amplify amount:\n{dsl}");
+        assert!(dsl.contains("stft:default"), "missing stft:default:\n{dsl}");
+
+        let parsed = parse_project(&dsl).unwrap();
+        let parsed_src = parsed.sources.values().next().unwrap();
+        let ops: Vec<&Op> = parsed_src.edits.active().collect();
+        assert_eq!(ops.len(), 4);
+        assert!(matches!(
+            ops[0],
+            Op::SpectralEdit {
+                operation: SpectralOp::Attenuate { db },
+                ..
+            } if (db - -18.0).abs() < 1e-3
+        ));
+        assert!(matches!(
+            ops[1],
+            Op::SpectralEdit {
+                operation: SpectralOp::Silence,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[2],
+            Op::SpectralEdit {
+                operation: SpectralOp::Repair,
+                ..
+            }
+        ));
+        assert!(matches!(
+            ops[3],
+            Op::SpectralEdit {
+                operation: SpectralOp::Amplify { db },
+                ..
+            } if (db - 6.0).abs() < 1e-3
+        ));
+        for op in &ops {
+            if let Op::SpectralEdit {
+                region: TimeFreqRegion::Rect {
+                    freq_low_hz,
+                    freq_high_hz,
+                    time,
+                },
+                stft,
+                ..
+            } = op
+            {
+                assert!((freq_low_hz - 2_400.0).abs() < 1e-3);
+                assert!((freq_high_hz - 3_800.0).abs() < 1e-3);
+                assert_eq!(time.start(), 48_000);
+                assert_eq!(time.end(), 96_000);
+                assert_eq!(stft, &StftParams::DEFAULT);
+            }
+        }
     }
 
     #[test]

@@ -602,6 +602,35 @@ export class EngineClient {
     return { samples: ev.samples, channels: ev.channels };
   }
 
+  /** Compute STFT magnitudes for a source range. Returns row-major
+   *  `frameCount × binCount` linear magnitudes; the caller maps to dB and
+   *  paints. */
+  async spectrogramTile(
+    sourceId: string,
+    startFrame: number,
+    endFrame: number,
+    fftSize: number,
+    hopSize: number,
+  ): Promise<{ magnitudes: Float32Array; frameCount: number; binCount: number }> {
+    const ev = await this.request<EngineCommand & { kind: "spectrogram_tile" }>(
+      (req) => ({
+        kind: "spectrogram_tile",
+        req,
+        sourceId,
+        startFrame,
+        endFrame,
+        fftSize,
+        hopSize,
+      }),
+    );
+    if (ev.kind !== "spectrogram_tile_ok") throw new Error("unexpected event");
+    return {
+      magnitudes: ev.magnitudes,
+      frameCount: ev.frameCount,
+      binCount: ev.binCount,
+    };
+  }
+
   terminate(): void {
     this.worker.terminate();
     this.pending.clear();

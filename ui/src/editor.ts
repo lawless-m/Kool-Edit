@@ -7,6 +7,7 @@
 import type { EngineClient, NoiseProfileInfo, SourceInfo } from "./engine/client";
 import type { Playback } from "./audio/playback";
 import { drawWaveform } from "./waveform";
+import { drawSpectrogram } from "./spectrogram";
 
 interface Selection {
   inFrame: number; // source-native frames
@@ -54,6 +55,13 @@ export async function mountEditor(
   let playheadRaf: number | null = null;
   let pendingPeakRequest = 0; // race guard for in-flight peakSummary calls
   let cachedPeaks: Float32Array | null = null;
+  let viewMode: "waveform" | "spectral" = "waveform";
+  let cachedSpectrogram: {
+    magnitudes: Float32Array;
+    frameCount: number;
+    binCount: number;
+  } | null = null;
+  let pendingSpectrogramRequest = 0;
   let sources: SourceInfo[] = [];
   let noiseProfiles: NoiseProfileInfo[] = [];
 
@@ -193,6 +201,10 @@ export async function mountEditor(
 
   const redrawWaveform = async (): Promise<void> => {
     if (!currentSourceId || sourceFrameCount === 0) return;
+    if (viewMode === "spectral") {
+      await fetchSpectrogram();
+      return;
+    }
     const reqId = ++pendingPeakRequest;
     const peaks = await client.peakSummary(
       currentSourceId,
@@ -206,8 +218,42 @@ export async function mountEditor(
   };
 
   const drawCachedWaveform = (): void => {
+    if (viewMode === "spectral") {
+      if (cachedSpectrogram) {
+        drawSpectrogram(
+          ui.canvas,
+          cachedSpectrogram.magnitudes,
+          cachedSpectrogram.frameCount,
+          cachedSpectrogram.binCount,
+        );
+      }
+      return;
+    }
     if (!cachedPeaks) return;
     drawWaveform(ui.canvas, cachedPeaks);
+  };
+
+  const fetchSpectrogram = async (): Promise<void> => {
+    if (!currentSourceId || viewport.endFrame <= viewport.startFrame) return;
+    const reqId = ++pendingSpectrogramRequest;
+    // Hop ≈ viewport_frames / canvas_width keeps us at roughly one STFT
+    // frame per pixel column — finer is wasted, coarser leaves visible
+    // smearing. Hop is rounded to a power-of-two-ish step so the engine's
+    // FFT planner stays cache-friendly.
+    const viewportLen = viewport.endFrame - viewport.startFrame;
+    const fftSize = 2048;
+    const desiredHop = Math.max(64, Math.round(viewportLen / Math.max(1, ui.canvas.width)));
+    const hopSize = Math.min(fftSize, Math.max(64, 1 << Math.round(Math.log2(desiredHop))));
+    const tile = await client.spectrogramTile(
+      currentSourceId,
+      viewport.startFrame,
+      viewport.endFrame,
+      fftSize,
+      hopSize,
+    );
+    if (reqId !== pendingSpectrogramRequest) return;
+    cachedSpectrogram = tile;
+    drawCachedWaveform();
   };
 
   // ---- canvas drawing ---------------------------------------------------
@@ -864,6 +910,18 @@ export async function mountEditor(
     fn();
     commitSelectionToPlayback();
   };
+  ui.viewModeSelect.addEventListener("change", () => {
+    const v = ui.viewModeSelect.value;
+    viewMode = v === "spectral" ? "spectral" : "waveform";
+    if (viewMode === "waveform") {
+      cachedSpectrogram = null;
+    } else {
+      cachedPeaks = null;
+    }
+    void redrawWaveform();
+    redrawOverlay();
+  });
+
   ui.inInput.addEventListener("change", wrapCommit(onTimeInputChange("in")));
   ui.outInput.addEventListener("change", wrapCommit(onTimeInputChange("out")));
   ui.inMinus.addEventListener("click", wrapCommit(() => trim("in", -TRIM_NUDGE_MS)));
@@ -1162,13 +1220,14 @@ export async function mountEditor(
   // uses a fixed set of three bands, Generate inserts at a position
   // rather than processing a range, and NoiseReduce is a two-stage
   // capture-then-apply workflow that needs the project's profile list.
-  for (const id of ["Eq", "Generate", "NoiseReduce", "Autotune"]) {
+  for (const id of ["Eq", "Generate", "NoiseReduce", "Autotune", "Spectral"]) {
     const opt = document.createElement("option");
     opt.value = id;
     const labels: Record<string, string> = {
       Eq: "EQ",
       Generate: "Generate",
       NoiseReduce: "Noise Reduction",
+      Spectral: "Spectral Edit",
     };
     opt.textContent = labels[id] ?? id;
     ui.fxKindSelect.appendChild(opt);
@@ -1222,6 +1281,14 @@ export async function mountEditor(
     amountDb: HTMLInputElement;
     floorDb: HTMLInputElement;
     oversub: HTMLInputElement;
+  } | null = null;
+
+  let spectralInputs: {
+    op: HTMLSelectElement;
+    lowHz: HTMLInputElement;
+    highHz: HTMLInputElement;
+    amountDb: HTMLInputElement;
+    amountWrap: HTMLElement;
   } | null = null;
 
   let currentFxInputs: Record<string, HTMLInputElement | HTMLSelectElement> = {};
@@ -1617,6 +1684,79 @@ export async function mountEditor(
     void refreshNoiseProfiles();
   };
 
+  const buildSpectralInputs = (): void => {
+    ui.fxParamsRow.innerHTML = "";
+    currentFxInputs = {};
+    autotuneInputs = null;
+    eqInputs = null;
+    nrInputs = null;
+    generateInputs = null;
+
+    const opWrap = document.createElement("label");
+    Object.assign(opWrap.style, wrapStyle);
+    opWrap.appendChild(document.createTextNode("op"));
+    const op = document.createElement("select");
+    Object.assign(op.style, selStyle);
+    for (const m of ["Silence", "Attenuate", "Amplify", "Repair"]) {
+      const o = document.createElement("option");
+      o.value = m;
+      o.textContent = m;
+      op.appendChild(o);
+    }
+    opWrap.appendChild(op);
+
+    const lowWrap = document.createElement("label");
+    Object.assign(lowWrap.style, wrapStyle);
+    lowWrap.appendChild(document.createTextNode("low Hz"));
+    const lowHz = makeNumberInput();
+    lowHz.min = "0";
+    lowHz.max = "24000";
+    lowHz.step = "10";
+    lowHz.value = "800";
+    lowHz.title = "Lower edge of the frequency band";
+    lowWrap.appendChild(lowHz);
+
+    const highWrap = document.createElement("label");
+    Object.assign(highWrap.style, wrapStyle);
+    highWrap.appendChild(document.createTextNode("high Hz"));
+    const highHz = makeNumberInput();
+    highHz.min = "0";
+    highHz.max = "24000";
+    highHz.step = "10";
+    highHz.value = "1200";
+    highHz.title = "Upper edge of the frequency band";
+    highWrap.appendChild(highHz);
+
+    const amountWrap = document.createElement("label");
+    Object.assign(amountWrap.style, wrapStyle);
+    amountWrap.appendChild(document.createTextNode("amount dB"));
+    const amountDb = makeNumberInput();
+    amountDb.min = "-60";
+    amountDb.max = "30";
+    amountDb.step = "0.5";
+    amountDb.value = "-12";
+    amountDb.title = "Gain change applied to the band (Attenuate/Amplify only)";
+    amountWrap.appendChild(amountDb);
+
+    const hint = document.createElement("span");
+    hint.textContent = "time range = waveform selection (else whole source)";
+    hint.style.color = "var(--text-4)";
+    hint.style.fontSize = "11px";
+
+    op.addEventListener("change", () => {
+      const needsAmount = op.value === "Attenuate" || op.value === "Amplify";
+      amountWrap.style.display = needsAmount ? "inline-flex" : "none";
+    });
+
+    ui.fxParamsRow.appendChild(opWrap);
+    ui.fxParamsRow.appendChild(lowWrap);
+    ui.fxParamsRow.appendChild(highWrap);
+    ui.fxParamsRow.appendChild(amountWrap);
+    ui.fxParamsRow.appendChild(hint);
+
+    spectralInputs = { op, lowHz, highHz, amountDb, amountWrap };
+  };
+
   const buildGenerateInputs = (): void => {
     ui.fxParamsRow.innerHTML = "";
     currentFxInputs = {};
@@ -1790,6 +1930,7 @@ export async function mountEditor(
     eqInputs = null;
     generateInputs = null;
     nrInputs = null;
+    spectralInputs = null;
     if (v === "Autotune") {
       buildAutotuneInputs();
     } else if (v === "Eq") {
@@ -1798,6 +1939,8 @@ export async function mountEditor(
       buildGenerateInputs();
     } else if (v === "NoiseReduce") {
       buildNrInputs();
+    } else if (v === "Spectral") {
+      buildSpectralInputs();
     } else {
       const def = fxDefs.find((d) => d.id === v);
       if (def) buildFxParamInputs(def);
@@ -1999,6 +2142,52 @@ export async function mountEditor(
         ui.status.textContent = `EQ applied (${bands.length} band${bands.length === 1 ? "" : "s"})`;
       } catch (err) {
         ui.status.textContent = `EQ failed: ${String(err)}`;
+      } finally {
+        syncFxApplyEnabled();
+      }
+      return;
+    }
+
+    if (ui.fxKindSelect.value === "Spectral") {
+      if (!spectralInputs) return;
+      const lo = parseFloat(spectralInputs.lowHz.value);
+      const hi = parseFloat(spectralInputs.highHz.value);
+      if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {
+        ui.status.textContent = "Spectral: low must be < high (Hz)";
+        return;
+      }
+      const opName = spectralInputs.op.value;
+      let operation: unknown;
+      if (opName === "Silence") operation = "Silence";
+      else if (opName === "Repair") operation = "Repair";
+      else {
+        const db = parseFloat(spectralInputs.amountDb.value);
+        if (!Number.isFinite(db)) {
+          ui.status.textContent = "Spectral: amount must be a number";
+          return;
+        }
+        operation =
+          opName === "Attenuate"
+            ? { Attenuate: { db } }
+            : { Amplify: { db } };
+      }
+      const opJson = JSON.stringify({
+        SpectralEdit: {
+          region: {
+            Rect: { time: range, freq_low_hz: lo, freq_high_hz: hi },
+          },
+          operation,
+          stft: { fft_size: 2048, hop_size: 512, window: "Hann" },
+        },
+      });
+      ui.fxApplyBtn.disabled = true;
+      try {
+        await client.applyOp(currentSourceId, opJson);
+        await refreshAfterEdit();
+        opts.onSourceImported?.();
+        ui.status.textContent = `Spectral ${opName} applied (${lo.toFixed(0)}-${hi.toFixed(0)} Hz)`;
+      } catch (err) {
+        ui.status.textContent = `Spectral failed: ${String(err)}`;
       } finally {
         syncFxApplyEnabled();
       }
@@ -2214,6 +2403,7 @@ interface UiHandles {
   zoomOutBtn: HTMLButtonElement;
   zoomFullBtn: HTMLButtonElement;
   zoomSelBtn: HTMLButtonElement;
+  viewModeSelect: HTMLSelectElement;
   scrollbar: HTMLInputElement;
   libraryList: HTMLDivElement;
   duplicateBtn: HTMLButtonElement;
@@ -2445,6 +2635,28 @@ function buildUi(root: HTMLElement): UiHandles {
   zoomRow.appendChild(zoomOutBtn);
   zoomRow.appendChild(zoomFullBtn);
   zoomRow.appendChild(zoomSelBtn);
+  const viewLabel = document.createElement("span");
+  viewLabel.textContent = "View:";
+  viewLabel.style.marginLeft = "12px";
+  const viewModeSelect = document.createElement("select");
+  Object.assign(viewModeSelect.style, {
+    padding: "4px 6px",
+    background: "#0c0c0c",
+    color: "#d8d8d8",
+    border: "1px solid #3a3a3a",
+    fontSize: "13px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  for (const [v, label] of [
+    ["waveform", "Waveform"],
+    ["spectral", "Spectral"],
+  ] as const) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = label;
+    viewModeSelect.appendChild(opt);
+  }
+  zoomRow.appendChild(viewLabel);
+  zoomRow.appendChild(viewModeSelect);
   zoomRow.appendChild(wheelHint);
   main.appendChild(zoomRow);
 
@@ -2614,6 +2826,7 @@ function buildUi(root: HTMLElement): UiHandles {
     zoomOutBtn,
     zoomFullBtn,
     zoomSelBtn,
+    viewModeSelect,
     scrollbar,
     libraryList,
     duplicateBtn,

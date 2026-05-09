@@ -158,6 +158,15 @@ export type EngineCommand =
       sourceId: string;
       startFrame: number;
       endFrame: number;
+    }
+  | {
+      kind: "spectrogram_tile";
+      req: RequestId;
+      sourceId: string;
+      startFrame: number;
+      endFrame: number;
+      fftSize: number;
+      hopSize: number;
     };
 
 export type EngineEvent =
@@ -216,4 +225,11 @@ export type EngineEvent =
   | { kind: "list_noise_profiles_ok"; req: RequestId; json: string }
   | { kind: "set_clip_envelope_ok"; req: RequestId }
   | { kind: "query_samples_ok"; req: RequestId; samples: Float32Array; channels: number }
+  | {
+      kind: "spectrogram_tile_ok";
+      req: RequestId;
+      magnitudes: Float32Array;
+      frameCount: number;
+      binCount: number;
+    }
   | { kind: "error"; req: RequestId; reason: string };

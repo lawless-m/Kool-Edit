@@ -389,9 +389,61 @@ impl Parser {
                     cents: self.parse_float()?,
                 }
             }
+            "spectral" => self.parse_spectral_tail(range)?,
             other => return Err(ParseError::Unsupported(static_op_name(other))),
         };
         Ok(op)
+    }
+
+    /// Tail after `<range>  spectral`: an op keyword, then `band:LO-HI`,
+    /// `amount:DBdb` (attenuate/amplify only), and `stft:default`.
+    fn parse_spectral_tail(&mut self, range: SampleRange) -> Result<Op, ParseError> {
+        use crate::spectral::{SpectralOp, StftParams, TimeFreqRegion};
+        let op_name = self.parse_ident()?;
+        let (operation, expects_amount) = match op_name.as_str() {
+            "silence" => (SpectralOp::Silence, false),
+            "repair" => (SpectralOp::Repair, false),
+            "attenuate" => (SpectralOp::Attenuate { db: 0.0 }, true),
+            "amplify" => (SpectralOp::Amplify { db: 0.0 }, true),
+            other => {
+                return Err(self.err(format!("unknown spectral op `{other}`")));
+            }
+        };
+        self.expect_ident("band")?;
+        self.expect(&Token::Colon)?;
+        let freq_low_hz = self.parse_float()?;
+        self.expect(&Token::Dash)?;
+        let freq_high_hz = self.parse_float()?;
+
+        let operation = if expects_amount {
+            self.expect_ident("amount")?;
+            self.expect(&Token::Colon)?;
+            let db = self.parse_db()?;
+            match operation {
+                SpectralOp::Attenuate { .. } => SpectralOp::Attenuate { db },
+                SpectralOp::Amplify { .. } => SpectralOp::Amplify { db },
+                other => other,
+            }
+        } else {
+            operation
+        };
+
+        self.expect_ident("stft")?;
+        self.expect(&Token::Colon)?;
+        // Only `stft:default` is accepted in v1: spectral edits must match
+        // the project's default STFT params for round-trip invertibility
+        // (architecture doc §"STFT machinery"). Other forms may land later.
+        self.expect_ident("default")?;
+
+        Ok(Op::SpectralEdit {
+            region: TimeFreqRegion::Rect {
+                time: range,
+                freq_low_hz,
+                freq_high_hz,
+            },
+            operation,
+            stft: StftParams::DEFAULT,
+        })
     }
 
     fn parse_generate_op(&mut self, rate: u32) -> Result<Op, ParseError> {
