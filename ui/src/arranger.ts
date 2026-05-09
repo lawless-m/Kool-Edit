@@ -78,7 +78,13 @@ export async function mountArranger(
   const sourcePeaks = new Map<string, Float32Array>();
   const PEAK_COLS = 2048;
   let stagedSourceId: string | null = null;
-  let selectedClip: { trackId: number; clipId: number } | null = null;
+  // Multi-selection. Keys are `${trackId}:${clipId}`. Plain click replaces
+  // the selection with just the clicked clip; Ctrl/Cmd-click toggles a clip
+  // in/out of the set. Drag moves every selected clip together.
+  const selectedClips = new Set<string>();
+  const clipKey = (trackId: number, clipId: number): string => `${trackId}:${clipId}`;
+  const isClipSelected = (trackId: number, clipId: number): boolean =>
+    selectedClips.has(clipKey(trackId, clipId));
 
   /** UI-side clipboard for "Copy Sel" / "Insert ×N". Each entry is one
    *  clip-portion: cropped to fit inside the original selection so the
@@ -142,19 +148,39 @@ export async function mountArranger(
   } | null = null;
   let playRaf: number | null = null;
   let dragState: { anchorFrame: number; moved: boolean } | null = null;
-  let clipDragState: {
+  type DraggedClip = {
     trackId: number;
     clipId: number;
     elt: HTMLElement;
-    startMouseX: number;
     startPositionFrame: number;
-    currentPositionFrame: number;
+  };
+  // The clip the user grabbed is the anchor — its snap drives the group's
+  // delta, and every other selected clip shifts by the same frames so the
+  // relative spacing of the group is preserved.
+  let clipDragState: {
+    anchor: DraggedClip;
+    others: DraggedClip[];
+    startMouseX: number;
+    currentDelta: number;
     moved: boolean;
   } | null = null;
   let edgeDragState: {
     edge: "in" | "out";
     startMouseX: number;
     startFrame: number;
+  } | null = null;
+  // Box / marquee selection. Starts on mousedown over empty lane space and
+  // grows as the user drags. The element is appended to lanesContent (a
+  // sibling of lanesStack) so drawTracks's rebuild doesn't nuke it. Hit
+  // testing uses each clip element's bounding rect against viewport
+  // coordinates so the math is independent of which container we live in.
+  let marqueeState: {
+    startClientX: number;
+    startClientY: number;
+    additive: boolean;
+    baseSelection: Set<string>;
+    elt: HTMLDivElement;
+    moved: boolean;
   } | null = null;
   let binHovered = false;
 
@@ -270,11 +296,13 @@ export async function mountArranger(
         // ignore — clip will render without a waveform
       }
     }
-    if (selectedClip) {
-      const list = clipsByTrack.get(selectedClip.trackId);
-      if (!list || !list.some((c) => c.id === selectedClip!.clipId)) {
-        selectedClip = null;
-      }
+    // Prune the selection set to clips that still exist after the refresh.
+    const live = new Set<string>();
+    for (const [trackId, list] of clipsByTrack) {
+      for (const c of list) live.add(clipKey(trackId, c.id));
+    }
+    for (const k of [...selectedClips]) {
+      if (!live.has(k)) selectedClips.delete(k);
     }
     drawSources();
     drawTracks();
@@ -285,7 +313,7 @@ export async function mountArranger(
     // The bin is enabled when there's a selection (so clicking it works) AND
     // during clip drag (so it's a visible drop target). The drag path forces
     // it on directly; this covers the click-to-bin path.
-    ui.deleteClipBtn.disabled = selectedClip === null && clipDragState === null;
+    ui.deleteClipBtn.disabled = selectedClips.size === 0 && clipDragState === null;
     const noProject = projectLengthFrames() === 0;
     ui.playBtn.disabled = noProject;
     ui.loopBtn.disabled = noProject;
@@ -297,6 +325,21 @@ export async function mountArranger(
     ui.deleteClipBtn.style.background = b ? "#a83030" : "#2a2a2a";
     ui.deleteClipBtn.style.borderColor = b ? "#ff6060" : "#3a3a3a";
     ui.deleteClipBtn.style.color = b ? "#ffffff" : "#d8d8d8";
+  };
+
+  // Cheap restyle of every clip element to reflect the current selection.
+  // Used during marquee drag so we don't pay a full drawTracks rebuild on
+  // every mousemove (which would also destroy the marquee element). The
+  // waveform colour stays put — it gets refreshed on the next full redraw.
+  const updateClipSelectionStyles = (): void => {
+    const elts = ui.lanesStack.querySelectorAll<HTMLElement>("[data-clip-key]");
+    for (const elt of elts) {
+      const key = elt.dataset["clipKey"];
+      if (!key) continue;
+      const sel = selectedClips.has(key);
+      elt.style.background = sel ? "#2f4a2f" : "#1f2f1f";
+      elt.style.border = sel ? "1px solid #b6e6b6" : "1px solid #4a6a4a";
+    }
   };
 
   // ---- sources panel ----------------------------------------------------
@@ -816,16 +859,51 @@ export async function mountArranger(
         alignItems: "center",
         gap: "4px",
       } satisfies Partial<CSSStyleDeclaration>);
-      const name = document.createElement("div");
-      name.textContent = track.name;
+      const name = document.createElement("input");
+      name.type = "text";
+      name.value = track.name;
+      name.title = "Track name — click to rename";
       Object.assign(name.style, {
         flex: "1",
+        minWidth: "0",
         fontWeight: "500",
         fontSize: "12px",
-        whiteSpace: "nowrap",
-        overflow: "hidden",
-        textOverflow: "ellipsis",
+        fontFamily: "inherit",
+        background: "transparent",
+        color: "#d8d8d8",
+        border: "1px solid transparent",
+        borderRadius: "2px",
+        padding: "0 2px",
+        outline: "none",
       } satisfies Partial<CSSStyleDeclaration>);
+      name.addEventListener("focus", () => {
+        name.style.background = "#0c0c0c";
+        name.style.borderColor = "#3a3a3a";
+      });
+      const commitName = async (): Promise<void> => {
+        name.style.background = "transparent";
+        name.style.borderColor = "transparent";
+        const next = name.value.trim();
+        if (next === "" || next === track.name) {
+          name.value = track.name;
+          return;
+        }
+        track.name = next;
+        await client.setTrackName(track.id, next);
+      };
+      name.addEventListener("blur", () => {
+        void commitName();
+      });
+      name.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter") {
+          ev.preventDefault();
+          name.blur();
+        } else if (ev.key === "Escape") {
+          ev.preventDefault();
+          name.value = track.name;
+          name.blur();
+        }
+      });
 
       // Mute / Solo state pills. Tiny, click-to-toggle. Solo overrides mute
       // in the mixdown when any track is soloed.
@@ -984,9 +1062,46 @@ export async function mountArranger(
         commitGain((Number.isFinite(cur) ? cur : 0) - 0.5, true);
       });
 
+      // Choke: trim each clip's source_out so it ends where the next clip on
+      // this track begins. For drum tracks where every kick is longer than a
+      // beat, this stops the tails summing additively into distortion.
+      const chokeBtn = document.createElement("button");
+      chokeBtn.type = "button";
+      chokeBtn.textContent = "Choke";
+      chokeBtn.title = "Trim each clip on this track to end where the next clip starts";
+      Object.assign(chokeBtn.style, {
+        padding: "0 5px",
+        height: "16px",
+        fontSize: "10px",
+        lineHeight: "14px",
+        background: "#2a2a2a",
+        color: "#d8d8d8",
+        border: "1px solid #3a3a3a",
+        borderRadius: "2px",
+        cursor: "pointer",
+      } satisfies Partial<CSSStyleDeclaration>);
+      chokeBtn.addEventListener("click", async () => {
+        const list = (clipsByTrack.get(track.id) ?? [])
+          .slice()
+          .sort((a, b) => a.position - b.position);
+        for (let i = 0; i < list.length - 1; i++) {
+          const cur = list[i];
+          const next = list[i + 1];
+          if (cur.endPosition <= next.position) continue;
+          const overlap = next.position - cur.position;
+          if (overlap <= 0) continue;
+          const newSourceOut = cur.sourceIn + overlap;
+          if (newSourceOut <= cur.sourceIn) continue;
+          await client.setClipSourceRange(track.id, cur.id, cur.sourceIn, newSourceOut);
+        }
+        await refresh();
+        rerenderIfPlaying();
+      });
+
       bottomRow.appendChild(gainInput);
       bottomRow.appendChild(spinnerCol);
       bottomRow.appendChild(dbLabel);
+      bottomRow.appendChild(chokeBtn);
       bottomRow.appendChild(sub);
 
       header.appendChild(topRow);
@@ -1007,8 +1122,46 @@ export async function mountArranger(
         backgroundSize: grid.backgroundSize,
         backgroundRepeat: "no-repeat",
       } satisfies Partial<CSSStyleDeclaration>);
+      lane.addEventListener("mousedown", (ev) => {
+        if (ev.button !== 0) return;
+        if (stagedSourceId) return; // staged-source placement is handled on click
+        if ((ev.target as HTMLElement) !== lane) return;
+        ev.preventDefault();
+        const additive = ev.ctrlKey || ev.metaKey || ev.shiftKey;
+        if (!additive) selectedClips.clear();
+        const baseSelection = new Set(selectedClips);
+        // Marquee element is parented to lanesContent (a sibling of
+        // lanesStack) so it survives drawTracks rebuilds. Coords are
+        // therefore in lanesContent space.
+        const containerRect = ui.lanesContent.getBoundingClientRect();
+        const startX = ev.clientX - containerRect.left;
+        const startY = ev.clientY - containerRect.top;
+        const elt = document.createElement("div");
+        Object.assign(elt.style, {
+          position: "absolute",
+          left: `${startX}px`,
+          top: `${startY}px`,
+          width: "0px",
+          height: "0px",
+          border: "1px dashed #b6e6b6",
+          background: "rgba(124, 209, 124, 0.12)",
+          pointerEvents: "none",
+          zIndex: "5",
+        } satisfies Partial<CSSStyleDeclaration>);
+        ui.lanesContent.appendChild(elt);
+        marqueeState = {
+          startClientX: ev.clientX,
+          startClientY: ev.clientY,
+          additive,
+          baseSelection,
+          elt,
+          moved: false,
+        };
+        updateClipSelectionStyles();
+        syncToolbar();
+      });
       lane.addEventListener("click", async (ev) => {
-        if (!stagedSourceId) return;
+        if (!stagedSourceId) return; // empty-space clear is handled by marquee mousedown
         const target = ev.target as HTMLElement;
         if (target !== lane) return;
         const rect = lane.getBoundingClientRect();
@@ -1028,11 +1181,11 @@ export async function mountArranger(
       const clips = clipsByTrack.get(track.id) ?? [];
       for (const c of clips) {
         const elt = document.createElement("div");
+        elt.dataset["clipKey"] = clipKey(track.id, c.id);
         const left = framesToPx(c.position);
         const width = Math.max(2, framesToPx(c.endPosition - c.position));
         const innerH = LANE_HEIGHT - 8;
-        const isSelected =
-          selectedClip?.trackId === track.id && selectedClip?.clipId === c.id;
+        const isSelected = isClipSelected(track.id, c.id);
         Object.assign(elt.style, {
           position: "absolute",
           left: `${left}px`,
@@ -1115,13 +1268,60 @@ export async function mountArranger(
           ev.stopPropagation();
           ev.preventDefault();
           setBinHover(false);
-          clipDragState = {
+          const key = clipKey(track.id, c.id);
+          // Ctrl/Cmd-click toggles this clip in/out of the selection without
+          // starting a drag — matches the standard "extend selection" gesture.
+          if (ev.ctrlKey || ev.metaKey) {
+            if (selectedClips.has(key)) selectedClips.delete(key);
+            else selectedClips.add(key);
+            drawTracks();
+            syncToolbar();
+            return;
+          }
+          // Plain click on an unselected clip replaces the selection so the
+          // user can drag a single clip out of a multi-selection naturally.
+          // Clicking a clip that's already part of the selection keeps the
+          // group intact so the whole selection moves together.
+          if (!selectedClips.has(key)) {
+            selectedClips.clear();
+            selectedClips.add(key);
+            drawTracks();
+            syncToolbar();
+          }
+          // Build the drag cohort: the grabbed clip is the anchor, and every
+          // other selected clip rides along. We capture each one's element
+          // and start position so mousemove only has to apply a delta.
+          const anchor: DraggedClip = {
             trackId: track.id,
             clipId: c.id,
             elt,
-            startMouseX: ev.clientX,
             startPositionFrame: c.position,
-            currentPositionFrame: c.position,
+          };
+          const others: DraggedClip[] = [];
+          for (const otherKey of selectedClips) {
+            if (otherKey === key) continue;
+            const [tIdStr, cIdStr] = otherKey.split(":");
+            const tId = Number(tIdStr);
+            const cId = Number(cIdStr);
+            const list = clipsByTrack.get(tId);
+            const clip = list?.find((x) => x.id === cId);
+            if (!clip) continue;
+            const otherElt = ui.lanesStack.querySelector<HTMLElement>(
+              `[data-clip-key="${otherKey}"]`,
+            );
+            if (!otherElt) continue;
+            others.push({
+              trackId: tId,
+              clipId: cId,
+              elt: otherElt,
+              startPositionFrame: clip.position,
+            });
+          }
+          clipDragState = {
+            anchor,
+            others,
+            startMouseX: ev.clientX,
+            currentDelta: 0,
             moved: false,
           };
           ui.deleteClipBtn.disabled = false;
@@ -1207,9 +1407,19 @@ export async function mountArranger(
   });
 
   ui.deleteClipBtn.addEventListener("click", async () => {
-    if (!selectedClip) return;
-    await client.removeClip(selectedClip.trackId, selectedClip.clipId);
-    selectedClip = null;
+    if (selectedClips.size === 0) return;
+    const targets = [...selectedClips].map((k) => {
+      const [t, c] = k.split(":");
+      return { trackId: Number(t), clipId: Number(c) };
+    });
+    selectedClips.clear();
+    for (const t of targets) {
+      try {
+        await client.removeClip(t.trackId, t.clipId);
+      } catch (err) {
+        setStatus(`delete failed: ${String(err)}`);
+      }
+    }
     await refresh();
   });
 
@@ -1380,6 +1590,49 @@ export async function mountArranger(
   // ---- ruler drag selection / bare-click playhead ----------------------
 
   window.addEventListener("mousemove", (ev) => {
+    // Marquee drag: grow the rectangle and recompute which clips overlap.
+    // baseSelection is the snapshot taken at mousedown — additive mode
+    // (Ctrl/Cmd/Shift) keeps it intact and adds intersections on top;
+    // replace mode starts empty so the marquee defines the whole selection.
+    if (marqueeState) {
+      const ms = marqueeState;
+      const containerRect = ui.lanesContent.getBoundingClientRect();
+      const startX = ms.startClientX - containerRect.left;
+      const startY = ms.startClientY - containerRect.top;
+      const curX = ev.clientX - containerRect.left;
+      const curY = ev.clientY - containerRect.top;
+      const left = Math.min(startX, curX);
+      const top = Math.min(startY, curY);
+      const width = Math.abs(curX - startX);
+      const height = Math.abs(curY - startY);
+      ms.elt.style.left = `${left}px`;
+      ms.elt.style.top = `${top}px`;
+      ms.elt.style.width = `${width}px`;
+      ms.elt.style.height = `${height}px`;
+      if (width + height > 4) ms.moved = true;
+      // Hit-test in viewport coords — independent of which container holds
+      // the marquee or the clips.
+      const rL = Math.min(ms.startClientX, ev.clientX);
+      const rT = Math.min(ms.startClientY, ev.clientY);
+      const rR = Math.max(ms.startClientX, ev.clientX);
+      const rB = Math.max(ms.startClientY, ev.clientY);
+      const next = new Set(ms.baseSelection);
+      const elts = ui.lanesStack.querySelectorAll<HTMLElement>("[data-clip-key]");
+      for (const elt of elts) {
+        const key = elt.dataset["clipKey"];
+        if (!key) continue;
+        const r = elt.getBoundingClientRect();
+        const intersects = !(r.right < rL || r.left > rR || r.bottom < rT || r.top > rB);
+        if (intersects) next.add(key);
+      }
+      // Mutate selectedClips in place so other code reading it sees the
+      // live result.
+      selectedClips.clear();
+      for (const k of next) selectedClips.add(k);
+      updateClipSelectionStyles();
+      syncToolbar();
+      return;
+    }
     // Envelope-breakpoint drag: live-update the breakpoint's time + value,
     // pin the dot visually, leave persistence to mouseup.
     if (envelopeDrag) {
@@ -1417,14 +1670,27 @@ export async function mountArranger(
     // Clip drag takes precedence — its mousedown stops propagation, but the
     // window-level mousemove still fires, so we branch on which drag is live.
     if (clipDragState) {
-      const deltaPx = ev.clientX - clipDragState.startMouseX;
-      const deltaFrames = Math.round((deltaPx / pixelsPerSecond) * projectSr);
-      let newPos = clipDragState.startPositionFrame + deltaFrames;
-      if (!ev.shiftKey) newPos = snapFrames(newPos);
-      newPos = Math.max(0, newPos);
-      if (Math.abs(deltaPx) > 3) clipDragState.moved = true;
-      clipDragState.currentPositionFrame = newPos;
-      clipDragState.elt.style.left = `${framesToPx(newPos)}px`;
+      const ds = clipDragState;
+      const deltaPx = ev.clientX - ds.startMouseX;
+      const rawDelta = Math.round((deltaPx / pixelsPerSecond) * projectSr);
+      // Snap the anchor's destination first; the resulting delta drives the
+      // whole group so spacing within the selection is preserved exactly.
+      let anchorNew = ds.anchor.startPositionFrame + rawDelta;
+      if (!ev.shiftKey) anchorNew = snapFrames(anchorNew);
+      anchorNew = Math.max(0, anchorNew);
+      let actualDelta = anchorNew - ds.anchor.startPositionFrame;
+      // Clamp so the leftmost clip in the cohort can't slide past frame 0.
+      let minStart = ds.anchor.startPositionFrame;
+      for (const o of ds.others) {
+        if (o.startPositionFrame < minStart) minStart = o.startPositionFrame;
+      }
+      if (minStart + actualDelta < 0) actualDelta = -minStart;
+      if (Math.abs(deltaPx) > 3) ds.moved = true;
+      ds.currentDelta = actualDelta;
+      ds.anchor.elt.style.left = `${framesToPx(ds.anchor.startPositionFrame + actualDelta)}px`;
+      for (const o of ds.others) {
+        o.elt.style.left = `${framesToPx(o.startPositionFrame + actualDelta)}px`;
+      }
       // Drop-on-bin detection: highlight while the cursor is over it.
       const r = ui.deleteClipBtn.getBoundingClientRect();
       const overBin =
@@ -1466,6 +1732,25 @@ export async function mountArranger(
     drawSelection();
   });
   window.addEventListener("mouseup", async () => {
+    if (marqueeState) {
+      const ms = marqueeState;
+      marqueeState = null;
+      ms.elt.remove();
+      // Final styling pass — drawTracks would also recolor waveforms, but
+      // it's heavy. The lighter restyle keeps borders/backgrounds in sync;
+      // a future drawTracks (e.g. on the next add/move) will catch up the
+      // waveform tint.
+      updateClipSelectionStyles();
+      syncToolbar();
+      const status =
+        selectedClips.size === 0
+          ? "selection cleared"
+          : selectedClips.size === 1
+            ? "1 clip selected"
+            : `${selectedClips.size} clips selected`;
+      setStatus(status);
+      return;
+    }
     if (envelopeDrag) {
       const ed = envelopeDrag;
       envelopeDrag = null;
@@ -1484,43 +1769,43 @@ export async function mountArranger(
       clipDragState = null;
       const droppedOnBin = binHovered;
       setBinHover(false);
+      const cohort = [ds.anchor, ...ds.others];
       if (droppedOnBin) {
-        try {
-          await client.removeClip(ds.trackId, ds.clipId);
-          if (
-            selectedClip &&
-            selectedClip.trackId === ds.trackId &&
-            selectedClip.clipId === ds.clipId
-          ) {
-            selectedClip = null;
+        let removed = 0;
+        for (const d of cohort) {
+          try {
+            await client.removeClip(d.trackId, d.clipId);
+            selectedClips.delete(clipKey(d.trackId, d.clipId));
+            removed++;
+          } catch (err) {
+            setStatus(`delete failed: ${String(err)}`);
           }
-          setStatus("clip binned");
-        } catch (err) {
-          setStatus(`delete failed: ${String(err)}`);
         }
+        setStatus(removed === 1 ? "clip binned" : `${removed} clips binned`);
         await refresh();
         return;
       }
       if (ds.moved) {
-        try {
-          await client.moveClip(ds.trackId, ds.clipId, ds.currentPositionFrame);
-          const beats =
-            ds.currentPositionFrame / Math.max(1, projectSr) / Math.max(1e-6, secondsPerBeat());
-          setStatus(
-            gridMode === "beats"
-              ? `moved to bar ${Math.floor(beats / beatsPerBar) + 1} beat ${(beats % beatsPerBar) + 1}`
-              : `moved to ${(ds.currentPositionFrame / projectSr).toFixed(3)}s`,
-          );
-        } catch (err) {
-          setStatus(`move clip failed: ${String(err)}`);
+        let moved = 0;
+        for (const d of cohort) {
+          const newPos = d.startPositionFrame + ds.currentDelta;
+          try {
+            await client.moveClip(d.trackId, d.clipId, newPos);
+            moved++;
+          } catch (err) {
+            setStatus(`move clip failed: ${String(err)}`);
+          }
         }
+        const anchorPos = ds.anchor.startPositionFrame + ds.currentDelta;
+        const beats = anchorPos / Math.max(1, projectSr) / Math.max(1e-6, secondsPerBeat());
+        const where =
+          gridMode === "beats"
+            ? `bar ${Math.floor(beats / beatsPerBar) + 1} beat ${(beats % beatsPerBar) + 1}`
+            : `${(anchorPos / projectSr).toFixed(3)}s`;
+        setStatus(moved === 1 ? `moved to ${where}` : `moved ${moved} clips (anchor → ${where})`);
         await refresh();
-      } else {
-        // Bare click on a clip — select it.
-        selectedClip = { trackId: ds.trackId, clipId: ds.clipId };
-        drawTracks();
-        syncToolbar();
       }
+      // No-move case: selection was already updated on mousedown.
       return;
     }
     if (edgeDragState) {
@@ -1805,32 +2090,33 @@ export async function mountArranger(
     }
   });
 
-  // Delete (not Backspace — browsers map that to navigate-back) removes the
+  // Delete (not Backspace — browsers map that to navigate-back) removes every
   // selected clip. Skip when typing in inputs so digits can be edited freely.
   window.addEventListener("keydown", (ev) => {
     if (ev.key !== "Delete") return;
-    if (!selectedClip) return;
+    if (selectedClips.size === 0) return;
     const t = ev.target as HTMLElement | null;
     if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
       return;
     }
     ev.preventDefault();
-    const target = selectedClip;
+    const targets = [...selectedClips].map((k) => {
+      const [tid, cid] = k.split(":");
+      return { trackId: Number(tid), clipId: Number(cid) };
+    });
+    selectedClips.clear();
     void (async () => {
-      try {
-        await client.removeClip(target.trackId, target.clipId);
-        if (
-          selectedClip &&
-          selectedClip.trackId === target.trackId &&
-          selectedClip.clipId === target.clipId
-        ) {
-          selectedClip = null;
+      let removed = 0;
+      for (const target of targets) {
+        try {
+          await client.removeClip(target.trackId, target.clipId);
+          removed++;
+        } catch (err) {
+          setStatus(`delete failed: ${String(err)}`);
         }
-        await refresh();
-        setStatus("clip deleted");
-      } catch (err) {
-        setStatus(`delete failed: ${String(err)}`);
       }
+      await refresh();
+      setStatus(removed === 1 ? "clip deleted" : `${removed} clips deleted`);
     })();
   });
 
@@ -1966,7 +2252,8 @@ function buildUi(root: HTMLElement): ArrangerUi {
   const addTrackBtn = makeToolbarBtn("Add Track");
   const deleteClipBtn = makeToolbarBtn("Bin");
   deleteClipBtn.disabled = true;
-  deleteClipBtn.title = "Click to bin the selected clip — or drag a clip here";
+  deleteClipBtn.title =
+    "Click to bin selected clips — or drag a clip here. Ctrl/Cmd-click clips to multi-select.";
 
   const sep1 = makeSep();
   const gridLabel = document.createElement("span");
