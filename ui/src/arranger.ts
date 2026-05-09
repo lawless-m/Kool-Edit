@@ -9,10 +9,13 @@ import type {
   Breakpoint,
   ClipInfo,
   EngineClient,
+  GroupInfo,
+  PatternInfo,
   SourceInfo,
   TrackInfo,
 } from "./engine/client";
 import { btnStyle } from "./editor";
+import type { SavedPatternGrid } from "./drums";
 
 const DEFAULT_PIXELS_PER_SECOND = 60;
 const MIN_PIXELS_PER_SECOND = 5;
@@ -72,6 +75,10 @@ export async function mountArranger(
   let sources: SourceInfo[] = [];
   let tracks: TrackInfo[] = [];
   const clipsByTrack = new Map<number, ClipInfo[]>();
+  // Named groups, refreshed alongside clips. Map for O(1) lookup by id.
+  const groupNames = new Map<number, string>();
+  // Saved patterns, refreshed on every pattern-list change. Names are unique.
+  let savedPatterns: PatternInfo[] = [];
   // Pre-baked peak summaries (one Float32Array per source, length = 2 × COLS)
   // so clip rendering doesn't pay a round trip per redraw. Refreshed on every
   // refresh() call so destructive edits in the editor tab show up here.
@@ -85,6 +92,73 @@ export async function mountArranger(
   const clipKey = (trackId: number, clipId: number): string => `${trackId}:${clipId}`;
   const isClipSelected = (trackId: number, clipId: number): boolean =>
     selectedClips.has(clipKey(trackId, clipId));
+
+  // ---- groups ----------------------------------------------------------
+  // Clips with the same non-zero `group` id move and select as one. Per-clip
+  // parameters (trim, gain, pan, envelopes) stay independent — groups bind
+  // position only.
+
+  /** Find every clip in the project sharing the given non-zero group id,
+   *  returned as `${trackId}:${clipId}` keys. */
+  const groupMembers = (groupId: number): string[] => {
+    if (groupId === 0) return [];
+    const out: string[] = [];
+    for (const [trackId, list] of clipsByTrack) {
+      for (const c of list) {
+        if (c.group === groupId) out.push(clipKey(trackId, c.id));
+      }
+    }
+    return out;
+  };
+
+  /** Look up a clip by its `${trackId}:${clipId}` key. */
+  const clipByKey = (key: string): { trackId: number; clip: ClipInfo } | null => {
+    const [tIdStr, cIdStr] = key.split(":");
+    const tId = Number(tIdStr);
+    const cId = Number(cIdStr);
+    const list = clipsByTrack.get(tId);
+    const clip = list?.find((c) => c.id === cId);
+    return clip ? { trackId: tId, clip } : null;
+  };
+
+  /** Pull all group siblings of any grouped clip in `set` into the set, in
+   *  place. Cheap: a single sweep through the project clips. */
+  const expandSelectionToGroups = (set: Set<string>): void => {
+    const seenGroups = new Set<number>();
+    for (const key of set) {
+      const found = clipByKey(key);
+      if (found && found.clip.group > 0) seenGroups.add(found.clip.group);
+    }
+    for (const g of seenGroups) {
+      for (const k of groupMembers(g)) set.add(k);
+    }
+  };
+
+  /** Mint a fresh group id by finding the max existing one + 1. */
+  const nextGroupId = (): number => {
+    let max = 0;
+    for (const list of clipsByTrack.values()) {
+      for (const c of list) {
+        if (c.group > max) max = c.group;
+      }
+    }
+    for (const id of groupNames.keys()) {
+      if (id > max) max = id;
+    }
+    return max + 1;
+  };
+
+  /** Custom name from `groupNames`, or default "Group N" fallback. */
+  const groupDisplayName = (groupId: number): string =>
+    groupNames.get(groupId) ?? `Group ${groupId}`;
+
+  /** Deterministic colour from a group id using the golden-angle hue trick.
+   *  Returns an HSL string usable as both background tint and border. */
+  const groupHue = (groupId: number): number => (groupId * 137.508) % 360;
+  const groupBorderColor = (groupId: number): string =>
+    `hsl(${groupHue(groupId).toFixed(1)}, 65%, 65%)`;
+  const groupFillColor = (groupId: number, selected: boolean): string =>
+    `hsl(${groupHue(groupId).toFixed(1)}, ${selected ? 50 : 35}%, ${selected ? 30 : 22}%)`;
 
   /** UI-side clipboard for "Copy Sel" / "Insert ×N". Each entry is one
    *  clip-portion: cropped to fit inside the original selection so the
@@ -285,6 +359,21 @@ export async function mountArranger(
     for (const t of tracks) {
       clipsByTrack.set(t.id, await client.listClips(t.id));
     }
+    // Refresh group names + saved patterns. Older engine builds without
+    // these may throw; in that case we just leave the maps empty.
+    groupNames.clear();
+    try {
+      const gs: GroupInfo[] = await client.listGroups();
+      for (const g of gs) groupNames.set(g.id, g.name);
+    } catch {
+      // pre-groups engine — ignore
+    }
+    try {
+      savedPatterns = await client.listPatterns();
+    } catch {
+      savedPatterns = [];
+    }
+    refreshPatternPicker();
     // Refresh peak summaries for every source. Cheap per call; the engine's
     // cache does the heavy lifting.
     sourcePeaks.clear();
@@ -317,6 +406,54 @@ export async function mountArranger(
     const noProject = projectLengthFrames() === 0;
     ui.playBtn.disabled = noProject;
     ui.loopBtn.disabled = noProject;
+    // Group needs at least 2 clips to make sense. Ungroup is enabled if any
+    // selected clip is currently in a group.
+    ui.groupBtn.disabled = selectedClips.size < 2;
+    ui.ungroupBtn.disabled = ![...selectedClips].some((k) => {
+      const f = clipByKey(k);
+      return f !== null && f.clip.group > 0;
+    });
+    // Rename only makes sense when the selection is exactly one group (every
+    // selected clip shares the same non-zero group id).
+    ui.renameGroupBtn.disabled = singleSelectedGroup() === null;
+    // Insert needs both a pattern and a destination position. We use the
+    // current arranger selection in-point if there is one, else the playhead.
+    ui.insertPatternBtn.disabled =
+      savedPatterns.length === 0 || ui.patternPicker.value === "";
+  };
+
+  /** Returns the group id when every selected clip belongs to the same
+   *  non-zero group; null otherwise (mixed, ungrouped, or empty). */
+  const singleSelectedGroup = (): number | null => {
+    if (selectedClips.size === 0) return null;
+    let g: number | null = null;
+    for (const k of selectedClips) {
+      const f = clipByKey(k);
+      if (!f || f.clip.group === 0) return null;
+      if (g === null) g = f.clip.group;
+      else if (g !== f.clip.group) return null;
+    }
+    return g;
+  };
+
+  const refreshPatternPicker = (): void => {
+    const prev = ui.patternPicker.value;
+    ui.patternPicker.innerHTML = "";
+    if (savedPatterns.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(no saved patterns)";
+      ui.patternPicker.appendChild(opt);
+    } else {
+      for (const p of savedPatterns) {
+        const opt = document.createElement("option");
+        opt.value = p.name;
+        opt.textContent = p.name;
+        ui.patternPicker.appendChild(opt);
+      }
+      // Preserve the previous selection if still valid.
+      if (savedPatterns.some((p) => p.name === prev)) ui.patternPicker.value = prev;
+    }
   };
 
   const setBinHover = (b: boolean): void => {
@@ -337,8 +474,15 @@ export async function mountArranger(
       const key = elt.dataset["clipKey"];
       if (!key) continue;
       const sel = selectedClips.has(key);
-      elt.style.background = sel ? "#2f4a2f" : "#1f2f1f";
-      elt.style.border = sel ? "1px solid #b6e6b6" : "1px solid #4a6a4a";
+      const groupIdStr = elt.dataset["groupId"];
+      const groupId = groupIdStr ? Number(groupIdStr) : 0;
+      if (groupId > 0) {
+        elt.style.background = groupFillColor(groupId, sel);
+        elt.style.border = `${sel ? 2 : 1}px solid ${groupBorderColor(groupId)}`;
+      } else {
+        elt.style.background = sel ? "#2f4a2f" : "#1f2f1f";
+        elt.style.border = `${sel ? 2 : 1}px solid ${sel ? "#b6e6b6" : "#4a6a4a"}`;
+      }
     }
   };
 
@@ -1186,20 +1330,30 @@ export async function mountArranger(
         const width = Math.max(2, framesToPx(c.endPosition - c.position));
         const innerH = LANE_HEIGHT - 8;
         const isSelected = isClipSelected(track.id, c.id);
+        // Grouped clips get a deterministic hue; ungrouped keep the original
+        // green palette. Selection bumps the saturation/lightness either way.
+        const grouped = c.group > 0;
+        const bg = grouped
+          ? groupFillColor(c.group, isSelected)
+          : isSelected ? "#2f4a2f" : "#1f2f1f";
+        const borderCol = grouped
+          ? groupBorderColor(c.group)
+          : isSelected ? "#b6e6b6" : "#4a6a4a";
         Object.assign(elt.style, {
           position: "absolute",
           left: `${left}px`,
           top: "4px",
           height: `${innerH}px`,
           width: `${width}px`,
-          background: isSelected ? "#2f4a2f" : "#1f2f1f",
-          border: isSelected ? "1px solid #b6e6b6" : "1px solid #4a6a4a",
+          background: bg,
+          border: `${isSelected ? 2 : 1}px solid ${borderCol}`,
           borderRadius: "3px",
           boxSizing: "border-box",
           overflow: "hidden",
           cursor: "pointer",
           userSelect: "none",
         } satisfies Partial<CSSStyleDeclaration>);
+        elt.dataset["groupId"] = String(c.group);
         const src = sources.find((s) => s.id === c.sourceId);
 
         // Waveform canvas. Size in device pixels matches the clip's display
@@ -1256,6 +1410,31 @@ export async function mountArranger(
         } satisfies Partial<CSSStyleDeclaration>);
         elt.appendChild(label);
 
+        // Group-name badge. Sits in the bottom-left so it doesn't fight with
+        // the source-name label up top. Only rendered when the clip is in a
+        // group and the clip is wide enough to show it.
+        if (grouped && width > 40) {
+          const badge = document.createElement("div");
+          badge.textContent = groupDisplayName(c.group);
+          Object.assign(badge.style, {
+            position: "absolute",
+            bottom: "1px",
+            left: "4px",
+            fontSize: "10px",
+            color: "#000",
+            background: groupBorderColor(c.group),
+            padding: "0 4px",
+            borderRadius: "2px",
+            fontWeight: "600",
+            pointerEvents: "none",
+            maxWidth: `${Math.max(20, width - 8)}px`,
+            whiteSpace: "nowrap",
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+          } satisfies Partial<CSSStyleDeclaration>);
+          elt.appendChild(badge);
+        }
+
         const beats = framesToBeats(c.position);
         const beatLabel =
           gridMode === "beats"
@@ -1271,9 +1450,15 @@ export async function mountArranger(
           const key = clipKey(track.id, c.id);
           // Ctrl/Cmd-click toggles this clip in/out of the selection without
           // starting a drag — matches the standard "extend selection" gesture.
+          // For grouped clips the toggle fans out to every member so the group
+          // moves and unselects as one.
           if (ev.ctrlKey || ev.metaKey) {
-            if (selectedClips.has(key)) selectedClips.delete(key);
-            else selectedClips.add(key);
+            const peers = c.group > 0 ? groupMembers(c.group) : [key];
+            const allIn = peers.every((k) => selectedClips.has(k));
+            for (const k of peers) {
+              if (allIn) selectedClips.delete(k);
+              else selectedClips.add(k);
+            }
             drawTracks();
             syncToolbar();
             return;
@@ -1285,6 +1470,7 @@ export async function mountArranger(
           if (!selectedClips.has(key)) {
             selectedClips.clear();
             selectedClips.add(key);
+            expandSelectionToGroups(selectedClips);
             drawTracks();
             syncToolbar();
           }
@@ -1422,6 +1608,135 @@ export async function mountArranger(
     }
     await refresh();
   });
+
+  // ---- group / ungroup -------------------------------------------------
+
+  /** Stamp every selected clip with a fresh group id so they move and select
+   *  together. If the selection is already part of one or more groups those
+   *  are merged into the new id. */
+  const groupSelection = async (): Promise<void> => {
+    if (selectedClips.size < 2) return;
+    const newGroup = nextGroupId();
+    const targets = [...selectedClips].map((k) => {
+      const [t, c] = k.split(":");
+      return { trackId: Number(t), clipId: Number(c) };
+    });
+    for (const t of targets) {
+      try {
+        await client.setClipGroup(t.trackId, t.clipId, newGroup);
+      } catch (err) {
+        setStatus(`group failed: ${String(err)}`);
+      }
+    }
+    setStatus(`grouped ${targets.length} clips`);
+    await refresh();
+  };
+
+  /** Clear the group id on every selected clip. Members of the same group
+   *  not in the selection stay grouped — only the selection is freed. */
+  const ungroupSelection = async (): Promise<void> => {
+    if (selectedClips.size === 0) return;
+    const targets = [...selectedClips].map((k) => {
+      const [t, c] = k.split(":");
+      return { trackId: Number(t), clipId: Number(c) };
+    });
+    let n = 0;
+    for (const t of targets) {
+      try {
+        await client.setClipGroup(t.trackId, t.clipId, 0);
+        n++;
+      } catch (err) {
+        setStatus(`ungroup failed: ${String(err)}`);
+      }
+    }
+    setStatus(`ungrouped ${n} clip${n === 1 ? "" : "s"}`);
+    await refresh();
+  };
+
+  ui.groupBtn.addEventListener("click", () => void groupSelection());
+  ui.ungroupBtn.addEventListener("click", () => void ungroupSelection());
+
+  /** Prompt for a new name for the single selected group and persist it. */
+  const renameSelectedGroup = async (): Promise<void> => {
+    const id = singleSelectedGroup();
+    if (id === null) return;
+    const current = groupDisplayName(id);
+    const next = window.prompt("Rename group", current);
+    if (next === null) return;
+    const trimmed = next.trim();
+    if (trimmed === "" || trimmed === current) return;
+    try {
+      await client.setGroupName(id, trimmed);
+      setStatus(`renamed group to "${trimmed}"`);
+      await refresh();
+    } catch (err) {
+      setStatus(`rename failed: ${String(err)}`);
+    }
+  };
+  ui.renameGroupBtn.addEventListener("click", () => void renameSelectedGroup());
+
+  ui.patternPicker.addEventListener("change", () => syncToolbar());
+
+  /** Stamp a saved pattern at the current playhead (or selection in-point)
+   *  as a new named group. Tracks named after each lane are reused if they
+   *  already exist; otherwise new tracks are added so re-inserting the same
+   *  pattern doesn't keep multiplying drum lanes. */
+  const insertSavedPattern = async (): Promise<void> => {
+    const name = ui.patternPicker.value;
+    if (!name) return;
+    const json = await client.loadPattern(name);
+    if (!json) {
+      setStatus(`pattern "${name}" not found`);
+      return;
+    }
+    let grid: SavedPatternGrid;
+    try {
+      grid = JSON.parse(json) as SavedPatternGrid;
+    } catch (err) {
+      setStatus(`pattern parse failed: ${String(err)}`);
+      return;
+    }
+    if (projectSr === 0) {
+      setStatus("can't insert — engine has no sample rate yet");
+      return;
+    }
+    const startFrame = inFrame ?? playheadFrame ?? 0;
+    // One step is one 16th-note at the *current* project tempo, so changing
+    // BPM/time-sig later still gives you a musically aligned insert.
+    const stepDurSec = secondsPerBeat() / Math.max(1, grid.stepsPerBeat ?? 4);
+    const stepFrames = Math.round(stepDurSec * projectSr);
+    const newGroup = nextGroupId();
+    await client.setGroupName(newGroup, name);
+    let clipCount = 0;
+    for (const lane of grid.lanes) {
+      if (!lane.sourceId) continue;
+      const hits = lane.steps
+        .map((on, idx) => (on ? idx : -1))
+        .filter((idx) => idx >= 0);
+      if (hits.length === 0) continue;
+      const src = sources.find((s) => s.id === lane.sourceId);
+      if (!src) continue;
+      // Find or create a track named after this lane. Re-using lets repeat
+      // inserts of the same pattern stack onto the same drum tracks rather
+      // than fanning out to N copies of "BD".
+      const existing = tracks.find((t) => t.name === lane.label);
+      const trackId = existing ? existing.id : await client.addTrack(lane.label);
+      if (!existing) tracks = await client.listTracks();
+      for (const stepIdx of hits) {
+        const positionFrame = startFrame + stepIdx * stepFrames;
+        try {
+          const clipId = await client.addClip(trackId, lane.sourceId, positionFrame, 0, src.frames);
+          await client.setClipGroup(trackId, clipId, newGroup);
+          clipCount++;
+        } catch (err) {
+          console.warn("insertPattern: addClip failed", err);
+        }
+      }
+    }
+    setStatus(`inserted "${name}" — ${clipCount} hits`);
+    await refresh();
+  };
+  ui.insertPatternBtn.addEventListener("click", () => void insertSavedPattern());
 
   // ---- zoom -----------------------------------------------------------
 
@@ -1625,6 +1940,9 @@ export async function mountArranger(
         const intersects = !(r.right < rL || r.left > rR || r.bottom < rT || r.top > rB);
         if (intersects) next.add(key);
       }
+      // If the marquee touched any grouped clip, pull in the rest of the
+      // group so the selection always treats a group as one unit.
+      expandSelectionToGroups(next);
       // Mutate selectedClips in place so other code reading it sees the
       // live result.
       selectedClips.clear();
@@ -2092,13 +2410,20 @@ export async function mountArranger(
 
   // Delete (not Backspace — browsers map that to navigate-back) removes every
   // selected clip. Skip when typing in inputs so digits can be edited freely.
+  // G groups the selection, Shift+G ungroups it.
   window.addEventListener("keydown", (ev) => {
-    if (ev.key !== "Delete") return;
-    if (selectedClips.size === 0) return;
     const t = ev.target as HTMLElement | null;
-    if (t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable)) {
+    const inEditableField =
+      t && (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+    if (inEditableField) return;
+    if (ev.key === "g" || ev.key === "G") {
+      if (selectedClips.size === 0) return;
+      ev.preventDefault();
+      void (ev.shiftKey ? ungroupSelection() : groupSelection());
       return;
     }
+    if (ev.key !== "Delete") return;
+    if (selectedClips.size === 0) return;
     ev.preventDefault();
     const targets = [...selectedClips].map((k) => {
       const [tid, cid] = k.split(":");
@@ -2140,6 +2465,11 @@ interface ArrangerUi {
   playheadOverlay: HTMLDivElement;
   addTrackBtn: HTMLButtonElement;
   deleteClipBtn: HTMLButtonElement;
+  groupBtn: HTMLButtonElement;
+  ungroupBtn: HTMLButtonElement;
+  renameGroupBtn: HTMLButtonElement;
+  patternPicker: HTMLSelectElement;
+  insertPatternBtn: HTMLButtonElement;
   modeBeatsBtn: HTMLButtonElement;
   modeTimeBtn: HTMLButtonElement;
   snapSelect: HTMLSelectElement;
@@ -2254,6 +2584,30 @@ function buildUi(root: HTMLElement): ArrangerUi {
   deleteClipBtn.disabled = true;
   deleteClipBtn.title =
     "Click to bin selected clips — or drag a clip here. Ctrl/Cmd-click clips to multi-select.";
+  const groupBtn = makeToolbarBtn("Group");
+  groupBtn.disabled = true;
+  groupBtn.title = "Group selected clips so they move and select together (G)";
+  const ungroupBtn = makeToolbarBtn("Ungroup");
+  ungroupBtn.disabled = true;
+  ungroupBtn.title = "Remove selected clips from their group (Shift+G)";
+  const renameGroupBtn = makeToolbarBtn("Rename");
+  renameGroupBtn.disabled = true;
+  renameGroupBtn.title = "Rename the selected group";
+
+  const patternPicker = document.createElement("select");
+  Object.assign(patternPicker.style, {
+    padding: "4px 6px",
+    background: "var(--bg-sunken)",
+    color: "var(--text-2)",
+    border: "1px solid var(--line-2)",
+    borderRadius: "var(--r-2)",
+    fontSize: "12px",
+    fontFamily: "inherit",
+  } satisfies Partial<CSSStyleDeclaration>);
+  patternPicker.title = "Saved drum patterns";
+  const insertPatternBtn = makeToolbarBtn("Insert pattern");
+  insertPatternBtn.disabled = true;
+  insertPatternBtn.title = "Stamp the selected pattern at the playhead as a new group";
 
   const sep1 = makeSep();
   const gridLabel = document.createElement("span");
@@ -2317,6 +2671,11 @@ function buildUi(root: HTMLElement): ArrangerUi {
   toolbar.appendChild(tracksTitle);
   toolbar.appendChild(addTrackBtn);
   toolbar.appendChild(deleteClipBtn);
+  toolbar.appendChild(groupBtn);
+  toolbar.appendChild(ungroupBtn);
+  toolbar.appendChild(renameGroupBtn);
+  toolbar.appendChild(patternPicker);
+  toolbar.appendChild(insertPatternBtn);
   toolbar.appendChild(sep1);
   toolbar.appendChild(gridLabel);
   toolbar.appendChild(modeBeatsBtn);
@@ -2560,6 +2919,11 @@ function buildUi(root: HTMLElement): ArrangerUi {
     playheadOverlay,
     addTrackBtn,
     deleteClipBtn,
+    groupBtn,
+    ungroupBtn,
+    renameGroupBtn,
+    patternPicker,
+    insertPatternBtn,
     modeBeatsBtn,
     modeTimeBtn,
     snapSelect,

@@ -42,6 +42,19 @@ export interface ClipInfo {
   pan: number;
   volumeEnvelope: Breakpoint[];
   panEnvelope: Breakpoint[];
+  // 0 means ungrouped. Any other value identifies a clip group whose
+  // members move and select together in the arranger.
+  group: number;
+}
+
+export interface GroupInfo {
+  id: number;
+  name: string;
+}
+
+export interface PatternInfo {
+  name: string;
+  gridJson: string;
 }
 
 export interface NoiseProfileInfo {
@@ -343,6 +356,71 @@ export class EngineClient {
     return ev.removed;
   }
 
+  /** Assign a clip to a group. `groupId === 0` removes any existing group. */
+  async setClipGroup(trackId: number, clipId: number, groupId: number): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_clip_group" }>(
+      (req) => ({ kind: "set_clip_group", req, trackId, clipId, groupId }),
+    );
+    if (ev.kind !== "set_clip_group_ok") throw new Error("unexpected event");
+  }
+
+  /** Return the named groups stored in the project. Clips can reference a
+   *  group id that has no name entry — UIs should fall back to "Group N". */
+  async listGroups(): Promise<GroupInfo[]> {
+    const ev = await this.request<EngineCommand & { kind: "list_groups" }>(
+      (req) => ({ kind: "list_groups", req }),
+    );
+    if (ev.kind !== "list_groups_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as GroupInfo[];
+  }
+
+  async setGroupName(groupId: number, name: string): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_group_name" }>(
+      (req) => ({ kind: "set_group_name", req, groupId, name }),
+    );
+    if (ev.kind !== "set_group_name_ok") throw new Error("unexpected event");
+  }
+
+  async removeGroup(groupId: number): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "remove_group" }>(
+      (req) => ({ kind: "remove_group", req, groupId }),
+    );
+    if (ev.kind !== "remove_group_ok") throw new Error("unexpected event");
+    return ev.removed;
+  }
+
+  async listPatterns(): Promise<PatternInfo[]> {
+    const ev = await this.request<EngineCommand & { kind: "list_patterns" }>(
+      (req) => ({ kind: "list_patterns", req }),
+    );
+    if (ev.kind !== "list_patterns_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as PatternInfo[];
+  }
+
+  async savePattern(name: string, gridJson: string): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "save_pattern" }>(
+      (req) => ({ kind: "save_pattern", req, name, gridJson }),
+    );
+    if (ev.kind !== "save_pattern_ok") throw new Error("unexpected event");
+  }
+
+  /** Returns the saved gridJson for `name`, or null if no such pattern. */
+  async loadPattern(name: string): Promise<string | null> {
+    const ev = await this.request<EngineCommand & { kind: "load_pattern" }>(
+      (req) => ({ kind: "load_pattern", req, name }),
+    );
+    if (ev.kind !== "load_pattern_ok") throw new Error("unexpected event");
+    return ev.gridJson;
+  }
+
+  async removePattern(name: string): Promise<boolean> {
+    const ev = await this.request<EngineCommand & { kind: "remove_pattern" }>(
+      (req) => ({ kind: "remove_pattern", req, name }),
+    );
+    if (ev.kind !== "remove_pattern_ok") throw new Error("unexpected event");
+    return ev.removed;
+  }
+
   async mixdownWav(): Promise<Uint8Array> {
     const ev = await this.request<EngineCommand & { kind: "mixdown_wav" }>(
       (req) => ({ kind: "mixdown_wav", req }),
@@ -507,6 +585,21 @@ export class EngineClient {
     );
     if (ev.kind !== "list_noise_profiles_ok") throw new Error("unexpected event");
     return JSON.parse(ev.json) as NoiseProfileInfo[];
+  }
+
+  /** Pull raw interleaved samples for a source range. Used by the drum
+   *  sequencer to populate per-pad AudioBuffers for low-latency live
+   *  preview without round-tripping through mixdownWav. */
+  async querySamples(
+    sourceId: string,
+    startFrame: number,
+    endFrame: number,
+  ): Promise<{ samples: Float32Array; channels: number }> {
+    const ev = await this.request<EngineCommand & { kind: "query_samples" }>(
+      (req) => ({ kind: "query_samples", req, sourceId, startFrame, endFrame }),
+    );
+    if (ev.kind !== "query_samples_ok") throw new Error("unexpected event");
+    return { samples: ev.samples, channels: ev.channels };
   }
 
   terminate(): void {

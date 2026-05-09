@@ -10,8 +10,9 @@ import { EngineClient, EngineUnavailable } from "./engine/client";
 import { Playback } from "./audio/playback";
 import { mountEditor } from "./editor";
 import { mountArranger } from "./arranger";
+import { mountDrums } from "./drums";
 
-type TabId = "editor" | "arranger";
+type TabId = "editor" | "arranger" | "drums";
 
 async function main(): Promise<void> {
   const root = document.querySelector<HTMLDivElement>("#app");
@@ -49,8 +50,10 @@ async function main(): Promise<void> {
   tabs.className = "tabs";
   const editorTab = makeTab("EDITOR");
   const arrangerTab = makeTab("ARRANGER");
+  const drumsTab = makeTab("DRUMS");
   tabs.appendChild(editorTab);
   tabs.appendChild(arrangerTab);
+  tabs.appendChild(drumsTab);
   topbar.appendChild(tabs);
 
   // Timecode
@@ -112,16 +115,21 @@ async function main(): Promise<void> {
   workspace.className = "workspace";
   const editorRoot = document.createElement("div");
   const arrangerRoot = document.createElement("div");
+  const drumsRoot = document.createElement("div");
   arrangerRoot.style.display = "none";
+  drumsRoot.style.display = "none";
   // flex:1 + minHeight:0 lets the editor/arranger fill the workspace and
   // shrink below content height — the inner library/source list relies
   // on this cascade to scroll instead of pushing chrome off the bottom.
   editorRoot.style.flex = "1 1 auto";
   arrangerRoot.style.flex = "1 1 auto";
+  drumsRoot.style.flex = "1 1 auto";
   editorRoot.style.minHeight = "0";
   arrangerRoot.style.minHeight = "0";
+  drumsRoot.style.minHeight = "0";
   workspace.appendChild(editorRoot);
   workspace.appendChild(arrangerRoot);
+  workspace.appendChild(drumsRoot);
   root.appendChild(workspace);
 
   // ---- transport bar --------------------------------------------------
@@ -182,11 +190,18 @@ async function main(): Promise<void> {
   const editor = await mountEditor(editorRoot, client, playback, {
     onSourceImported: () => {
       void arranger.refresh();
+      void drums.refresh();
     },
   });
   const arranger = await mountArranger(arrangerRoot, client, {
     onSourceImported: () => {
       void editor.refreshLibrary();
+      void drums.refresh();
+    },
+  });
+  const drums = await mountDrums(drumsRoot, client, {
+    onArrangerNeedsRefresh: () => {
+      void arranger.refresh();
     },
   });
 
@@ -223,6 +238,7 @@ async function main(): Promise<void> {
       await client.importKepz(new Uint8Array(buf));
       await editor.reset();
       await arranger.refresh();
+      await drums.refresh();
       statusFile.textContent = file.name;
       statusContext.textContent = "loaded";
     } catch (err) {
@@ -237,12 +253,16 @@ async function main(): Promise<void> {
   const showTab = (tab: TabId): void => {
     editorRoot.style.display = tab === "editor" ? "flex" : "none";
     arrangerRoot.style.display = tab === "arranger" ? "flex" : "none";
+    drumsRoot.style.display = tab === "drums" ? "flex" : "none";
     editorTab.classList.toggle("active", tab === "editor");
     arrangerTab.classList.toggle("active", tab === "arranger");
+    drumsTab.classList.toggle("active", tab === "drums");
     if (tab === "arranger") void arranger.refresh();
+    if (tab === "drums") void drums.refresh();
   };
   editorTab.addEventListener("click", () => showTab("editor"));
   arrangerTab.addEventListener("click", () => showTab("arranger"));
+  drumsTab.addEventListener("click", () => showTab("drums"));
   showTab("editor");
 
   // ---- timecode + status loop ----------------------------------------

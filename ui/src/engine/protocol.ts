@@ -86,6 +86,21 @@ export type EngineCommand =
       sourceOut: number;
     }
   | { kind: "remove_clip"; req: RequestId; trackId: number; clipId: number }
+  | {
+      kind: "set_clip_group";
+      req: RequestId;
+      trackId: number;
+      clipId: number;
+      // 0 means ungroup; any other value sets that group id.
+      groupId: number;
+    }
+  | { kind: "list_groups"; req: RequestId }
+  | { kind: "set_group_name"; req: RequestId; groupId: number; name: string }
+  | { kind: "remove_group"; req: RequestId; groupId: number }
+  | { kind: "list_patterns"; req: RequestId }
+  | { kind: "save_pattern"; req: RequestId; name: string; gridJson: string }
+  | { kind: "load_pattern"; req: RequestId; name: string }
+  | { kind: "remove_pattern"; req: RequestId; name: string }
   | { kind: "mixdown_wav"; req: RequestId }
   | { kind: "export_kepz"; req: RequestId }
   | { kind: "import_kepz"; req: RequestId; bytes: Uint8Array }
@@ -136,6 +151,13 @@ export type EngineCommand =
       clipId: number;
       parameter: "volume" | "pan";
       breakpointsJson: string;
+    }
+  | {
+      kind: "query_samples";
+      req: RequestId;
+      sourceId: string;
+      startFrame: number;
+      endFrame: number;
     };
 
 export type EngineEvent =
@@ -172,6 +194,14 @@ export type EngineEvent =
   | { kind: "move_clip_ok"; req: RequestId }
   | { kind: "set_clip_source_range_ok"; req: RequestId }
   | { kind: "remove_clip_ok"; req: RequestId; removed: boolean }
+  | { kind: "set_clip_group_ok"; req: RequestId }
+  | { kind: "list_groups_ok"; req: RequestId; json: string }
+  | { kind: "set_group_name_ok"; req: RequestId }
+  | { kind: "remove_group_ok"; req: RequestId; removed: boolean }
+  | { kind: "list_patterns_ok"; req: RequestId; json: string }
+  | { kind: "save_pattern_ok"; req: RequestId }
+  | { kind: "load_pattern_ok"; req: RequestId; gridJson: string | null }
+  | { kind: "remove_pattern_ok"; req: RequestId; removed: boolean }
   | { kind: "mixdown_wav_ok"; req: RequestId; bytes: Uint8Array }
   | { kind: "export_kepz_ok"; req: RequestId; bytes: Uint8Array }
   | { kind: "import_kepz_ok"; req: RequestId }
@@ -185,4 +215,5 @@ export type EngineEvent =
   | { kind: "capture_noise_profile_ok"; req: RequestId }
   | { kind: "list_noise_profiles_ok"; req: RequestId; json: string }
   | { kind: "set_clip_envelope_ok"; req: RequestId }
+  | { kind: "query_samples_ok"; req: RequestId; samples: Float32Array; channels: number }
   | { kind: "error"; req: RequestId; reason: string };

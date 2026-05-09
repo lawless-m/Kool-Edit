@@ -733,6 +733,9 @@ mod wasm_api {
                         "pan": c.pan,
                         "volumeEnvelope": env_to_json(EnvelopeParam::Volume),
                         "panEnvelope": env_to_json(EnvelopeParam::Pan),
+                        // 0 means ungrouped — matches the wire convention used
+                        // by setClipGroup so callers don't have to handle null.
+                        "group": c.group.map(|g| g.0).unwrap_or(0),
                     })
                 })
                 .collect();
@@ -875,6 +878,132 @@ mod wasm_api {
             let before = track.clips.len();
             track.clips.retain(|c| c.id.0 != clip_id);
             track.clips.len() != before
+        }
+
+        /// Set the group id of a clip. `group_id == 0` clears the group
+        /// (clip becomes ungrouped). Other values are stored verbatim — the
+        /// caller is responsible for minting fresh ids that don't collide.
+        #[wasm_bindgen(js_name = setClipGroup)]
+        pub fn set_clip_group(
+            &mut self,
+            track_id: u64,
+            clip_id: u64,
+            group_id: u64,
+        ) -> Result<(), JsError> {
+            use crate::ids::GroupId;
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            let clip = track
+                .clips
+                .iter_mut()
+                .find(|c| c.id.0 == clip_id)
+                .ok_or_else(|| JsError::new(&format!("unknown clip {clip_id}")))?;
+            clip.group = if group_id == 0 {
+                None
+            } else {
+                Some(GroupId(group_id))
+            };
+            Ok(())
+        }
+
+        // ---- groups ----------------------------------------------------
+
+        /// JSON: `[{id, name}]`. Only includes groups that have been
+        /// explicitly named via setGroupName — clips referencing an
+        /// id that has no entry are still valid (the UI can fall back to
+        /// "Group N" for those).
+        #[wasm_bindgen(js_name = listGroups)]
+        pub fn list_groups(&self) -> String {
+            let arr: Vec<serde_json::Value> = self
+                .inner
+                .project()
+                .groups
+                .iter()
+                .map(|g| serde_json::json!({ "id": g.id.0, "name": g.name }))
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        }
+
+        /// Set or update the human-readable name of a group. Inserts a new
+        /// entry if the id isn't already named. Empty names are accepted —
+        /// the UI is responsible for any "must not be empty" rule.
+        #[wasm_bindgen(js_name = setGroupName)]
+        pub fn set_group_name(&mut self, group_id: u64, name: String) {
+            use crate::ids::GroupId;
+            use crate::project::Group;
+            let id = GroupId(group_id);
+            let groups = &mut self.inner.project_mut().groups;
+            if let Some(g) = groups.iter_mut().find(|g| g.id == id) {
+                g.name = name;
+            } else {
+                groups.push(Group { id, name });
+            }
+        }
+
+        /// Remove a group's entry from `Project::groups`. Member clips keep
+        /// their `group` id — call setClipGroup with 0 to actually free
+        /// them. Returns true if an entry was removed.
+        #[wasm_bindgen(js_name = removeGroup)]
+        pub fn remove_group(&mut self, group_id: u64) -> bool {
+            use crate::ids::GroupId;
+            let id = GroupId(group_id);
+            let groups = &mut self.inner.project_mut().groups;
+            let before = groups.len();
+            groups.retain(|g| g.id != id);
+            groups.len() != before
+        }
+
+        // ---- patterns --------------------------------------------------
+
+        /// JSON: `[{name, gridJson}]`. Patterns are stored opaquely — the
+        /// engine doesn't parse `gridJson`.
+        #[wasm_bindgen(js_name = listPatterns)]
+        pub fn list_patterns(&self) -> String {
+            let arr: Vec<serde_json::Value> = self
+                .inner
+                .project()
+                .patterns
+                .iter()
+                .map(|p| serde_json::json!({ "name": p.name, "gridJson": p.grid_json }))
+                .collect();
+            serde_json::Value::Array(arr).to_string()
+        }
+
+        /// Insert or replace a saved pattern. `name` is the unique key.
+        #[wasm_bindgen(js_name = savePattern)]
+        pub fn save_pattern(&mut self, name: String, grid_json: String) {
+            use crate::project::Pattern;
+            let patterns = &mut self.inner.project_mut().patterns;
+            if let Some(p) = patterns.iter_mut().find(|p| p.name == name) {
+                p.grid_json = grid_json;
+            } else {
+                patterns.push(Pattern { name, grid_json });
+            }
+        }
+
+        /// Look up a saved pattern's grid JSON by name. Returns `None` when
+        /// no pattern with that name exists.
+        #[wasm_bindgen(js_name = loadPattern)]
+        pub fn load_pattern(&self, name: String) -> Option<String> {
+            self.inner
+                .project()
+                .patterns
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| p.grid_json.clone())
+        }
+
+        /// Remove a saved pattern by name. Returns true if anything was
+        /// removed.
+        #[wasm_bindgen(js_name = removePattern)]
+        pub fn remove_pattern(&mut self, name: String) -> bool {
+            let patterns = &mut self.inner.project_mut().patterns;
+            let before = patterns.len();
+            patterns.retain(|p| p.name != name);
+            patterns.len() != before
         }
     }
 }

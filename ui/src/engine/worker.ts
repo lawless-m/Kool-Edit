@@ -65,6 +65,14 @@ type WasmEngine = {
     sourceOut: bigint,
   ) => void;
   removeClip: (trackId: bigint, clipId: bigint) => boolean;
+  setClipGroup: (trackId: bigint, clipId: bigint, groupId: bigint) => void;
+  listGroups: () => string;
+  setGroupName: (groupId: bigint, name: string) => void;
+  removeGroup: (groupId: bigint) => boolean;
+  listPatterns: () => string;
+  savePattern: (name: string, gridJson: string) => void;
+  loadPattern: (name: string) => string | undefined;
+  removePattern: (name: string) => boolean;
   mixdownWav: () => Uint8Array;
   exportKepz: () => Uint8Array;
   importKepz: (bytes: Uint8Array) => void;
@@ -405,6 +413,58 @@ let playback: PlaybackState | null = null;
           return;
         }
 
+        case "set_clip_group": {
+          engine.setClipGroup(
+            BigInt(cmd.trackId),
+            BigInt(cmd.clipId),
+            BigInt(cmd.groupId),
+          );
+          send({ kind: "set_clip_group_ok", req: cmd.req });
+          return;
+        }
+
+        case "list_groups": {
+          const json = engine.listGroups();
+          send({ kind: "list_groups_ok", req: cmd.req, json });
+          return;
+        }
+
+        case "set_group_name": {
+          engine.setGroupName(BigInt(cmd.groupId), cmd.name);
+          send({ kind: "set_group_name_ok", req: cmd.req });
+          return;
+        }
+
+        case "remove_group": {
+          const removed = engine.removeGroup(BigInt(cmd.groupId));
+          send({ kind: "remove_group_ok", req: cmd.req, removed });
+          return;
+        }
+
+        case "list_patterns": {
+          const json = engine.listPatterns();
+          send({ kind: "list_patterns_ok", req: cmd.req, json });
+          return;
+        }
+
+        case "save_pattern": {
+          engine.savePattern(cmd.name, cmd.gridJson);
+          send({ kind: "save_pattern_ok", req: cmd.req });
+          return;
+        }
+
+        case "load_pattern": {
+          const gridJson = engine.loadPattern(cmd.name) ?? null;
+          send({ kind: "load_pattern_ok", req: cmd.req, gridJson });
+          return;
+        }
+
+        case "remove_pattern": {
+          const removed = engine.removePattern(cmd.name);
+          send({ kind: "remove_pattern_ok", req: cmd.req, removed });
+          return;
+        }
+
         case "mixdown_wav": {
           const bytes = engine.mixdownWav();
           send({ kind: "mixdown_wav_ok", req: cmd.req, bytes });
@@ -510,6 +570,21 @@ let playback: PlaybackState | null = null;
             cmd.breakpointsJson,
           );
           send({ kind: "set_clip_envelope_ok", req: cmd.req });
+          return;
+        }
+
+        case "query_samples": {
+          const ch = engine.sourceChannelCount(cmd.sourceId);
+          if (ch === undefined) {
+            send({ kind: "error", req: cmd.req, reason: `unknown source ${cmd.sourceId}` });
+            return;
+          }
+          const samples = engine.querySamples(
+            cmd.sourceId,
+            BigInt(Math.floor(cmd.startFrame)),
+            BigInt(Math.floor(cmd.endFrame)),
+          );
+          send({ kind: "query_samples_ok", req: cmd.req, samples, channels: ch });
           return;
         }
       }

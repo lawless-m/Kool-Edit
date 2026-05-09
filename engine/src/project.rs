@@ -165,6 +165,25 @@ impl Default for MasterBus {
     }
 }
 
+/// Human-readable name for a clip group. The id matches the `group` field on
+/// member clips. Naming a group is independent of which clips reference it —
+/// renaming the group doesn't touch the clips, and clearing a clip's group
+/// doesn't remove the entry from `Project::groups`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Group {
+    pub id: crate::ids::GroupId,
+    pub name: String,
+}
+
+/// A saved drum-machine pattern. Stored opaquely as JSON because the schema
+/// lives in the UI; the engine just persists and serves it back. `name` is
+/// the unique key used by the UI to recall a pattern by name.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Pattern {
+    pub name: String,
+    pub grid_json: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Project {
     /// JSON `format_version`. Pinned at construction; migration runs at load.
@@ -182,6 +201,13 @@ pub struct Project {
     #[serde(default)]
     pub tempo: TempoSettings,
     pub noise_profiles: BTreeMap<ProfileId, NoiseProfile>,
+    /// Names for clip groups. Uses #[serde(default)] so older project files
+    /// without this field still load.
+    #[serde(default)]
+    pub groups: Vec<Group>,
+    /// Saved drum-machine patterns. Same migration story as `groups`.
+    #[serde(default)]
+    pub patterns: Vec<Pattern>,
 }
 
 impl Project {
@@ -198,6 +224,8 @@ impl Project {
             view: ViewState::default(),
             tempo: TempoSettings::default(),
             noise_profiles: BTreeMap::new(),
+            groups: Vec::new(),
+            patterns: Vec::new(),
         }
     }
 
