@@ -45,8 +45,13 @@ export interface SavedPatternGrid {
 }
 
 const DEFAULT_LANE_LABELS = ["BD", "SD", "HH", "OH", "CY", "CP"];
-const DEFAULT_STEPS = 16;
+// One cell = one 16th note. 4 beats per bar × 4 sixteenths per beat = 16
+// cells per bar (matches the Oberheim DMX layout). The + button extends
+// the pattern by BARS_PER_EXTEND bars per click.
 const STEPS_PER_GROUP = 4;
+const STEPS_PER_BAR = STEPS_PER_GROUP * 4;
+const BARS_PER_EXTEND = 1;
+const DEFAULT_STEPS = STEPS_PER_BAR;
 
 export interface DrumsHandle {
   refresh(): Promise<void>;
@@ -75,11 +80,14 @@ export async function mountDrums(
   // a "step" as one 16th regardless of the project signature so the bar
   // count always works out cleanly for the user's 16-step pattern.
   const stepsPerBeat = 4;
+  // Mutable so the + button can extend the pattern. Every lane carries
+  // exactly this many step booleans; growStepCount keeps them in sync.
+  let stepCount = DEFAULT_STEPS;
 
   const lanes: Lane[] = DEFAULT_LANE_LABELS.map((label) => ({
     label,
     sourceId: null,
-    steps: new Array<boolean>(DEFAULT_STEPS).fill(false),
+    steps: new Array<boolean>(stepCount).fill(false),
   }));
 
   // AudioBuffer cache keyed by sourceId. Populated lazily on first preview
@@ -124,6 +132,17 @@ export async function mountDrums(
   bpmDisplay.style.color = "#d8d8d8";
   bpmDisplay.textContent = "— BPM";
   toolbar.appendChild(bpmDisplay);
+
+  // Live readout of the current pattern length in bars. Driven by
+  // updateLengthDisplay() whenever stepCount changes.
+  const lengthDisplay = document.createElement("div");
+  lengthDisplay.style.fontSize = "12px";
+  lengthDisplay.style.color = "#9a9a9a";
+  toolbar.appendChild(lengthDisplay);
+
+  const addBarsBtn = makeBtn(`+ ${BARS_PER_EXTEND} bar${BARS_PER_EXTEND === 1 ? "" : "s"}`);
+  addBarsBtn.title = `Extend the pattern by ${BARS_PER_EXTEND} bar${BARS_PER_EXTEND === 1 ? "" : "s"}`;
+  toolbar.appendChild(addBarsBtn);
 
   const spacer = document.createElement("div");
   spacer.style.flex = "1";
@@ -204,6 +223,12 @@ export async function mountDrums(
   const drawGrid = (): void => {
     grid.innerHTML = "";
 
+    // Beat labels are anchored DIRECTLY to the cell buttons of the first
+    // lane (position: absolute children of each downbeat cell). They live
+    // in the cell's own positioning context, so whatever flex / overflow /
+    // scroll behaviour places the cell also places the label — they
+    // cannot drift apart, even when the row scrolls off-screen.
+
     for (let li = 0; li < lanes.length; li++) {
       const lane = lanes[li]!;
       const row = document.createElement("div");
@@ -212,6 +237,9 @@ export async function mountDrums(
         alignItems: "center",
         gap: "8px",
         marginBottom: "6px",
+        // First row gets headroom so the per-cell labels can render above
+        // the cells without overlapping the toolbar / status row.
+        marginTop: li === 0 ? "16px" : "0",
       } satisfies Partial<CSSStyleDeclaration>);
 
       // Editable label so the user can rename "HH" to "tom" etc. without a
@@ -220,6 +248,10 @@ export async function mountDrums(
       label.value = lane.label;
       Object.assign(label.style, {
         width: "44px",
+        // border-box keeps the actual layout width at 44px regardless of
+        // padding+border; otherwise the input would be 10px wider than the
+        // header's 44px spacer and shove every cell out of alignment.
+        boxSizing: "border-box",
         background: "transparent",
         color: "#d8d8d8",
         border: "1px solid transparent",
@@ -238,6 +270,7 @@ export async function mountDrums(
       const picker = document.createElement("select");
       Object.assign(picker.style, {
         width: "180px",
+        boxSizing: "border-box",
         background: "#1a1a1a",
         color: "#d8d8d8",
         border: "1px solid #333",
@@ -275,6 +308,7 @@ export async function mountDrums(
         if (s > 0 && s % STEPS_PER_GROUP === 0) {
           const gutter = document.createElement("div");
           gutter.style.width = "10px";
+          gutter.style.flexShrink = "0";
           cells.appendChild(gutter);
         }
         const cell = document.createElement("button");
@@ -286,6 +320,9 @@ export async function mountDrums(
         Object.assign(cell.style, {
           width: "26px",
           height: "32px",
+          // border-box so the 1px border doesn't push each cell to 28px and
+          // drift the row out of alignment with the bar.beat header.
+          boxSizing: "border-box",
           margin: "0 2px",
           borderRadius: "3px",
           border: isActiveStep ? "1px solid #ffe066" : "1px solid #555",
@@ -293,7 +330,31 @@ export async function mountDrums(
           cursor: "pointer",
           padding: "0",
           flexShrink: "0",
+          // Establishes the positioning context for the bar.beat label
+          // attached to first-row downbeat cells.
+          position: "relative",
         } satisfies Partial<CSSStyleDeclaration>);
+        // Anchor the bar.beat label to the first lane's downbeat cells so
+        // the label and cell share a positioning context — they move
+        // together no matter what flex/scroll does to the row.
+        if (li === 0 && s % STEPS_PER_GROUP === 0) {
+          const bar = Math.floor(s / STEPS_PER_BAR) + 1;
+          const beat = Math.floor((s % STEPS_PER_BAR) / STEPS_PER_GROUP) + 1;
+          const labelOnCell = document.createElement("span");
+          labelOnCell.textContent = `${bar}.${beat}`;
+          Object.assign(labelOnCell.style, {
+            position: "absolute",
+            top: "-14px",
+            left: "0",
+            fontSize: "10px",
+            color: beat === 1 ? "#d8d8d8" : "#7a7a7a",
+            fontWeight: beat === 1 ? "600" : "400",
+            pointerEvents: "none",
+            whiteSpace: "nowrap",
+            fontFamily: "inherit",
+          } satisfies Partial<CSSStyleDeclaration>);
+          cell.appendChild(labelOnCell);
+        }
         cell.addEventListener("click", () => {
           lane.steps[s] = !lane.steps[s];
           drawGrid();
@@ -362,7 +423,7 @@ export async function mountDrums(
     return beatDurSec / stepsPerBeat;
   };
 
-  const patternDurationSec = (): number => stepDurationSec() * DEFAULT_STEPS;
+  const patternDurationSec = (): number => stepDurationSec() * stepCount;
 
   /** Schedule one full pattern pass starting at `startCtxTime`. Returns
    *  the array of sources scheduled so callers can cancel mid-flight. */
@@ -378,7 +439,7 @@ export async function mountDrums(
       const buf = await prefetchBuffer(lane.sourceId);
       if (buf) lanesWithBufs.push({ lane, buf });
     }
-    for (let s = 0; s < DEFAULT_STEPS; s++) {
+    for (let s = 0; s < stepCount; s++) {
       const t = startCtxTime + s * stepDur;
       for (const { lane, buf } of lanesWithBufs) {
         if (!lane.steps[s]) continue;
@@ -451,7 +512,7 @@ export async function mountDrums(
       const elapsed = audioCtx.currentTime - previewStartCtxTime;
       const stepDur = stepDurationSec();
       // elapsed can be negative for ~50ms while we're waiting on startAt
-      const step = Math.max(0, Math.floor(elapsed / Math.max(0.0001, stepDur))) % DEFAULT_STEPS;
+      const step = Math.max(0, Math.floor(elapsed / Math.max(0.0001, stepDur))) % stepCount;
       if (step !== activeStep) {
         activeStep = step;
         drawGrid();
@@ -532,7 +593,7 @@ export async function mountDrums(
       sourceId: l.sourceId,
       steps: [...l.steps],
     })),
-    stepCount: DEFAULT_STEPS,
+    stepCount,
     stepsPerBeat,
   });
 
@@ -580,23 +641,31 @@ export async function mountDrums(
       setStatus(`pattern parse failed: ${String(err)}`);
       return;
     }
+    // Adopt the saved pattern's length so + extensions on the previous
+    // pattern don't bleed into a freshly-loaded one. Falls back to 16 for
+    // older patterns that didn't capture stepCount.
+    stepCount = Math.max(STEPS_PER_BAR, grid.stepCount || DEFAULT_STEPS);
     // Replace as much of the editor state as the loaded pattern provides.
-    // Lane count is fixed (we don't grow/shrink) so we copy by index.
+    // Lane count is fixed (we don't grow/shrink) so we copy by index. Per-
+    // lane step buffers are resized to match the new stepCount.
     for (let i = 0; i < lanes.length; i++) {
       const src = grid.lanes[i];
+      lanes[i]!.steps = new Array<boolean>(stepCount).fill(false);
       if (!src) {
-        lanes[i]!.steps.fill(false);
         lanes[i]!.sourceId = null;
         continue;
       }
       lanes[i]!.label = src.label;
       lanes[i]!.sourceId = src.sourceId;
       const steps = lanes[i]!.steps;
-      for (let s = 0; s < steps.length; s++) steps[s] = !!src.steps[s];
+      for (let s = 0; s < Math.min(steps.length, src.steps.length); s++) {
+        steps[s] = !!src.steps[s];
+      }
     }
     nameInput.value = name;
+    updateLengthDisplay();
     drawGrid();
-    setStatus(`loaded "${name}"`);
+    setStatus(`loaded "${name}" (${stepCount / STEPS_PER_BAR} bars)`);
   };
 
   /** Save the current grid under the name in the textbox, replacing any
@@ -617,6 +686,29 @@ export async function mountDrums(
   };
 
   // ---- toolbar wiring -------------------------------------------------
+
+  // Refresh the toolbar's bar-count chip from the current stepCount. Cheap
+  // enough to call from anywhere that touches stepCount.
+  const updateLengthDisplay = (): void => {
+    const bars = stepCount / STEPS_PER_BAR;
+    lengthDisplay.textContent = `${bars} bar${bars === 1 ? "" : "s"} · ${stepCount} steps`;
+  };
+  updateLengthDisplay();
+
+  // Stop preview before extending — the scheduler captures stepCount at
+  // schedule time, so live-mutating it under a running preview would leave
+  // a half-pattern dangling on the audio clock.
+  addBarsBtn.addEventListener("click", () => {
+    if (previewLoopTimer !== null) stopPreview();
+    const added = BARS_PER_EXTEND * STEPS_PER_BAR;
+    stepCount += added;
+    for (const lane of lanes) {
+      lane.steps.push(...new Array<boolean>(added).fill(false));
+    }
+    updateLengthDisplay();
+    drawGrid();
+    setStatus(`extended to ${stepCount / STEPS_PER_BAR} bars`);
+  });
 
   playBtn.addEventListener("click", () => {
     void startPreview();
