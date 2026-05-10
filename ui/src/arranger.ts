@@ -1262,9 +1262,60 @@ export async function mountArranger(
         rerenderIfPlaying();
       });
 
+      // Pan: slider -100..+100 mapped to -1..+1 in the engine. Width is
+      // tight on purpose (60px) so the bottom row doesn't push the choke
+      // button off small viewports. Double-clicking the readout centres
+      // the slider; the readout itself reads "C"/"L34"/"R72" so the
+      // direction is unambiguous at a glance.
+      const panSlider = document.createElement("input");
+      panSlider.type = "range";
+      panSlider.min = "-100";
+      panSlider.max = "100";
+      panSlider.step = "1";
+      panSlider.value = String(Math.round(track.pan * 100));
+      panSlider.title = "Track pan (L ← C → R) — double-click value to centre";
+      Object.assign(panSlider.style, {
+        width: "60px",
+        marginLeft: "6px",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const panReadout = document.createElement("span");
+      const panLetter = (v: number): string => {
+        const r = Math.round(v * 100);
+        if (r === 0) return "C";
+        return r < 0 ? `L${-r}` : `R${r}`;
+      };
+      panReadout.textContent = panLetter(track.pan);
+      Object.assign(panReadout.style, {
+        color: "#888",
+        fontSize: "10px",
+        fontFamily: "ui-monospace, monospace",
+        width: "28px",
+        textAlign: "left",
+        cursor: "pointer",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const commitPan = (pan: number, rerender: boolean): void => {
+        const clamped = Math.max(-1, Math.min(1, pan));
+        panSlider.value = String(Math.round(clamped * 100));
+        panReadout.textContent = panLetter(clamped);
+        void client.setTrackPan(track.id, clamped);
+        if (rerender && playSession) {
+          const wasLooping = playSession.loop;
+          void startPlayback(wasLooping);
+        }
+      };
+      panSlider.addEventListener("input", () => {
+        commitPan(Number(panSlider.value) / 100, false);
+      });
+      panSlider.addEventListener("change", () => {
+        commitPan(Number(panSlider.value) / 100, true);
+      });
+      panReadout.addEventListener("dblclick", () => commitPan(0, true));
+
       bottomRow.appendChild(gainInput);
       bottomRow.appendChild(spinnerCol);
       bottomRow.appendChild(dbLabel);
+      bottomRow.appendChild(panSlider);
+      bottomRow.appendChild(panReadout);
       bottomRow.appendChild(chokeBtn);
       bottomRow.appendChild(sub);
 

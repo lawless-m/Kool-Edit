@@ -57,6 +57,7 @@ export type EngineCommand =
   | { kind: "list_tracks"; req: RequestId }
   | { kind: "remove_track"; req: RequestId; trackId: number }
   | { kind: "set_track_gain"; req: RequestId; trackId: number; gainDb: number }
+  | { kind: "set_track_pan"; req: RequestId; trackId: number; pan: number }
   | { kind: "set_track_mute"; req: RequestId; trackId: number; mute: boolean }
   | { kind: "set_track_solo"; req: RequestId; trackId: number; solo: boolean }
   | { kind: "set_track_name"; req: RequestId; trackId: number; name: string }
@@ -196,6 +197,7 @@ export type EngineEvent =
   | { kind: "list_tracks_ok"; req: RequestId; json: string }
   | { kind: "remove_track_ok"; req: RequestId; removed: boolean }
   | { kind: "set_track_gain_ok"; req: RequestId }
+  | { kind: "set_track_pan_ok"; req: RequestId }
   | { kind: "set_track_mute_ok"; req: RequestId }
   | { kind: "set_track_solo_ok"; req: RequestId }
   | { kind: "set_track_name_ok"; req: RequestId }

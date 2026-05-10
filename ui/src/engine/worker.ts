@@ -46,6 +46,7 @@ type WasmEngine = {
   listTracks: () => string;
   removeTrack: (trackId: bigint) => boolean;
   setTrackGain: (trackId: bigint, gainDb: number) => void;
+  setTrackPan: (trackId: bigint, pan: number) => void;
   setTrackMute: (trackId: bigint, mute: boolean) => void;
   setTrackSolo: (trackId: bigint, solo: boolean) => void;
   setTrackName: (trackId: bigint, name: string) => void;
@@ -349,6 +350,11 @@ let playback: PlaybackState | null = null;
         case "set_track_gain": {
           engine.setTrackGain(BigInt(cmd.trackId), cmd.gainDb);
           send({ kind: "set_track_gain_ok", req: cmd.req });
+          return;
+        }
+        case "set_track_pan": {
+          engine.setTrackPan(BigInt(cmd.trackId), cmd.pan);
+          send({ kind: "set_track_pan_ok", req: cmd.req });
           return;
         }
 

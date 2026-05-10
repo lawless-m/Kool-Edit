@@ -288,6 +288,15 @@ export class EngineClient {
     if (ev.kind !== "set_track_gain_ok") throw new Error("unexpected event");
   }
 
+  /** Set the static stereo pan for a track. `pan` is clamped to
+   *  [-1, +1] (L → R) by the engine. */
+  async setTrackPan(trackId: number, pan: number): Promise<void> {
+    const ev = await this.request<EngineCommand & { kind: "set_track_pan" }>(
+      (req) => ({ kind: "set_track_pan", req, trackId, pan }),
+    );
+    if (ev.kind !== "set_track_pan_ok") throw new Error("unexpected event");
+  }
+
   async setTrackMute(trackId: number, mute: boolean): Promise<void> {
     const ev = await this.request<EngineCommand & { kind: "set_track_mute" }>(
       (req) => ({ kind: "set_track_mute", req, trackId, mute }),

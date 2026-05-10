@@ -700,6 +700,22 @@ mod wasm_api {
             Ok(())
         }
 
+        /// Set the static stereo pan for a track. `pan` is clamped to
+        /// [-1.0, +1.0] (L → R). Track pan automation lanes (set
+        /// elsewhere) still take precedence at frames where the lane is
+        /// defined; this scalar is the fallback used by mixdown when no
+        /// automation is present.
+        #[wasm_bindgen(js_name = setTrackPan)]
+        pub fn set_track_pan(&mut self, track_id: u64, pan: f32) -> Result<(), JsError> {
+            let track = self
+                .inner
+                .project_mut()
+                .track_mut(TrackId(track_id))
+                .ok_or_else(|| JsError::new(&format!("unknown track {track_id}")))?;
+            track.pan = pan.clamp(-1.0, 1.0);
+            Ok(())
+        }
+
         #[wasm_bindgen(js_name = setTrackMute)]
         pub fn set_track_mute(&mut self, track_id: u64, mute: bool) -> Result<(), JsError> {
             let track = self
