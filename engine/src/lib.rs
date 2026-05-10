@@ -127,6 +127,34 @@ mod wasm_api {
             Some(flat.into_boxed_slice())
         }
 
+        /// Per-channel range summary. Returns `channels * columns * 2`
+        /// floats laid out as channel-major: all of channel 0's
+        /// `[min, max, min, max, ...]` first, then channel 1, etc.
+        /// Caller knows the channel count from `listSources` and uses
+        /// the matching stride. Used by the stereo waveform renderer.
+        #[wasm_bindgen(js_name = peakSummaryRangeChannels)]
+        pub fn peak_summary_range_channels(
+            &self,
+            source_id: &str,
+            start_frame: u64,
+            end_frame: u64,
+            columns: u32,
+        ) -> Option<Box<[f32]>> {
+            let id = SourceId::new(source_id);
+            let per_channel = self
+                .inner
+                .peak_summary_range_channels(&id, start_frame, end_frame, columns as usize)?;
+            let cols = columns as usize;
+            let mut flat = Vec::with_capacity(per_channel.len() * cols * 2);
+            for channel in &per_channel {
+                for p in channel {
+                    flat.push(p.min);
+                    flat.push(p.max);
+                }
+            }
+            Some(flat.into_boxed_slice())
+        }
+
         /// Compute STFT magnitudes for a source range, returning a flat
         /// row-major buffer of `frame_count * bin_count` values, where
         /// `bin_count = fft_size/2 + 1` (positive bins only) and

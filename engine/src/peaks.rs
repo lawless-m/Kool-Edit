@@ -43,13 +43,18 @@ impl MinMax {
 }
 
 /// First-level peak cache: one min/max pair per `samples_per_pair` frames of
-/// audio, computed mono-summed if the source is multichannel. Mono-summing
-/// produces a single visual track; per-channel rendering will live alongside
-/// this once stereo waveform display is implemented.
+/// audio. `pairs` holds the mono-summed view used by the existing renderers;
+/// `channel_pairs` holds an additional one-Vec-per-channel view used by the
+/// stereo waveform renderer. Mono sources have `channel_pairs.len() == 1`
+/// and that inner Vec is identical to `pairs`; stereo sources have two
+/// inner Vecs (L, R). The duplication is cheap (a few MB even on long
+/// stereo material) and saves the renderer from re-deriving per-channel
+/// peaks on every viewport change.
 #[derive(Clone, Debug)]
 pub struct PeakCache {
     pub samples_per_pair: u32,
     pub pairs: Vec<MinMax>,
+    pub channel_pairs: Vec<Vec<MinMax>>,
 }
 
 pub const DEFAULT_DECIMATION: u32 = 64;
@@ -66,14 +71,20 @@ impl PeakCache {
         assert!(samples_per_pair > 0);
         let mono = mono_sum(interleaved, channels);
         let pairs = build_pairs(&mono, samples_per_pair as usize);
+        let channel_pairs = build_channel_pairs(interleaved, channels, samples_per_pair as usize);
         Self {
             samples_per_pair,
             pairs,
+            channel_pairs,
         }
     }
 
     pub fn frame_count(&self) -> u64 {
         self.pairs.len() as u64 * self.samples_per_pair as u64
+    }
+
+    pub fn channel_count(&self) -> u16 {
+        self.channel_pairs.len() as u16
     }
 
     /// Return `columns` summarised min/max pairs spanning the entire cache.
@@ -95,11 +106,38 @@ impl PeakCache {
         end_frame: u64,
         columns: usize,
     ) -> Vec<MinMax> {
-        if columns == 0 || self.pairs.is_empty() || end_frame <= start_frame {
+        Self::summarize_pairs_range(&self.pairs, self.samples_per_pair, start_frame, end_frame, columns)
+    }
+
+    /// Per-channel range summary. Returns one Vec<MinMax> of length
+    /// `columns` per channel of the cached source. Used by the stereo
+    /// waveform renderer; mono sources return a single inner Vec.
+    pub fn summarize_range_channels(
+        &self,
+        start_frame: u64,
+        end_frame: u64,
+        columns: usize,
+    ) -> Vec<Vec<MinMax>> {
+        self.channel_pairs
+            .iter()
+            .map(|pairs| {
+                Self::summarize_pairs_range(pairs, self.samples_per_pair, start_frame, end_frame, columns)
+            })
+            .collect()
+    }
+
+    fn summarize_pairs_range(
+        pairs: &[MinMax],
+        samples_per_pair: u32,
+        start_frame: u64,
+        end_frame: u64,
+        columns: usize,
+    ) -> Vec<MinMax> {
+        if columns == 0 || pairs.is_empty() || end_frame <= start_frame {
             return vec![MinMax::default(); columns];
         }
-        let spp = self.samples_per_pair as u64;
-        let total_pairs = self.pairs.len();
+        let spp = samples_per_pair as u64;
+        let total_pairs = pairs.len();
         let pair_start = (start_frame / spp) as usize;
         let pair_end_excl = end_frame.div_ceil(spp) as usize;
         let pair_start = pair_start.min(total_pairs);
@@ -114,7 +152,7 @@ impl PeakCache {
             let e = (pair_start + (col + 1) * span / columns)
                 .max(s + 1)
                 .min(pair_end_excl);
-            let bucket = &self.pairs[s..e];
+            let bucket = &pairs[s..e];
             let merged = bucket
                 .iter()
                 .copied()
@@ -123,6 +161,32 @@ impl PeakCache {
         }
         out
     }
+}
+
+/// Build one Vec<MinMax> per channel from an interleaved sample buffer.
+/// Mirrors `build_pairs` but de-interleaves first so each channel's peaks
+/// are independent. Used by the stereo waveform renderer.
+fn build_channel_pairs(
+    interleaved: &[f32],
+    channels: u16,
+    samples_per_pair: usize,
+) -> Vec<Vec<MinMax>> {
+    if channels == 0 {
+        return Vec::new();
+    }
+    let ch = channels as usize;
+    let frames = interleaved.len() / ch.max(1);
+    let mut per_channel: Vec<Vec<f32>> = (0..ch).map(|_| Vec::with_capacity(frames)).collect();
+    for f in 0..frames {
+        let base = f * ch;
+        for c in 0..ch {
+            per_channel[c].push(interleaved[base + c]);
+        }
+    }
+    per_channel
+        .iter()
+        .map(|samples| build_pairs(samples, samples_per_pair))
+        .collect()
 }
 
 fn mono_sum(interleaved: &[f32], channel_count: u16) -> Vec<f32> {
@@ -160,6 +224,37 @@ pub fn bin_raw_samples(samples: &[f32], channels: u16, columns: usize) -> Vec<Mi
         let s = col * total / columns;
         let e = ((col + 1) * total / columns).max(s + 1).min(total);
         out.push(MinMax::from_slice(&mono[s..e]));
+    }
+    out
+}
+
+/// Per-channel variant of `bin_raw_samples`. Returns one Vec<MinMax> of
+/// length `columns` per channel; mono input yields a single inner Vec.
+pub fn bin_raw_samples_channels(
+    samples: &[f32],
+    channels: u16,
+    columns: usize,
+) -> Vec<Vec<MinMax>> {
+    if columns == 0 || channels == 0 {
+        return Vec::new();
+    }
+    let ch = channels as usize;
+    let frames = samples.len() / ch.max(1);
+    if frames == 0 {
+        return (0..ch).map(|_| vec![MinMax::default(); columns]).collect();
+    }
+    let mut out: Vec<Vec<MinMax>> = (0..ch).map(|_| Vec::with_capacity(columns)).collect();
+    let mut scratch: Vec<f32> = Vec::with_capacity(frames / columns + 1);
+    for c in 0..ch {
+        for col in 0..columns {
+            let s = col * frames / columns;
+            let e = ((col + 1) * frames / columns).max(s + 1).min(frames);
+            scratch.clear();
+            for f in s..e {
+                scratch.push(samples[f * ch + c]);
+            }
+            out[c].push(MinMax::from_slice(&scratch));
+        }
     }
     out
 }

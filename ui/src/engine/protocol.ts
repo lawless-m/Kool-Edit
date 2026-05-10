@@ -20,6 +20,14 @@ export type EngineCommand =
       endFrame: number;
     }
   | {
+      kind: "peak_summary_channels";
+      req: RequestId;
+      sourceId: string;
+      columns: number;
+      startFrame: number;
+      endFrame: number;
+    }
+  | {
       kind: "start_playback";
       req: RequestId;
       sourceId: string;
@@ -184,6 +192,14 @@ export type EngineEvent =
       channelCount: number;
     }
   | { kind: "peak_summary_ok"; req: RequestId; peaks: Float32Array }
+  | {
+      kind: "peak_summary_channels_ok";
+      req: RequestId;
+      // Channel-major flat array. Per-channel slice is `columns * 2`
+      // floats laid out as `[min, max, min, max, ...]`. The caller
+      // already knows the channel count from listSources.
+      peaks: Float32Array;
+    }
   | { kind: "start_playback_ok"; req: RequestId; totalOutputFrames: number }
   | { kind: "stop_playback_ok"; req: RequestId }
   | { kind: "apply_op_ok"; req: RequestId }

@@ -30,6 +30,12 @@ type WasmEngine = {
     endFrame: bigint,
     columns: number,
   ) => Float32Array | undefined;
+  peakSummaryRangeChannels: (
+    sourceId: string,
+    startFrame: bigint,
+    endFrame: bigint,
+    columns: number,
+  ) => Float32Array | undefined;
   sourceFrameCount: (sourceId: string) => bigint | undefined;
   sourceSampleRate: (sourceId: string) => number | undefined;
   sourceChannelCount: (sourceId: string) => number | undefined;
@@ -224,6 +230,21 @@ let playback: PlaybackState | null = null;
             return;
           }
           send({ kind: "peak_summary_ok", req: cmd.req, peaks });
+          return;
+        }
+
+        case "peak_summary_channels": {
+          const peaks = engine.peakSummaryRangeChannels(
+            cmd.sourceId,
+            BigInt(Math.floor(cmd.startFrame)),
+            BigInt(Math.floor(cmd.endFrame)),
+            cmd.columns,
+          );
+          if (!peaks) {
+            send({ kind: "error", req: cmd.req, reason: `unknown source ${cmd.sourceId}` });
+            return;
+          }
+          send({ kind: "peak_summary_channels_ok", req: cmd.req, peaks });
           return;
         }
 

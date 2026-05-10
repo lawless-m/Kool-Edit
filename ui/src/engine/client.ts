@@ -165,6 +165,24 @@ export class EngineClient {
     return ev.peaks;
   }
 
+  /** Per-channel range summary. Returns a flat channel-major Float32Array
+   *  with `channels * columns * 2` floats (laid out as channel 0's
+   *  `[min, max, min, max, ...]` then channel 1's, etc). The caller
+   *  knows the channel count from listSources. Used by the stereo
+   *  waveform renderer. */
+  async peakSummaryChannels(
+    sourceId: string,
+    columns: number,
+    startFrame: number,
+    endFrame: number,
+  ): Promise<Float32Array> {
+    const ev = await this.request<EngineCommand & { kind: "peak_summary_channels" }>(
+      (req) => ({ kind: "peak_summary_channels", req, sourceId, columns, startFrame, endFrame }),
+    );
+    if (ev.kind !== "peak_summary_channels_ok") throw new Error("unexpected event");
+    return ev.peaks;
+  }
+
   async startPlayback(
     sourceId: string,
     outputSampleRate: number,

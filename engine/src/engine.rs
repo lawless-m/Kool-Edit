@@ -262,6 +262,41 @@ impl Engine {
         ))
     }
 
+    /// Per-channel variant of `peak_summary_range`. Returns one Vec<MinMax>
+    /// per channel of the source. Mono sources get a single inner Vec.
+    /// Used by the stereo waveform renderer.
+    pub fn peak_summary_range_channels(
+        &self,
+        id: &SourceId,
+        start_frame: u64,
+        end_frame: u64,
+        columns: usize,
+    ) -> Option<Vec<Vec<MinMax>>> {
+        let cache = self.peaks.get(id)?;
+        let source = self.project.sources.get(id)?;
+        let ch = source.channel_count.max(1) as usize;
+        if columns == 0 || end_frame <= start_frame {
+            return Some((0..ch).map(|_| vec![MinMax::default(); columns]).collect());
+        }
+        let range_frames = end_frame - start_frame;
+        let frames_per_column = range_frames / columns as u64;
+        if frames_per_column >= cache.samples_per_pair as u64 {
+            return Some(cache.summarize_range_channels(start_frame, end_frame, columns));
+        }
+        let effective_len = self.effective_frame_count(id).ok()?;
+        let clamped_end = end_frame.min(effective_len);
+        if clamped_end <= start_frame {
+            return Some((0..ch).map(|_| vec![MinMax::default(); columns]).collect());
+        }
+        let range = SampleRange::new(start_frame, clamped_end).ok()?;
+        let samples = self.query_samples(id, range).ok()?;
+        Some(crate::peaks::bin_raw_samples_channels(
+            &samples,
+            source.channel_count,
+            columns,
+        ))
+    }
+
     /// Append an op to the source's edit list. Truncates any redo branch.
     /// Regenerates the peak cache so renderers (which read peaks) reflect
     /// the post-op state.

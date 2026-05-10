@@ -55,6 +55,7 @@ export async function mountEditor(
   let currentSourceId: string | null = null;
   let sourceFrameCount = 0;
   let sourceSampleRate = 0;
+  let sourceChannels = 1;
   let selection: Selection | null = null;
   let viewport: Viewport = { startFrame: 0, endFrame: 0 };
   let playheadRaf: number | null = null;
@@ -211,12 +212,22 @@ export async function mountEditor(
       return;
     }
     const reqId = ++pendingPeakRequest;
-    const peaks = await client.peakSummary(
-      currentSourceId,
-      ui.canvas.width,
-      viewport.startFrame,
-      viewport.endFrame,
-    );
+    // Multi-channel sources fetch per-channel peaks so the renderer can
+    // stack L/R lanes; mono sources keep the cheaper single-track path.
+    const peaks =
+      sourceChannels > 1
+        ? await client.peakSummaryChannels(
+            currentSourceId,
+            ui.canvas.width,
+            viewport.startFrame,
+            viewport.endFrame,
+          )
+        : await client.peakSummary(
+            currentSourceId,
+            ui.canvas.width,
+            viewport.startFrame,
+            viewport.endFrame,
+          );
     if (reqId !== pendingPeakRequest) return;
     cachedPeaks = peaks;
     drawCachedWaveform();
@@ -235,7 +246,7 @@ export async function mountEditor(
       return;
     }
     if (!cachedPeaks) return;
-    drawWaveform(ui.canvas, cachedPeaks);
+    drawWaveform(ui.canvas, cachedPeaks, sourceChannels);
   };
 
   const fetchSpectrogram = async (): Promise<void> => {
@@ -933,6 +944,7 @@ export async function mountEditor(
     currentSourceId = id;
     sourceFrameCount = info.frames;
     sourceSampleRate = info.sampleRate;
+    sourceChannels = Math.max(1, info.channels);
     viewport = { startFrame: 0, endFrame: info.frames };
     cachedPeaks = null;
     setSelection(null);
