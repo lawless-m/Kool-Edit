@@ -80,11 +80,24 @@ export async function mountArranger(
   const groupNames = new Map<number, string>();
   // Saved patterns, refreshed on every pattern-list change. Names are unique.
   let savedPatterns: PatternInfo[] = [];
-  // Pre-baked peak summaries (one Float32Array per source, length = 2 × COLS)
-  // so clip rendering doesn't pay a round trip per redraw. Refreshed on every
-  // refresh() call so destructive edits in the editor tab show up here.
-  const sourcePeaks = new Map<string, Float32Array>();
-  const PEAK_COLS = 2048;
+  // Pre-baked peak summaries keyed by clip-slice (sourceId + source_in +
+  // source_out). One Float32Array per unique clip slice, length = 2 × COLS,
+  // Viewport-aware peak cache. One entry per visible clip, holding peaks
+  // scoped to the clip's *on-screen* slice plus the geometry the painter
+  // needs to position the canvas inside its clip container. Keyed by
+  // `${trackId}:${clipId}` since each clip has at most one visible region
+  // at a time. Refreshed on refresh / zoom / scroll so peak resolution
+  // tracks what the user actually sees — matching the editor's per-
+  // viewport strategy rather than the old per-clip one.
+  interface ClipPeakEntry {
+    peaks: Float32Array;
+    visiblePxLeft: number;
+    visiblePxWidth: number;
+  }
+  const clipPeaks = new Map<string, ClipPeakEntry>();
+  // Per-clip canvas / peak buffer width cap. Picked under Safari's 16384
+  // canvas-size limit; well above any realistic single-viewport span.
+  const MAX_CLIP_CANVAS_PX = 16384;
   let stagedSourceId: string | null = null;
   // Multi-selection. Keys are `${trackId}:${clipId}`. Plain click replaces
   // the selection with just the clicked clip; Ctrl/Cmd-click toggles a clip
@@ -390,17 +403,7 @@ export async function mountArranger(
       savedPatterns = [];
     }
     refreshPatternPicker();
-    // Refresh peak summaries for every source. Cheap per call; the engine's
-    // cache does the heavy lifting.
-    sourcePeaks.clear();
-    for (const s of sources) {
-      try {
-        const peaks = await client.peakSummary(s.id, PEAK_COLS);
-        sourcePeaks.set(s.id, peaks);
-      } catch {
-        // ignore — clip will render without a waveform
-      }
-    }
+    await refreshClipPeaks();
     // Prune the selection set to clips that still exist after the refresh.
     const live = new Set<string>();
     for (const [trackId, list] of clipsByTrack) {
@@ -450,6 +453,83 @@ export async function mountArranger(
       else if (g !== f.clip.group) return null;
     }
     return g;
+  };
+
+  /** Compute the on-screen slice of each clip and fetch peaks for just
+   *  that slice at viewport pixel resolution. Matches what the editor
+   *  does (cols == visible canvas pixels, range == visible source
+   *  frames) so drum transients land at editor-grade sharpness instead
+   *  of being smeared across a long source's whole peak buffer. Off-
+   *  screen clips don't get an entry — `drawTracks` then skips the
+   *  waveform canvas for them entirely. */
+  const refreshClipPeaks = async (): Promise<void> => {
+    clipPeaks.clear();
+    const scrollX = ui.lanesScroll.scrollLeft;
+    const viewportPx = ui.lanesScroll.clientWidth;
+    // Overshoot the viewport by a little so a small scroll doesn't
+    // immediately reveal an unpainted strip while the debounced fetch
+    // catches up. 200 px on each side is enough for normal scroll
+    // momentum without doubling the fetch cost.
+    const padPx = 200;
+    const visScreenLo = Math.max(0, scrollX - padPx);
+    const visScreenHi = scrollX + viewportPx + padPx;
+    type Want = {
+      key: string;
+      sourceId: string;
+      visibleSourceStart: number;
+      visibleSourceEnd: number;
+      visiblePxLeft: number;
+      visiblePxWidth: number;
+    };
+    const queue: Want[] = [];
+    for (const [trackId, list] of clipsByTrack) {
+      for (const c of list) {
+        const clipScreenLeft = framesToPx(c.position);
+        const clipWidthPx = Math.max(1, framesToPx(c.endPosition - c.position));
+        const clipScreenRight = clipScreenLeft + clipWidthPx;
+        const loScreen = Math.max(visScreenLo, clipScreenLeft);
+        const hiScreen = Math.min(visScreenHi, clipScreenRight);
+        if (hiScreen <= loScreen) continue; // clip entirely off-screen
+        const visiblePxLeft = Math.floor(loScreen - clipScreenLeft);
+        const visiblePxWidth = Math.min(
+          MAX_CLIP_CANVAS_PX,
+          Math.max(1, Math.floor(hiScreen - loScreen)),
+        );
+        // Map clip pixel coords to source frames proportionally so
+        // future time-stretch (where timeline span != source span)
+        // still works. For 1:1 clips this is just sourceIn + offset.
+        const sourceSpan = Math.max(1, c.sourceOut - c.sourceIn);
+        const visibleSourceStart =
+          c.sourceIn + Math.floor((visiblePxLeft / clipWidthPx) * sourceSpan);
+        const visibleSourceEnd =
+          c.sourceIn + Math.ceil(((visiblePxLeft + visiblePxWidth) / clipWidthPx) * sourceSpan);
+        queue.push({
+          key: clipKey(trackId, c.id),
+          sourceId: c.sourceId,
+          visibleSourceStart,
+          visibleSourceEnd: Math.max(visibleSourceStart + 1, visibleSourceEnd),
+          visiblePxLeft,
+          visiblePxWidth,
+        });
+      }
+    }
+    for (const w of queue) {
+      try {
+        const peaks = await client.peakSummary(
+          w.sourceId,
+          w.visiblePxWidth,
+          w.visibleSourceStart,
+          w.visibleSourceEnd,
+        );
+        clipPeaks.set(w.key, {
+          peaks,
+          visiblePxLeft: w.visiblePxLeft,
+          visiblePxWidth: w.visiblePxWidth,
+        });
+      } catch {
+        // ignore — clip will render without a waveform
+      }
+    }
   };
 
   const refreshPatternPicker = (): void => {
@@ -1456,32 +1536,30 @@ export async function mountArranger(
         elt.dataset["groupId"] = String(c.group);
         const src = sources.find((s) => s.id === c.sourceId);
 
-        // Waveform canvas. Size in device pixels matches the clip's display
-        // width; if the clip is very wide we cap to a sane max so we don't
-        // allocate a 30k-wide canvas at extreme zoom (rare but possible).
-        const peaks = sourcePeaks.get(c.sourceId);
-        if (peaks && src) {
+        // Viewport-aware waveform canvas. Covers only the on-screen
+        // slice of this clip (or skipped if the clip is off-screen),
+        // sized 1:1 in bitmap-to-CSS pixels so a long source doesn't
+        // get CSS-stretched into smeared blobs. The cache entry carries
+        // the geometry computed during the last refreshClipPeaks pass.
+        const peakEntry = clipPeaks.get(clipKey(track.id, c.id));
+        if (peakEntry && src) {
           const cv = document.createElement("canvas");
-          const cvW = Math.max(1, Math.floor(width));
-          const cvH = innerH;
-          cv.width = Math.min(cvW, 4096);
-          cv.height = cvH;
+          cv.width = peakEntry.visiblePxWidth;
+          cv.height = innerH;
           Object.assign(cv.style, {
             position: "absolute",
             top: "0",
-            left: "0",
-            width: `${width}px`,
+            left: `${peakEntry.visiblePxLeft}px`,
+            width: `${peakEntry.visiblePxWidth}px`,
             height: `${innerH}px`,
             pointerEvents: "none",
           } satisfies Partial<CSSStyleDeclaration>);
-          const totalCols = peaks.length / 2;
-          const startCol = Math.floor((c.sourceIn / Math.max(1, src.frames)) * totalCols);
-          const endCol = Math.ceil((c.sourceOut / Math.max(1, src.frames)) * totalCols);
+          const totalCols = peakEntry.peaks.length / 2;
           paintClipWaveform(
             cv,
-            peaks,
-            startCol,
-            Math.max(startCol + 1, endCol),
+            peakEntry.peaks,
+            0,
+            totalCols,
             isSelected ? "#cfe6cf" : "#9ece9e",
           );
           elt.appendChild(cv);
@@ -1912,6 +1990,25 @@ export async function mountArranger(
     drawTracks();
     const newAnchor = seconds * pixelsPerSecond;
     ui.lanesScroll.scrollLeft = Math.max(0, newAnchor - targetViewportX);
+    // Re-fetch peaks at the new clip widths so the waveform resolution
+    // tracks zoom. Debounced so wheel-zoom doesn't fire dozens of
+    // round-trips per gesture; the redraw on completion paints the
+    // sharper version once the user settles.
+    schedulePeakRefresh();
+  };
+
+  // Coalesce rapid zoom-driven peak fetches into a single trailing run.
+  // Wheel-zoom can fire setZoom many times per second; we only need the
+  // last one's resolution.
+  let peakRefreshTimer: number | null = null;
+  const schedulePeakRefresh = (): void => {
+    if (peakRefreshTimer !== null) {
+      clearTimeout(peakRefreshTimer);
+    }
+    peakRefreshTimer = window.setTimeout(() => {
+      peakRefreshTimer = null;
+      void refreshClipPeaks().then(() => drawTracks());
+    }, 120);
   };
 
   /** When the user presses a zoom button, pick something interesting to
@@ -1952,6 +2049,14 @@ export async function mountArranger(
     const cursorContentPx = cursorViewportX + ui.lanesScroll.scrollLeft;
     const factor = ev.deltaY > 0 ? 1 / ZOOM_FACTOR : ZOOM_FACTOR;
     setZoom(pixelsPerSecond * factor, cursorContentPx, cursorViewportX);
+  });
+
+  // Scroll triggers a debounced peak refresh + redraw so the visible
+  // slice of each clip gets fresh viewport-resolution peaks. The 200px
+  // pad in refreshClipPeaks means small scrolls don't immediately fall
+  // off the painted region while the debounce settles.
+  ui.lanesScroll.addEventListener("scroll", () => {
+    schedulePeakRefresh();
   });
 
   // ---- grid controls ---------------------------------------------------
@@ -3160,7 +3265,13 @@ function makeSep(): HTMLDivElement {
 /** Paint a min/max peak strip into a clip's canvas. `peaks` is a flat
  *  Float32Array of `[min0, max0, min1, max1, ...]` for the full source;
  *  `[startCol, endCol)` is the column slice corresponding to the clip's
- *  source_in..source_out window. */
+ *  source_in..source_out window.
+ *
+ *  When cols > pixels we aggregate min/max across each pixel's bucket
+ *  instead of point-sampling one column — otherwise sharp transients
+ *  inside the bucket get silently dropped and the waveform reads as
+ *  smooth lozenges. When cols <= pixels we fall back to the simple
+ *  point sample (no extra data to merge). */
 function paintClipWaveform(
   canvas: HTMLCanvasElement,
   peaks: Float32Array,
@@ -3178,11 +3289,18 @@ function paintClipWaveform(
   const cols = Math.max(1, endCol - startCol);
   const yMid = h / 2;
   for (let x = 0; x < w; x++) {
-    const c = startCol + Math.floor((x / w) * cols);
-    const cClamped = Math.max(0, Math.min(totalCols - 1, c));
-    const i = cClamped * 2;
-    const min = peaks[i] ?? 0;
-    const max = peaks[i + 1] ?? 0;
+    const sCol = startCol + Math.floor((x / w) * cols);
+    const eCol = startCol + Math.floor(((x + 1) / w) * cols);
+    const lo = Math.max(0, Math.min(totalCols - 1, sCol));
+    const hi = Math.max(lo + 1, Math.min(totalCols, eCol));
+    let min = peaks[lo * 2] ?? 0;
+    let max = peaks[lo * 2 + 1] ?? 0;
+    for (let c = lo + 1; c < hi; c++) {
+      const m = peaks[c * 2] ?? 0;
+      const M = peaks[c * 2 + 1] ?? 0;
+      if (m < min) min = m;
+      if (M > max) max = M;
+    }
     const yMax = yMid - max * yMid;
     const yMin = yMid - min * yMid;
     const barH = Math.max(1, yMin - yMax);
