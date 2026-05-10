@@ -23,28 +23,48 @@ export interface DrumsOptions {
   onArrangerNeedsRefresh?: () => void;
 }
 
+// Step values:
+//   0 = off
+//   1 = primary source ("X" — white cell)
+//   2 = secondary source ("x" — grey cell)
+// Each lane has two source slots (sourceA / sourceB). Click cycles
+// off → A → B → off so the user can layer two timbres on one lane —
+// e.g. open + closed hat, soft + hard kick, ghost notes vs accents.
+type StepValue = 0 | 1 | 2;
+
 interface Lane {
   label: string;
-  sourceId: string | null;
-  steps: boolean[];
+  sourceA: string | null;
+  sourceB: string | null;
+  steps: StepValue[];
 }
 
 /** Wire format for a saved drum pattern. Stored as opaque JSON in the
  *  engine's `Project::patterns`. The arranger uses this to re-stamp a
  *  pattern at a new playhead position. `stepsPerBeat` is captured so the
  *  pattern survives changes to step resolution; the actual duration of one
- *  step is recomputed from the current project tempo on insert. */
+ *  step is recomputed from the current project tempo on insert.
+ *
+ *  Older patterns saved before dual-source lanes use `sourceId` and
+ *  boolean steps; loadSavedPattern reads both shapes. */
 export interface SavedPatternGrid {
   lanes: Array<{
     label: string;
-    sourceId: string | null;
-    steps: boolean[];
+    sourceA?: string | null;
+    sourceB?: string | null;
+    sourceId?: string | null; // legacy
+    steps: Array<number | boolean>;
   }>;
   stepCount: number;
   stepsPerBeat: number;
 }
 
-const DEFAULT_LANE_LABELS = ["BD", "SD", "HH", "OH", "CY", "CP"];
+// Ordered low-to-high so the kit stacks from the deepest sound at the
+// bottom (BD) up through the brighter ones (cymbals at the top), matching
+// drum-kit ergonomics and most hardware drum machines' lane layout. Eight
+// slots gives room for toms + cowbell out of the box; the user can add /
+// remove more from the toolbar.
+const DEFAULT_LANE_LABELS = ["CY", "OH", "CP", "HH", "CB", "TT", "SD", "BD"];
 // One cell = one 16th note. 4 beats per bar × 4 sixteenths per beat = 16
 // cells per bar (matches the Oberheim DMX layout). The + button extends
 // the pattern by BARS_PER_EXTEND bars per click.
@@ -81,13 +101,14 @@ export async function mountDrums(
   // count always works out cleanly for the user's 16-step pattern.
   const stepsPerBeat = 4;
   // Mutable so the + button can extend the pattern. Every lane carries
-  // exactly this many step booleans; growStepCount keeps them in sync.
+  // exactly this many step values; growStepCount keeps them in sync.
   let stepCount = DEFAULT_STEPS;
 
   const lanes: Lane[] = DEFAULT_LANE_LABELS.map((label) => ({
     label,
-    sourceId: null,
-    steps: new Array<boolean>(stepCount).fill(false),
+    sourceA: null,
+    sourceB: null,
+    steps: new Array<StepValue>(stepCount).fill(0),
   }));
 
   // AudioBuffer cache keyed by sourceId. Populated lazily on first preview
@@ -143,6 +164,10 @@ export async function mountDrums(
   const addBarsBtn = makeBtn(`+ ${BARS_PER_EXTEND} bar${BARS_PER_EXTEND === 1 ? "" : "s"}`);
   addBarsBtn.title = `Extend the pattern by ${BARS_PER_EXTEND} bar${BARS_PER_EXTEND === 1 ? "" : "s"}`;
   toolbar.appendChild(addBarsBtn);
+
+  const addLaneBtn = makeBtn("+ lane");
+  addLaneBtn.title = "Append an empty lane to the bottom of the kit";
+  toolbar.appendChild(addLaneBtn);
 
   const spacer = document.createElement("div");
   spacer.style.flex = "1";
@@ -265,36 +290,79 @@ export async function mountDrums(
       });
       row.appendChild(label);
 
-      // Source picker for this lane. "—" means unassigned: cells still
-      // toggle but preview/bake skip the row.
-      const picker = document.createElement("select");
-      Object.assign(picker.style, {
-        width: "180px",
+      // Two source pickers per lane (A = white "X" cells, B = grey "x"
+      // cells). Each cell cycles off → A → B → off so the lane can layer
+      // two timbres on the same time grid (e.g. open vs closed hat,
+      // accents vs ghost notes). Either picker can stay unassigned —
+      // preview/bake just skip cells whose source is missing.
+      const makePicker = (
+        which: "A" | "B",
+        currentValue: string | null,
+        onChange: (id: string | null) => void,
+      ): HTMLSelectElement => {
+        const sel = document.createElement("select");
+        Object.assign(sel.style, {
+          width: "120px",
+          boxSizing: "border-box",
+          background: "#1a1a1a",
+          // The select chip echoes the cell colour so the user can tell
+          // which slot drives the white vs grey cells at a glance.
+          color: which === "A" ? "#e6e6e6" : "#aaaaaa",
+          border: which === "A" ? "1px solid #555" : "1px solid #3a3a3a",
+          padding: "2px 4px",
+          fontSize: "12px",
+        } satisfies Partial<CSSStyleDeclaration>);
+        const noneOpt = document.createElement("option");
+        noneOpt.value = "";
+        noneOpt.textContent = which === "A" ? "— X —" : "— x —";
+        sel.appendChild(noneOpt);
+        for (const s of sources) {
+          const o = document.createElement("option");
+          o.value = s.id;
+          o.textContent = s.name;
+          sel.appendChild(o);
+        }
+        sel.value = currentValue ?? "";
+        sel.addEventListener("change", () => {
+          const v = sel.value || null;
+          onChange(v);
+          if (v) void prefetchBuffer(v);
+        });
+        return sel;
+      };
+      row.appendChild(makePicker("A", lane.sourceA, (id) => (lane.sourceA = id)));
+      row.appendChild(makePicker("B", lane.sourceB, (id) => (lane.sourceB = id)));
+
+      // Per-lane remove button. Disabled when there's only one lane left
+      // so the user can't accidentally empty the kit.
+      const removeBtn = document.createElement("button");
+      removeBtn.type = "button";
+      removeBtn.textContent = "×";
+      removeBtn.title = "Remove this lane";
+      Object.assign(removeBtn.style, {
+        width: "20px",
+        height: "20px",
         boxSizing: "border-box",
-        background: "#1a1a1a",
-        color: "#d8d8d8",
+        background: "transparent",
+        color: "#7a7a7a",
         border: "1px solid #333",
-        padding: "2px 4px",
-        fontSize: "12px",
+        borderRadius: "3px",
+        cursor: lanes.length > 1 ? "pointer" : "default",
+        fontSize: "14px",
+        lineHeight: "16px",
+        padding: "0",
+        flexShrink: "0",
+        opacity: lanes.length > 1 ? "1" : "0.3",
       } satisfies Partial<CSSStyleDeclaration>);
-      const noneOpt = document.createElement("option");
-      noneOpt.value = "";
-      noneOpt.textContent = "— assign source —";
-      picker.appendChild(noneOpt);
-      for (const s of sources) {
-        const o = document.createElement("option");
-        o.value = s.id;
-        o.textContent = s.name;
-        picker.appendChild(o);
-      }
-      picker.value = lane.sourceId ?? "";
-      picker.addEventListener("change", () => {
-        lane.sourceId = picker.value || null;
-        // Drop the cached buffer so the new source gets reloaded next time
-        // it's previewed.
-        if (lane.sourceId) void prefetchBuffer(lane.sourceId);
+      removeBtn.disabled = lanes.length <= 1;
+      removeBtn.addEventListener("click", () => {
+        if (lanes.length <= 1) return;
+        if (previewLoopTimer !== null) stopPreview();
+        lanes.splice(li, 1);
+        drawGrid();
+        setStatus(`removed lane (${lanes.length} remaining)`);
       });
-      row.appendChild(picker);
+      row.appendChild(removeBtn);
 
       // Step cells, broken into groups of 4 with a vertical gutter so the
       // user can count beats by eye (matches the Oberheim DMX layout).
@@ -315,8 +383,11 @@ export async function mountDrums(
         cell.type = "button";
         cell.dataset["lane"] = String(li);
         cell.dataset["step"] = String(s);
-        const on = lane.steps[s];
+        const value: StepValue = lane.steps[s] ?? 0;
         const isActiveStep = activeStep === s;
+        // Three-state colouring: off = dark, X = white, x = grey.
+        const cellBg =
+          value === 1 ? "#ffffff" : value === 2 ? "#7a7a7a" : "#0e0e0e";
         Object.assign(cell.style, {
           width: "26px",
           height: "32px",
@@ -326,7 +397,7 @@ export async function mountDrums(
           margin: "0 2px",
           borderRadius: "3px",
           border: isActiveStep ? "1px solid #ffe066" : "1px solid #555",
-          background: on ? "#e6e6e6" : "#0e0e0e",
+          background: cellBg,
           cursor: "pointer",
           padding: "0",
           flexShrink: "0",
@@ -356,13 +427,16 @@ export async function mountDrums(
           cell.appendChild(labelOnCell);
         }
         cell.addEventListener("click", () => {
-          lane.steps[s] = !lane.steps[s];
+          // Cycle through off → A → B → off so a single click advances and
+          // a third click clears the cell.
+          const next: StepValue = (((lane.steps[s] ?? 0) + 1) % 3) as StepValue;
+          lane.steps[s] = next;
           drawGrid();
-          // Audition the cell on toggle-on so the user can hear what's
-          // assigned without committing to a full pattern playback.
-          if (lane.steps[s] && lane.sourceId) {
-            void triggerOneShot(lane.sourceId);
-          }
+          // Audition the cell on the way up so the user hears what they
+          // just dialled in.
+          const pickedSource =
+            next === 1 ? lane.sourceA : next === 2 ? lane.sourceB : null;
+          if (pickedSource) void triggerOneShot(pickedSource);
         });
         cells.appendChild(cell);
       }
@@ -431,18 +505,25 @@ export async function mountDrums(
     const ctx = ensureCtx();
     const stepDur = stepDurationSec();
     const out: AudioBufferSourceNode[] = [];
-    // Resolve every assigned source up-front so scheduling is synchronous
-    // (otherwise async waits would push hits late).
-    const lanesWithBufs: Array<{ lane: Lane; buf: AudioBuffer }> = [];
+    // Resolve both sources up-front per lane so scheduling is synchronous
+    // (otherwise async waits would push hits late). Either slot can be
+    // null; cells whose slot is unassigned are silent.
+    const lanesWithBufs: Array<{
+      lane: Lane;
+      bufA: AudioBuffer | null;
+      bufB: AudioBuffer | null;
+    }> = [];
     for (const lane of lanes) {
-      if (!lane.sourceId) continue;
-      const buf = await prefetchBuffer(lane.sourceId);
-      if (buf) lanesWithBufs.push({ lane, buf });
+      const bufA = lane.sourceA ? await prefetchBuffer(lane.sourceA) : null;
+      const bufB = lane.sourceB ? await prefetchBuffer(lane.sourceB) : null;
+      if (bufA || bufB) lanesWithBufs.push({ lane, bufA, bufB });
     }
     for (let s = 0; s < stepCount; s++) {
       const t = startCtxTime + s * stepDur;
-      for (const { lane, buf } of lanesWithBufs) {
-        if (!lane.steps[s]) continue;
+      for (const { lane, bufA, bufB } of lanesWithBufs) {
+        const v = lane.steps[s] ?? 0;
+        const buf = v === 1 ? bufA : v === 2 ? bufB : null;
+        if (!buf) continue;
         const node = ctx.createBufferSource();
         node.buffer = buf;
         node.connect(ctx.destination);
@@ -549,21 +630,33 @@ export async function mountDrums(
     let tracksAdded = 0;
     let clipsAdded = 0;
     for (const lane of lanes) {
-      if (!lane.sourceId) continue;
-      const hits = lane.steps
-        .map((on, idx) => (on ? idx : -1))
-        .filter((idx) => idx >= 0);
+      // Resolve both source records so we can stamp clips for whichever
+      // step value they were assigned to. A lane with neither slot
+      // assigned (or with hits only on an unassigned slot) bakes nothing.
+      const srcA = lane.sourceA ? sources.find((s) => s.id === lane.sourceA) : null;
+      const srcB = lane.sourceB ? sources.find((s) => s.id === lane.sourceB) : null;
+      const hits: Array<{ stepIdx: number; sourceId: string; src: SourceInfo }> = [];
+      for (let s = 0; s < lane.steps.length; s++) {
+        const v = lane.steps[s] ?? 0;
+        if (v === 1 && srcA) hits.push({ stepIdx: s, sourceId: srcA.id, src: srcA });
+        else if (v === 2 && srcB) hits.push({ stepIdx: s, sourceId: srcB.id, src: srcB });
+      }
       if (hits.length === 0) continue;
-      const src = sources.find((s) => s.id === lane.sourceId);
-      if (!src) continue;
       // One track per non-empty lane so the user can mix each drum line
-      // independently in the arranger.
+      // independently in the arranger; clips on the same lane reference
+      // either source A or B based on which step value triggered them.
       const trackId = await client.addTrack(lane.label);
       tracksAdded++;
-      for (const stepIdx of hits) {
-        const positionFrame = stepIdx * stepFrames;
+      for (const hit of hits) {
+        const positionFrame = hit.stepIdx * stepFrames;
         try {
-          const clipId = await client.addClip(trackId, lane.sourceId, positionFrame, 0, src.frames);
+          const clipId = await client.addClip(
+            trackId,
+            hit.sourceId,
+            positionFrame,
+            0,
+            hit.src.frames,
+          );
           await client.setClipGroup(trackId, clipId, groupId);
           clipsAdded++;
         } catch (err) {
@@ -590,7 +683,8 @@ export async function mountDrums(
   const currentGrid = (): SavedPatternGrid => ({
     lanes: lanes.map((l) => ({
       label: l.label,
-      sourceId: l.sourceId,
+      sourceA: l.sourceA,
+      sourceB: l.sourceB,
       steps: [...l.steps],
     })),
     stepCount,
@@ -615,6 +709,9 @@ export async function mountDrums(
       loadBtn.disabled = true;
       return;
     }
+    patterns.sort((a, b) =>
+      a.name.localeCompare(b.name, undefined, { sensitivity: "base" }),
+    );
     for (const p of patterns) {
       const opt = document.createElement("option");
       opt.value = p.name;
@@ -645,27 +742,34 @@ export async function mountDrums(
     // pattern don't bleed into a freshly-loaded one. Falls back to 16 for
     // older patterns that didn't capture stepCount.
     stepCount = Math.max(STEPS_PER_BAR, grid.stepCount || DEFAULT_STEPS);
-    // Replace as much of the editor state as the loaded pattern provides.
-    // Lane count is fixed (we don't grow/shrink) so we copy by index. Per-
-    // lane step buffers are resized to match the new stepCount.
-    for (let i = 0; i < lanes.length; i++) {
-      const src = grid.lanes[i];
-      lanes[i]!.steps = new Array<boolean>(stepCount).fill(false);
-      if (!src) {
-        lanes[i]!.sourceId = null;
-        continue;
+    // Resize lanes array to match the saved pattern; older patterns may
+    // have fewer lanes than the new default kit (or more, for users who
+    // expanded after the dual-source upgrade). Read both legacy and new
+    // formats for source slots and step values.
+    lanes.length = 0;
+    for (const savedLane of grid.lanes) {
+      const sourceA = savedLane.sourceA ?? savedLane.sourceId ?? null;
+      const sourceB = savedLane.sourceB ?? null;
+      const steps = new Array<StepValue>(stepCount).fill(0);
+      const limit = Math.min(steps.length, savedLane.steps.length);
+      for (let s = 0; s < limit; s++) {
+        const v = savedLane.steps[s];
+        // Legacy boolean steps map to "X" (1); numeric values clamp to 0..2.
+        steps[s] =
+          typeof v === "boolean"
+            ? v
+              ? 1
+              : 0
+            : ((Math.max(0, Math.min(2, Number(v) || 0)) as 0 | 1 | 2));
       }
-      lanes[i]!.label = src.label;
-      lanes[i]!.sourceId = src.sourceId;
-      const steps = lanes[i]!.steps;
-      for (let s = 0; s < Math.min(steps.length, src.steps.length); s++) {
-        steps[s] = !!src.steps[s];
-      }
+      lanes.push({ label: savedLane.label, sourceA, sourceB, steps });
     }
     nameInput.value = name;
     updateLengthDisplay();
     drawGrid();
-    setStatus(`loaded "${name}" (${stepCount / STEPS_PER_BAR} bars)`);
+    setStatus(
+      `loaded "${name}" (${stepCount / STEPS_PER_BAR} bars · ${lanes.length} lanes)`,
+    );
   };
 
   /** Save the current grid under the name in the textbox, replacing any
@@ -703,11 +807,23 @@ export async function mountDrums(
     const added = BARS_PER_EXTEND * STEPS_PER_BAR;
     stepCount += added;
     for (const lane of lanes) {
-      lane.steps.push(...new Array<boolean>(added).fill(false));
+      lane.steps.push(...new Array<StepValue>(added).fill(0));
     }
     updateLengthDisplay();
     drawGrid();
     setStatus(`extended to ${stepCount / STEPS_PER_BAR} bars`);
+  });
+
+  addLaneBtn.addEventListener("click", () => {
+    if (previewLoopTimer !== null) stopPreview();
+    lanes.push({
+      label: `L${lanes.length + 1}`,
+      sourceA: null,
+      sourceB: null,
+      steps: new Array<StepValue>(stepCount).fill(0),
+    });
+    drawGrid();
+    setStatus(`added lane (${lanes.length} total)`);
   });
 
   playBtn.addEventListener("click", () => {
@@ -717,7 +833,7 @@ export async function mountDrums(
     stopPreview();
   });
   clearBtn.addEventListener("click", () => {
-    for (const lane of lanes) lane.steps.fill(false);
+    for (const lane of lanes) lane.steps.fill(0);
     drawGrid();
     setStatus("pattern cleared");
   });
@@ -740,6 +856,14 @@ export async function mountDrums(
       setStatus(`listSources failed: ${String(err)}`);
       sources = [];
     }
+    // Sort by display name (case-insensitive, locale-aware) so the source
+    // pickers read alphabetically. Tie-break on id for deterministic order
+    // when two sources share a name.
+    sources.sort(
+      (a, b) =>
+        a.name.localeCompare(b.name, undefined, { sensitivity: "base" }) ||
+        a.id.localeCompare(b.id),
+    );
     try {
       const t = await client.getTempo();
       bpm = t.bpm;
@@ -758,7 +882,8 @@ export async function mountDrums(
       if (!liveIds.has(id)) bufferCache.delete(id);
     }
     for (const lane of lanes) {
-      if (lane.sourceId && !liveIds.has(lane.sourceId)) lane.sourceId = null;
+      if (lane.sourceA && !liveIds.has(lane.sourceA)) lane.sourceA = null;
+      if (lane.sourceB && !liveIds.has(lane.sourceB)) lane.sourceB = null;
     }
     await refreshPatternList();
     drawGrid();

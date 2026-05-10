@@ -1709,23 +1709,32 @@ export async function mountArranger(
     await client.setGroupName(newGroup, name);
     let clipCount = 0;
     for (const lane of grid.lanes) {
-      if (!lane.sourceId) continue;
-      const hits = lane.steps
-        .map((on, idx) => (on ? idx : -1))
-        .filter((idx) => idx >= 0);
+      // New patterns store sourceA/sourceB; legacy patterns store sourceId
+      // (and boolean steps). Treat legacy as sourceA so old saves still load.
+      const sourceA = lane.sourceA ?? lane.sourceId ?? null;
+      const sourceB = lane.sourceB ?? null;
+      // Step values: legacy boolean true / numeric 1 → sourceA; numeric 2 →
+      // sourceB. Anything else is a rest.
+      const hits: Array<{ stepIdx: number; sourceId: string }> = [];
+      for (let i = 0; i < lane.steps.length; i++) {
+        const v = lane.steps[i];
+        const slot = typeof v === "boolean" ? (v ? 1 : 0) : Number(v) || 0;
+        if (slot === 1 && sourceA) hits.push({ stepIdx: i, sourceId: sourceA });
+        else if (slot === 2 && sourceB) hits.push({ stepIdx: i, sourceId: sourceB });
+      }
       if (hits.length === 0) continue;
-      const src = sources.find((s) => s.id === lane.sourceId);
-      if (!src) continue;
       // Find or create a track named after this lane. Re-using lets repeat
       // inserts of the same pattern stack onto the same drum tracks rather
       // than fanning out to N copies of "BD".
       const existing = tracks.find((t) => t.name === lane.label);
       const trackId = existing ? existing.id : await client.addTrack(lane.label);
       if (!existing) tracks = await client.listTracks();
-      for (const stepIdx of hits) {
-        const positionFrame = startFrame + stepIdx * stepFrames;
+      for (const hit of hits) {
+        const src = sources.find((s) => s.id === hit.sourceId);
+        if (!src) continue;
+        const positionFrame = startFrame + hit.stepIdx * stepFrames;
         try {
-          const clipId = await client.addClip(trackId, lane.sourceId, positionFrame, 0, src.frames);
+          const clipId = await client.addClip(trackId, hit.sourceId, positionFrame, 0, src.frames);
           await client.setClipGroup(trackId, clipId, newGroup);
           clipCount++;
         } catch (err) {
