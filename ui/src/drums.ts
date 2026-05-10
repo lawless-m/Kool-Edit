@@ -42,6 +42,9 @@ interface Lane {
    *  -¼ → 0. Applied on top of swing in preview, bake, and arranger
    *  insert. Same length as `steps`; default-0 array. */
   nudges: number[];
+  /** Per-lane stereo pan in [-1, +1] (L → R). Used as a single-
+   *  breakpoint pan envelope on every baked clip in this lane. */
+  pan: number;
 }
 
 const NUDGE_CYCLE: number[] = [0, 0.25, 0.5, -0.5, -0.25];
@@ -65,6 +68,9 @@ export interface SavedPatternGrid {
     /** Optional per-step microtiming nudge in [-0.5, +0.5] fractions of
      *  one step. Patterns saved before nudge existed default to all-0. */
     nudges?: number[];
+    /** Optional per-lane stereo pan in [-1, +1]. Patterns saved before
+     *  pan existed default to 0 (centre). */
+    pan?: number;
   }>;
   stepCount: number;
   stepsPerBeat: number;
@@ -132,6 +138,7 @@ export async function mountDrums(
     sourceB: null,
     steps: new Array<StepValue>(stepCount).fill(0),
     nudges: new Array<number>(stepCount).fill(0),
+    pan: 0,
   }));
   // 808-style shared accent row. One boolean per step; an accented step
   // boosts every lane that fires on it. Stored at the pattern level (not
@@ -448,6 +455,38 @@ export async function mountDrums(
       });
       row.appendChild(removeBtn);
 
+      // Per-lane pan slider. -100..+100 → -1..+1 in the engine; baked /
+      // inserted clips get a single-breakpoint pan envelope at this
+      // value so the lane sits where the user dropped it. Double-click
+      // the slider to centre.
+      const panSlider = document.createElement("input");
+      panSlider.type = "range";
+      panSlider.min = "-100";
+      panSlider.max = "100";
+      panSlider.step = "1";
+      panSlider.value = String(Math.round(lane.pan * 100));
+      Object.assign(panSlider.style, {
+        width: "50px",
+        flexShrink: "0",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const panLetter = (v: number): string => {
+        const r = Math.round(v * 100);
+        if (r === 0) return "C";
+        return r < 0 ? `L${-r}` : `R${r}`;
+      };
+      panSlider.title = `Lane pan (${panLetter(lane.pan)}) — double-click to centre`;
+      panSlider.addEventListener("input", () => {
+        const v = Math.max(-1, Math.min(1, Number(panSlider.value) / 100));
+        lane.pan = v;
+        panSlider.title = `Lane pan (${panLetter(v)}) — double-click to centre`;
+      });
+      panSlider.addEventListener("dblclick", () => {
+        lane.pan = 0;
+        panSlider.value = "0";
+        panSlider.title = "Lane pan (C) — double-click to centre";
+      });
+      row.appendChild(panSlider);
+
       // Step cells, broken into groups of 4 with a vertical gutter so the
       // user can count beats by eye (matches the Oberheim DMX layout).
       const cells = document.createElement("div");
@@ -577,12 +616,13 @@ export async function mountDrums(
       flexShrink: "0",
     } satisfies Partial<CSSStyleDeclaration>);
     acRow.appendChild(acLabel);
-    // Spacer that absorbs the same horizontal space the lane row uses for
-    // (swatch A + 8gap + swatch B + 8gap + × button) — total 28+8+28+8+20
-    // = 92 px. Keeps the AC cells aligned with the lane cells.
+    // Spacer that absorbs the same horizontal space the lane row uses
+    // for (swatch A + 8gap + swatch B + 8gap + × + 8gap + pan slider) —
+    // total 28+8+28+8+20+8+50 = 150 px. Keeps the AC cells aligned with
+    // the lane cells.
     const acSpacer = document.createElement("div");
     Object.assign(acSpacer.style, {
-      width: "92px",
+      width: "150px",
       flexShrink: "0",
     } satisfies Partial<CSSStyleDeclaration>);
     acRow.appendChild(acSpacer);
@@ -918,7 +958,17 @@ export async function mountDrums(
         const gainNode = ctx.createGain();
         gainNode.gain.value = stepGain;
         node.connect(gainNode);
-        gainNode.connect(ctx.destination);
+        // Per-lane stereo pan via StereoPannerNode. Skip the centre
+        // case so the pan node isn't allocated for every centre hit
+        // (most patterns) — chain straight into the destination.
+        if (Math.abs(lane.pan) > 1e-3) {
+          const panner = ctx.createStereoPanner();
+          panner.pan.value = Math.max(-1, Math.min(1, lane.pan));
+          gainNode.connect(panner);
+          panner.connect(ctx.destination);
+        } else {
+          gainNode.connect(ctx.destination);
+        }
         node.start(t);
         out.push(node);
       }
@@ -1071,6 +1121,14 @@ export async function mountDrums(
               { time: 0, value: NON_ACCENT_DB, curve: "Linear" },
             ]);
           }
+          // Per-lane pan baked as a constant single-breakpoint pan
+          // envelope. Skip when pan is centred so we don't litter the
+          // project with no-op envelopes.
+          if (Math.abs(lane.pan) > 1e-3) {
+            await client.setClipEnvelope(trackId, clipId, "pan", [
+              { time: 0, value: lane.pan, curve: "Linear" },
+            ]);
+          }
           clipsAdded++;
         } catch (err) {
           console.warn("bake: addClip failed", err);
@@ -1100,6 +1158,7 @@ export async function mountDrums(
       sourceB: l.sourceB,
       steps: [...l.steps],
       nudges: [...l.nudges],
+      pan: l.pan,
     })),
     stepCount,
     stepsPerBeat,
@@ -1188,7 +1247,9 @@ export async function mountDrums(
           nudges[s] = Math.max(-0.5, Math.min(0.5, v));
         }
       }
-      lanes.push({ label: savedLane.label, sourceA, sourceB, steps, nudges });
+      const rawPan = Number(savedLane.pan ?? 0) || 0;
+      const pan = Math.max(-1, Math.min(1, rawPan));
+      lanes.push({ label: savedLane.label, sourceA, sourceB, steps, nudges, pan });
     }
     // Restore the accent row, defaulting to all-off for older patterns
     // saved before the AC row existed. Truncate / pad to match stepCount
@@ -1266,6 +1327,7 @@ export async function mountDrums(
       sourceB: null,
       steps: new Array<StepValue>(stepCount).fill(0),
       nudges: new Array<number>(stepCount).fill(0),
+      pan: 0,
     });
     drawGrid();
     setStatus(`added lane (${lanes.length} total)`);

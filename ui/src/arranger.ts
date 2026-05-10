@@ -1845,6 +1845,9 @@ export async function mountArranger(
       // [-0.5, +0.5] of one step so a corrupt save can't fling clips
       // half a bar out of place.
       const laneNudges: number[] = Array.isArray(lane.nudges) ? lane.nudges : [];
+      // Per-lane pan, optional in the saved shape. Stamped on each
+      // baked clip as a constant pan envelope when non-centre.
+      const lanePan = Math.max(-1, Math.min(1, Number(lane.pan ?? 0) || 0));
       for (const hit of hits) {
         const src = sources.find((s) => s.id === hit.sourceId);
         if (!src) continue;
@@ -1867,6 +1870,14 @@ export async function mountArranger(
           if (!(accents[hit.stepIdx] ?? false)) {
             await client.setClipEnvelope(trackId, clipId, "volume", [
               { time: 0, value: NON_ACCENT_DB, curve: "Linear" },
+            ]);
+          }
+          // Per-lane pan from the drum machine, baked as a constant
+          // pan envelope. Skip the centre case to keep the project
+          // tidy.
+          if (Math.abs(lanePan) > 1e-3) {
+            await client.setClipEnvelope(trackId, clipId, "pan", [
+              { time: 0, value: lanePan, curve: "Linear" },
             ]);
           }
           clipCount++;
