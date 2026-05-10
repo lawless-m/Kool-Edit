@@ -57,6 +57,16 @@ export interface PatternInfo {
   gridJson: string;
 }
 
+/** Result of `detectBpm`. `candidates` is up to three `[bpm, normScore]`
+ *  pairs ordered best-first; the top score is always 1.0. `confidence` is
+ *  the top score divided by the sum of all returned candidate scores
+ *  (~1.0 = clear winner; ~0.33 = three roughly equal candidates). */
+export interface TempoEstimate {
+  bpm: number;
+  confidence: number;
+  candidates: Array<[number, number]>;
+}
+
 export interface NoiseProfileInfo {
   id: string;
   name: string;
@@ -464,6 +474,14 @@ export class EngineClient {
     );
     if (ev.kind !== "detect_pitch_contour_ok") throw new Error("unexpected event");
     return ev.contour;
+  }
+
+  async detectBpm(sourceId: string): Promise<TempoEstimate> {
+    const ev = await this.request<EngineCommand & { kind: "detect_bpm" }>(
+      (req) => ({ kind: "detect_bpm", req, sourceId }),
+    );
+    if (ev.kind !== "detect_bpm_ok") throw new Error("unexpected event");
+    return JSON.parse(ev.json) as TempoEstimate;
   }
 
   async duplicateSource(sourceId: string): Promise<string> {

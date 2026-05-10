@@ -113,6 +113,7 @@ export type EngineCommand =
       hopSamples: number;
       windowSamples: number;
     }
+  | { kind: "detect_bpm"; req: RequestId; sourceId: string }
   | { kind: "duplicate_source"; req: RequestId; sourceId: string; nowIso: string }
   | { kind: "rename_source"; req: RequestId; sourceId: string; newName: string }
   | { kind: "remove_source"; req: RequestId; sourceId: string }
@@ -215,6 +216,7 @@ export type EngineEvent =
   | { kind: "export_kepz_ok"; req: RequestId; bytes: Uint8Array }
   | { kind: "import_kepz_ok"; req: RequestId }
   | { kind: "detect_pitch_contour_ok"; req: RequestId; contour: Float32Array }
+  | { kind: "detect_bpm_ok"; req: RequestId; json: string }
   | { kind: "duplicate_source_ok"; req: RequestId; newSourceId: string }
   | { kind: "rename_source_ok"; req: RequestId }
   | { kind: "remove_source_ok"; req: RequestId; removed: boolean }

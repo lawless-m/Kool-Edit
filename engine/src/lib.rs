@@ -23,6 +23,7 @@ pub mod source;
 pub mod spectral;
 pub mod stft;
 pub mod storage;
+pub mod tempo;
 pub mod wav;
 
 pub const FORMAT_VERSION: u32 = 1;
@@ -243,6 +244,63 @@ mod wasm_api {
         #[wasm_bindgen(js_name = sourceSampleRate)]
         pub fn source_sample_rate(&self, source_id: &str) -> Option<u32> {
             self.inner.source_sample_rate(&SourceId::new(source_id))
+        }
+
+        /// Estimate the dominant tempo of a source. Returns JSON
+        /// `{bpm, confidence, candidates: [[bpm, normScore], ...]}` —
+        /// candidates are top-3, ordered best-first, with scores
+        /// normalised so the top is always 1.0.
+        #[wasm_bindgen(js_name = detectBpm)]
+        pub fn detect_bpm(&self, source_id: &str) -> Result<String, JsError> {
+            let id = SourceId::new(source_id);
+            let frames = self
+                .inner
+                .source_frame_count(&id)
+                .ok_or_else(|| JsError::new("unknown source"))?;
+            let range = SampleRange::new(0, frames)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let samples = self
+                .inner
+                .query_samples(&id, range)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let channels = self
+                .inner
+                .source_channel_count(&id)
+                .ok_or_else(|| JsError::new("unknown source"))?;
+            // Sum to mono: BPM cues are equally distributed across channels
+            // for typical material; the cheap mean is plenty.
+            let mono: Vec<f32> = if channels == 1 {
+                samples
+            } else {
+                let ch = channels as usize;
+                let frames = samples.len() / ch;
+                (0..frames)
+                    .map(|f| {
+                        let mut s = 0.0_f32;
+                        for c in 0..ch {
+                            s += samples[f * ch + c];
+                        }
+                        s / ch as f32
+                    })
+                    .collect()
+            };
+            let sample_rate = self
+                .inner
+                .source_sample_rate(&id)
+                .ok_or_else(|| JsError::new("unknown source"))?;
+            let est = crate::tempo::estimate_bpm(&mono, sample_rate)
+                .map_err(|e| JsError::new(&e.to_string()))?;
+            let candidates: Vec<serde_json::Value> = est
+                .candidates
+                .iter()
+                .map(|(b, s)| serde_json::json!([b, s]))
+                .collect();
+            Ok(serde_json::json!({
+                "bpm": est.bpm,
+                "confidence": est.confidence,
+                "candidates": candidates,
+            })
+            .to_string())
         }
 
         #[wasm_bindgen(js_name = sourceChannelCount)]

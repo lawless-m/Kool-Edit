@@ -83,6 +83,7 @@ type WasmEngine = {
     hopSamples: number,
     windowSamples: number,
   ) => Float32Array;
+  detectBpm: (sourceId: string) => string;
   duplicateSource: (sourceId: string, nowIso: string) => string;
   renameSource: (sourceId: string, newName: string) => void;
   removeSource: (sourceId: string) => boolean;
@@ -498,6 +499,11 @@ let playback: PlaybackState | null = null;
             cmd.windowSamples,
           );
           send({ kind: "detect_pitch_contour_ok", req: cmd.req, contour });
+          return;
+        }
+        case "detect_bpm": {
+          const json = engine.detectBpm(cmd.sourceId);
+          send({ kind: "detect_bpm_ok", req: cmd.req, json });
           return;
         }
 

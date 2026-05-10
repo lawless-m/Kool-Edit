@@ -4,7 +4,12 @@
 // The shell (main.ts) boots the shared EngineClient and Playback and hands
 // them in.
 
-import type { EngineClient, NoiseProfileInfo, SourceInfo } from "./engine/client";
+import type {
+  EngineClient,
+  NoiseProfileInfo,
+  SourceInfo,
+  TempoEstimate,
+} from "./engine/client";
 import type { Playback } from "./audio/playback";
 import { drawWaveform } from "./waveform";
 import { drawSpectrogram } from "./spectrogram";
@@ -616,6 +621,11 @@ export async function mountEditor(
       ev.stopPropagation();
       void promptMoveToFolder(s);
     });
+    const bpmBtn = mkActionBtn("♩", "Detect BPM");
+    bpmBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      void detectAndOfferBpm(s);
+    });
     const delBtn = mkActionBtn("×", "Delete from library");
     delBtn.style.fontSize = "14px";
     delBtn.addEventListener("click", (ev) => {
@@ -623,6 +633,7 @@ export async function mountEditor(
       void confirmDeleteSource(s);
     });
     actions.appendChild(folderBtn);
+    actions.appendChild(bpmBtn);
     actions.appendChild(delBtn);
 
     row.appendChild(text);
@@ -637,6 +648,179 @@ export async function mountEditor(
       beginRename(s, nameEl);
     });
     return row;
+  };
+
+  /** Run BPM detection on `s` and pop a dialog letting the user pick
+   *  one of the top candidates (or cancel). Picking sets the project
+   *  tempo, leaving the existing time signature alone. */
+  const detectAndOfferBpm = async (s: SourceInfo): Promise<void> => {
+    ui.status.textContent = `detecting BPM for "${s.name}"…`;
+    let est: TempoEstimate;
+    try {
+      est = await client.detectBpm(s.id);
+    } catch (err) {
+      ui.status.textContent = `BPM detect failed: ${String(err)}`;
+      return;
+    }
+    ui.status.textContent =
+      `BPM ≈ ${est.bpm.toFixed(1)} for "${s.name}"` +
+      ` (confidence ${(est.confidence * 100).toFixed(0)}%)`;
+    const chosen = await openBpmDialog(s, est);
+    if (chosen === null) return;
+    let beatsPerBar = 4;
+    let beatUnit = 4;
+    try {
+      const t = await client.getTempo();
+      beatsPerBar = t.beatsPerBar;
+      beatUnit = t.beatUnit;
+    } catch {
+      // Older engines without getTempo — fall back to 4/4 defaults.
+    }
+    try {
+      await client.setTempo(chosen, beatsPerBar, beatUnit);
+      ui.status.textContent = `tempo set to ${chosen.toFixed(1)} BPM`;
+      // Drums + arranger read tempo on refresh; reuse the existing import
+      // hook so they pick up the new value without a bespoke callback.
+      opts.onSourceImported?.();
+    } catch (err) {
+      ui.status.textContent = `setTempo failed: ${String(err)}`;
+    }
+  };
+
+  /** Modal dialog showing the detected candidates with relative-strength
+   *  bars. Resolves to the BPM the user picked, or `null` on cancel. */
+  const openBpmDialog = (
+    s: SourceInfo,
+    est: TempoEstimate,
+  ): Promise<number | null> => {
+    return new Promise((resolve) => {
+      const overlay = document.createElement("div");
+      Object.assign(overlay.style, {
+        position: "fixed",
+        inset: "0",
+        background: "rgba(0,0,0,0.6)",
+        zIndex: "1000",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const panel = document.createElement("div");
+      Object.assign(panel.style, {
+        width: "min(360px, 90vw)",
+        background: "#1a1a1a",
+        border: "1px solid #444",
+        borderRadius: "6px",
+        color: "#d8d8d8",
+        fontFamily: "system-ui, sans-serif",
+        fontSize: "13px",
+        boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+        display: "flex",
+        flexDirection: "column",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const header = document.createElement("div");
+      header.textContent = `Detected BPM for "${s.name}"`;
+      Object.assign(header.style, {
+        padding: "10px 14px",
+        borderBottom: "1px solid #333",
+        fontWeight: "600",
+        overflow: "hidden",
+        textOverflow: "ellipsis",
+        whiteSpace: "nowrap",
+      } satisfies Partial<CSSStyleDeclaration>);
+      panel.appendChild(header);
+      const sub = document.createElement("div");
+      sub.textContent = `Confidence ${(est.confidence * 100).toFixed(0)}% — pick a candidate to set the project tempo:`;
+      Object.assign(sub.style, {
+        padding: "8px 14px 4px",
+        color: "#9a9a9a",
+        fontSize: "12px",
+      } satisfies Partial<CSSStyleDeclaration>);
+      panel.appendChild(sub);
+      const list = document.createElement("div");
+      list.style.padding = "4px 6px 8px";
+      panel.appendChild(list);
+      const close = (result: number | null): void => {
+        document.removeEventListener("keydown", onKey);
+        overlay.remove();
+        resolve(result);
+      };
+      const onKey = (ev: KeyboardEvent): void => {
+        if (ev.key === "Escape") close(null);
+      };
+      document.addEventListener("keydown", onKey);
+      est.candidates.forEach(([bpm, score], idx) => {
+        const row = document.createElement("button");
+        row.type = "button";
+        Object.assign(row.style, {
+          display: "flex",
+          alignItems: "center",
+          gap: "10px",
+          padding: "8px 10px",
+          margin: "2px 0",
+          width: "100%",
+          background: idx === 0 ? "#2a3a2a" : "transparent",
+          color: "#d8d8d8",
+          border: "1px solid #333",
+          borderRadius: "3px",
+          cursor: "pointer",
+          textAlign: "left",
+          fontFamily: "inherit",
+          fontSize: "13px",
+        } satisfies Partial<CSSStyleDeclaration>);
+        const num = document.createElement("div");
+        num.textContent = `${bpm.toFixed(1)} BPM`;
+        Object.assign(num.style, {
+          width: "90px",
+          flexShrink: "0",
+          fontFamily: "ui-monospace, monospace",
+        } satisfies Partial<CSSStyleDeclaration>);
+        row.appendChild(num);
+        const barWrap = document.createElement("div");
+        Object.assign(barWrap.style, {
+          flex: "1 1 auto",
+          height: "10px",
+          background: "#0e0e0e",
+          border: "1px solid #2a2a2a",
+          borderRadius: "2px",
+          overflow: "hidden",
+        } satisfies Partial<CSSStyleDeclaration>);
+        const bar = document.createElement("div");
+        Object.assign(bar.style, {
+          width: `${Math.max(0, Math.min(1, score)) * 100}%`,
+          height: "100%",
+          background: idx === 0 ? "#7ac77a" : "#5a8a5a",
+        } satisfies Partial<CSSStyleDeclaration>);
+        barWrap.appendChild(bar);
+        row.appendChild(barWrap);
+        row.addEventListener("click", () => close(bpm));
+        list.appendChild(row);
+      });
+      const footer = document.createElement("div");
+      Object.assign(footer.style, {
+        padding: "6px 14px 10px",
+        display: "flex",
+        justifyContent: "flex-end",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Cancel";
+      Object.assign(cancel.style, {
+        background: "#2a2a2a",
+        color: "#d8d8d8",
+        border: "1px solid #444",
+        borderRadius: "3px",
+        padding: "4px 12px",
+        cursor: "pointer",
+      } satisfies Partial<CSSStyleDeclaration>);
+      cancel.addEventListener("click", () => close(null));
+      footer.appendChild(cancel);
+      panel.appendChild(footer);
+      overlay.addEventListener("click", (ev) => {
+        if (ev.target === overlay) close(null);
+      });
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+    });
   };
 
   const promptMoveToFolder = async (s: SourceInfo): Promise<void> => {
