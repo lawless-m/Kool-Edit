@@ -37,7 +37,14 @@ interface Lane {
   sourceA: string | null;
   sourceB: string | null;
   steps: StepValue[];
+  /** Per-step microtiming offset as a fraction of one step's duration,
+   *  in the range [-0.5, +0.5]. Right-click cycles 0 → +¼ → +½ → -½ →
+   *  -¼ → 0. Applied on top of swing in preview, bake, and arranger
+   *  insert. Same length as `steps`; default-0 array. */
+  nudges: number[];
 }
+
+const NUDGE_CYCLE: number[] = [0, 0.25, 0.5, -0.5, -0.25];
 
 /** Wire format for a saved drum pattern. Stored as opaque JSON in the
  *  engine's `Project::patterns`. The arranger uses this to re-stamp a
@@ -55,6 +62,9 @@ export interface SavedPatternGrid {
     sourceB?: string | null;
     sourceId?: string | null; // legacy
     steps: Array<number | boolean>;
+    /** Optional per-step microtiming nudge in [-0.5, +0.5] fractions of
+     *  one step. Patterns saved before nudge existed default to all-0. */
+    nudges?: number[];
   }>;
   stepCount: number;
   stepsPerBeat: number;
@@ -121,6 +131,7 @@ export async function mountDrums(
     sourceA: null,
     sourceB: null,
     steps: new Array<StepValue>(stepCount).fill(0),
+    nudges: new Array<number>(stepCount).fill(0),
   }));
   // 808-style shared accent row. One boolean per step; an accented step
   // boosts every lane that fires on it. Stored at the pattern level (not
@@ -461,6 +472,14 @@ export async function mountDrums(
         // Three-state colouring: off = dark, X = white, x = grey.
         const cellBg =
           value === 1 ? "#ffffff" : value === 2 ? "#7a7a7a" : "#0e0e0e";
+        // One column = cell width (26) + 2×margin (4) = 30 px. Shifting
+        // the cell by `nudge × column_width` makes the visual offset on
+        // the grid match the actual timing offset on the audio clock —
+        // a -0.5 nudge slides half a column back, so the cell visibly
+        // crowds the previous step. Cells stay click-targets at their
+        // nominal grid position; only the visual moves.
+        const nudge = lane.nudges[s] ?? 0;
+        const nudgePx = nudge * 30;
         Object.assign(cell.style, {
           width: "26px",
           height: "32px",
@@ -477,7 +496,12 @@ export async function mountDrums(
           // Establishes the positioning context for the bar.beat label
           // attached to first-row downbeat cells.
           position: "relative",
+          left: `${nudgePx}px`,
         } satisfies Partial<CSSStyleDeclaration>);
+        cell.title =
+          nudge !== 0
+            ? `nudge ${nudge > 0 ? "+" : ""}${nudge}× step (right-click to cycle)`
+            : "click: off → A → B  ·  right-click: cycle nudge ±¼ ±½ step";
         // Anchor the bar.beat label to the first lane's downbeat cells so
         // the label and cell share a positioning context — they move
         // together no matter what flex/scroll does to the row.
@@ -510,6 +534,18 @@ export async function mountDrums(
           const pickedSource =
             next === 1 ? lane.sourceA : next === 2 ? lane.sourceB : null;
           if (pickedSource) void triggerOneShot(pickedSource);
+        });
+        // Right-click cycles the per-step nudge so flams and humanised
+        // hats are reachable without a separate "mode". Cycle is
+        // 0 → +¼ → +½ → -½ → -¼ → 0; preventDefault stops the browser
+        // context menu hijacking the gesture.
+        cell.addEventListener("contextmenu", (ev) => {
+          ev.preventDefault();
+          const cur = lane.nudges[s] ?? 0;
+          const idx = NUDGE_CYCLE.findIndex((v) => Math.abs(v - cur) < 1e-6);
+          const nextIdx = (idx === -1 ? 0 : idx + 1) % NUDGE_CYCLE.length;
+          lane.nudges[s] = NUDGE_CYCLE[nextIdx]!;
+          drawGrid();
         });
         cells.appendChild(cell);
       }
@@ -863,7 +899,7 @@ export async function mountDrums(
       if (bufA || bufB) lanesWithBufs.push({ lane, bufA, bufB });
     }
     for (let s = 0; s < stepCount; s++) {
-      const t = startCtxTime + s * stepDur + swingOffsetSec(s, stepDur);
+      const baseT = startCtxTime + s * stepDur + swingOffsetSec(s, stepDur);
       // Apply the column-wide accent gain once per step. Accented steps
       // play at unity; non-accented steps are pulled down by NON_ACCENT_DB.
       const stepGain = (accents[s] ?? false) ? 1.0 : NON_ACCENT_LINEAR;
@@ -871,6 +907,12 @@ export async function mountDrums(
         const v = lane.steps[s] ?? 0;
         const buf = v === 1 ? bufA : v === 2 ? bufB : null;
         if (!buf) continue;
+        // Per-step microtiming nudge — fraction of one step, applied
+        // on top of swing. Negative nudges that would push the very
+        // first step to a time before startCtxTime are clamped so we
+        // never hand AudioBufferSourceNode.start a past timestamp.
+        const nudge = lane.nudges[s] ?? 0;
+        const t = Math.max(startCtxTime, baseT + nudge * stepDur);
         const node = ctx.createBufferSource();
         node.buffer = buf;
         const gainNode = ctx.createGain();
@@ -1003,7 +1045,14 @@ export async function mountDrums(
         const swingFrames = Math.round(
           swingOffsetSec(hit.stepIdx, stepDurationSec()) * projectSr,
         );
-        const positionFrame = hit.stepIdx * stepFrames + swingFrames;
+        // Per-step nudge in frames. Clamp the final position to ≥0 since
+        // a heavy negative nudge on step 0 would push the clip to a
+        // negative frame, which addClip rejects.
+        const nudgeFrames = Math.round((lane.nudges[hit.stepIdx] ?? 0) * stepFrames);
+        const positionFrame = Math.max(
+          0,
+          hit.stepIdx * stepFrames + swingFrames + nudgeFrames,
+        );
         try {
           const clipId = await client.addClip(
             trackId,
@@ -1050,6 +1099,7 @@ export async function mountDrums(
       sourceA: l.sourceA,
       sourceB: l.sourceB,
       steps: [...l.steps],
+      nudges: [...l.nudges],
     })),
     stepCount,
     stepsPerBeat,
@@ -1128,7 +1178,17 @@ export async function mountDrums(
               : 0
             : ((Math.max(0, Math.min(2, Number(v) || 0)) as 0 | 1 | 2));
       }
-      lanes.push({ label: savedLane.label, sourceA, sourceB, steps });
+      const nudges = new Array<number>(stepCount).fill(0);
+      if (Array.isArray(savedLane.nudges)) {
+        const lim = Math.min(nudges.length, savedLane.nudges.length);
+        for (let s = 0; s < lim; s++) {
+          // Clamp to the valid range so a corrupted save can't wedge a
+          // step half a bar away.
+          const v = Number(savedLane.nudges[s]) || 0;
+          nudges[s] = Math.max(-0.5, Math.min(0.5, v));
+        }
+      }
+      lanes.push({ label: savedLane.label, sourceA, sourceB, steps, nudges });
     }
     // Restore the accent row, defaulting to all-off for older patterns
     // saved before the AC row existed. Truncate / pad to match stepCount
@@ -1190,6 +1250,7 @@ export async function mountDrums(
     stepCount += added;
     for (const lane of lanes) {
       lane.steps.push(...new Array<StepValue>(added).fill(0));
+      lane.nudges.push(...new Array<number>(added).fill(0));
     }
     accents.push(...new Array<boolean>(added).fill(false));
     updateLengthDisplay();
@@ -1204,6 +1265,7 @@ export async function mountDrums(
       sourceA: null,
       sourceB: null,
       steps: new Array<StepValue>(stepCount).fill(0),
+      nudges: new Array<number>(stepCount).fill(0),
     });
     drawGrid();
     setStatus(`added lane (${lanes.length} total)`);
@@ -1216,7 +1278,10 @@ export async function mountDrums(
     stopPreview();
   });
   clearBtn.addEventListener("click", () => {
-    for (const lane of lanes) lane.steps.fill(0);
+    for (const lane of lanes) {
+      lane.steps.fill(0);
+      lane.nudges.fill(0);
+    }
     accents.fill(false);
     drawGrid();
     setStatus("pattern cleared");

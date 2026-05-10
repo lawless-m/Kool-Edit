@@ -1761,11 +1761,23 @@ export async function mountArranger(
       const existing = tracks.find((t) => t.name === lane.label);
       const trackId = existing ? existing.id : await client.addTrack(lane.label);
       if (!existing) tracks = await client.listTracks();
+      // Per-step microtiming, optional in the saved shape. Clamped to
+      // [-0.5, +0.5] of one step so a corrupt save can't fling clips
+      // half a bar out of place.
+      const laneNudges: number[] = Array.isArray(lane.nudges) ? lane.nudges : [];
       for (const hit of hits) {
         const src = sources.find((s) => s.id === hit.sourceId);
         if (!src) continue;
-        const positionFrame =
-          startFrame + hit.stepIdx * stepFrames + swingFramesFor(hit.stepIdx);
+        const rawNudge = Number(laneNudges[hit.stepIdx] ?? 0) || 0;
+        const nudge = Math.max(-0.5, Math.min(0.5, rawNudge));
+        const nudgeFrames = Math.round(nudge * stepFrames);
+        const positionFrame = Math.max(
+          0,
+          startFrame +
+            hit.stepIdx * stepFrames +
+            swingFramesFor(hit.stepIdx) +
+            nudgeFrames,
+        );
         try {
           const clipId = await client.addClip(trackId, hit.sourceId, positionFrame, 0, src.frames);
           await client.setClipGroup(trackId, clipId, newGroup);
