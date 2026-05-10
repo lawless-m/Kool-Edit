@@ -187,6 +187,8 @@ export async function mountArranger(
   const collapsedSourceFolders = new Set<string>();
 
   let envelopeMode = false;
+  type EnvelopeTarget = "volume" | "pan";
+  let envelopeTarget: EnvelopeTarget = "volume";
   const ENV_DB_MIN = -24;
   const ENV_DB_MAX = 12;
   // Pixel-Y → dB and vice versa, inside a clip lane of height `h`.
@@ -199,12 +201,25 @@ export async function mountArranger(
     const t = (clamped - ENV_DB_MIN) / (ENV_DB_MAX - ENV_DB_MIN);
     return (1 - t) * h;
   };
+  // Pan axis is -1..+1 with 0 (centre) at the lane's vertical midpoint.
+  // Up is L (negative), down is R (positive) — same convention as a
+  // mixer's pan knob with L on the left of the strip.
+  const yToPan = (y: number, h: number): number => {
+    const t = Math.max(0, Math.min(1, y / Math.max(1, h)));
+    // y=0 → -1 (full L at the top), y=h → +1 (full R at the bottom)
+    return Math.max(-1, Math.min(1, t * 2 - 1));
+  };
+  const panToY = (pan: number, h: number): number => {
+    const clamped = Math.max(-1, Math.min(1, pan));
+    return ((clamped + 1) / 2) * h;
+  };
   let envelopeDrag: {
     trackId: number;
     clipId: number;
     bpIndex: number;
     clipDiv: HTMLElement;
     clipFrames: number;
+    target: EnvelopeTarget;
   } | null = null;
 
   // Transport / selection state. inFrame/outFrame are project-frame positions
@@ -794,8 +809,8 @@ export async function mountArranger(
     o.style.left = `${framesToPx(playheadFrame)}px`;
   };
 
-  /** Build the SVG overlay that shows + edits a clip's volume envelope.
-   *  Drawn in clip-local coordinates. Click on empty space adds a
+  /** Build the SVG overlay that shows + edits a clip's envelope for the
+   *  active target ("volume" or "pan"). Click on empty space adds a
    *  breakpoint, mousedown on a dot drags it (clamped to the clip's
    *  bounds), double-click on a dot deletes. Persists via setClipEnvelope
    *  and triggers a redraw. */
@@ -804,6 +819,7 @@ export async function mountArranger(
     clip: ClipInfo,
     width: number,
     height: number,
+    target: EnvelopeTarget,
   ): SVGSVGElement => {
     const SVG = "http://www.w3.org/2000/svg";
     const svg = document.createElementNS(SVG, "svg") as SVGSVGElement;
@@ -819,14 +835,21 @@ export async function mountArranger(
     } satisfies Partial<CSSStyleDeclaration>);
 
     const clipFrames = Math.max(1, clip.sourceOut - clip.sourceIn);
-    const env = clip.volumeEnvelope ?? [];
+    const env = (target === "volume" ? clip.volumeEnvelope : clip.panEnvelope) ?? [];
+    // Per-target axis transforms + colour. Volume keeps the existing
+    // green; pan picks a contrasting cyan-blue so the two overlays read
+    // distinctly when the user toggles between targets.
+    const valueToY = target === "volume" ? dbToY : panToY;
+    const yToValue = target === "volume" ? yToDb : yToPan;
+    const referenceValue = 0;
+    const strokeColor = target === "volume" ? "var(--accent)" : "#6cb8ff";
 
-    // 0 dB reference line so it's clear where unity is.
+    // Reference line at unity (0 dB) / centre (pan = 0).
     const zeroLine = document.createElementNS(SVG, "line");
     zeroLine.setAttribute("x1", "0");
     zeroLine.setAttribute("x2", String(width));
-    zeroLine.setAttribute("y1", String(dbToY(0, height)));
-    zeroLine.setAttribute("y2", String(dbToY(0, height)));
+    zeroLine.setAttribute("y1", String(valueToY(referenceValue, height)));
+    zeroLine.setAttribute("y2", String(valueToY(referenceValue, height)));
     zeroLine.setAttribute("stroke", "rgba(255,255,255,0.18)");
     zeroLine.setAttribute("stroke-dasharray", "2 3");
     zeroLine.setAttribute("pointer-events", "none");
@@ -841,17 +864,17 @@ export async function mountArranger(
     // and the user gets a fresh start.
     if (env.length > 0) {
       const pts: Array<[number, number]> = [];
-      const firstY = dbToY(env[0]!.value, height);
+      const firstY = valueToY(env[0]!.value, height);
       pts.push([0, firstY]);
       for (const bp of env) {
-        pts.push([frameToX(bp.time), dbToY(bp.value, height)]);
+        pts.push([frameToX(bp.time), valueToY(bp.value, height)]);
       }
-      const lastY = dbToY(env[env.length - 1]!.value, height);
+      const lastY = valueToY(env[env.length - 1]!.value, height);
       pts.push([width, lastY]);
       const poly = document.createElementNS(SVG, "polyline");
       poly.setAttribute("points", pts.map(([x, y]) => `${x},${y}`).join(" "));
       poly.setAttribute("fill", "none");
-      poly.setAttribute("stroke", "var(--accent)");
+      poly.setAttribute("stroke", strokeColor);
       poly.setAttribute("stroke-width", "1.5");
       poly.setAttribute("pointer-events", "none");
       svg.appendChild(poly);
@@ -873,14 +896,15 @@ export async function mountArranger(
       const x = ev.clientX - rect.left;
       const y = ev.clientY - rect.top;
       const time = Math.max(0, Math.min(clipFrames - 1, Math.round((x / width) * clipFrames)));
-      const value = yToDb(y, height);
+      const value = yToValue(y, height);
       // Insert sorted by time; if a breakpoint already exists at this
       // exact frame, skip (the engine rejects duplicate times).
-      const next = (clip.volumeEnvelope ?? []).slice();
+      const existing = (target === "volume" ? clip.volumeEnvelope : clip.panEnvelope) ?? [];
+      const next = existing.slice();
       if (next.some((bp) => bp.time === time)) return;
       next.push({ time, value, curve: "Linear" });
       next.sort((a, b) => a.time - b.time);
-      void persistEnvelope(trackId, clip.id, next);
+      void persistEnvelope(trackId, clip.id, target, next);
     });
     svg.appendChild(bg);
 
@@ -888,12 +912,12 @@ export async function mountArranger(
     for (let i = 0; i < env.length; i++) {
       const bp = env[i]!;
       const cx = frameToX(bp.time);
-      const cy = dbToY(bp.value, height);
+      const cy = valueToY(bp.value, height);
       const dot = document.createElementNS(SVG, "circle");
       dot.setAttribute("cx", String(cx));
       dot.setAttribute("cy", String(cy));
       dot.setAttribute("r", "4");
-      dot.setAttribute("fill", "var(--accent)");
+      dot.setAttribute("fill", strokeColor);
       dot.setAttribute("stroke", "var(--bg-0)");
       dot.setAttribute("stroke-width", "1.5");
       dot.style.cursor = "grab";
@@ -907,15 +931,17 @@ export async function mountArranger(
           bpIndex: i,
           clipDiv: svg.parentElement as HTMLElement,
           clipFrames,
+          target,
         };
         dot.style.cursor = "grabbing";
       });
       dot.addEventListener("dblclick", (ev) => {
         ev.stopPropagation();
         ev.preventDefault();
-        const next = (clip.volumeEnvelope ?? []).slice();
+        const existing = (target === "volume" ? clip.volumeEnvelope : clip.panEnvelope) ?? [];
+        const next = existing.slice();
         next.splice(i, 1);
-        void persistEnvelope(trackId, clip.id, next);
+        void persistEnvelope(trackId, clip.id, target, next);
       });
       svg.appendChild(dot);
     }
@@ -926,16 +952,19 @@ export async function mountArranger(
   const persistEnvelope = async (
     trackId: number,
     clipId: number,
+    target: EnvelopeTarget,
     breakpoints: Breakpoint[],
   ): Promise<void> => {
     try {
-      await client.setClipEnvelope(trackId, clipId, "volume", breakpoints);
+      await client.setClipEnvelope(trackId, clipId, target, breakpoints);
       // Update local cache so the redraw shows the new state without
-      // round-tripping through listClips. refresh() would also work but
-      // this keeps the interaction snappy.
+      // round-tripping through listClips.
       const list = clipsByTrack.get(trackId) ?? [];
       const clip = list.find((c) => c.id === clipId);
-      if (clip) clip.volumeEnvelope = breakpoints;
+      if (clip) {
+        if (target === "volume") clip.volumeEnvelope = breakpoints;
+        else clip.panEnvelope = breakpoints;
+      }
       drawTracks();
       rerenderIfPlaying();
     } catch (err) {
@@ -1459,7 +1488,7 @@ export async function mountArranger(
         }
 
         if (envelopeMode) {
-          const overlay = renderEnvelopeOverlay(track.id, c, width, innerH);
+          const overlay = renderEnvelopeOverlay(track.id, c, width, innerH, envelopeTarget);
           elt.appendChild(overlay);
         }
 
@@ -1933,6 +1962,11 @@ export async function mountArranger(
     drawTracks();
   };
   ui.envelopeBtn.addEventListener("click", () => setEnvelopeMode(!envelopeMode));
+  ui.envelopeTargetSelect.addEventListener("change", () => {
+    const v = ui.envelopeTargetSelect.value;
+    envelopeTarget = v === "pan" ? "pan" : "volume";
+    if (envelopeMode) drawTracks();
+  });
 
   // Populate the snap dropdown and wire it. Changing the snap value
   // redraws tracks so the lane grid + ruler reflect the new resolution.
@@ -2069,8 +2103,10 @@ export async function mountArranger(
     if (envelopeDrag) {
       const list = clipsByTrack.get(envelopeDrag.trackId) ?? [];
       const clip = list.find((c) => c.id === envelopeDrag!.clipId);
-      const bp = clip?.volumeEnvelope?.[envelopeDrag.bpIndex];
-      if (!clip || !bp) {
+      const env =
+        envelopeDrag.target === "volume" ? clip?.volumeEnvelope : clip?.panEnvelope;
+      const bp = env?.[envelopeDrag.bpIndex];
+      if (!clip || !bp || !env) {
         envelopeDrag = null;
         return;
       }
@@ -2083,9 +2119,9 @@ export async function mountArranger(
         0,
         Math.min(envelopeDrag.clipFrames - 1, Math.round((x / w) * envelopeDrag.clipFrames)),
       );
-      const value = yToDb(y, h);
+      const value =
+        envelopeDrag.target === "volume" ? yToDb(y, h) : yToPan(y, h);
       // Don't let two breakpoints share a time.
-      const env = clip.volumeEnvelope ?? [];
       const collides = env.some(
         (other, idx) => idx !== envelopeDrag!.bpIndex && other.time === time,
       );
@@ -2190,8 +2226,10 @@ export async function mountArranger(
       if (clip) {
         // Re-sort because the dragged breakpoint may have crossed others
         // in time. The engine requires strictly-increasing times.
-        const env = (clip.volumeEnvelope ?? []).slice().sort((a, b) => a.time - b.time);
-        await persistEnvelope(ed.trackId, ed.clipId, env);
+        const source =
+          ed.target === "volume" ? clip.volumeEnvelope : clip.panEnvelope;
+        const env = (source ?? []).slice().sort((a, b) => a.time - b.time);
+        await persistEnvelope(ed.trackId, ed.clipId, ed.target, env);
       }
       return;
     }
@@ -2593,6 +2631,7 @@ interface ArrangerUi {
   zoomOutBtn: HTMLButtonElement;
   zoomFitBtn: HTMLButtonElement;
   envelopeBtn: HTMLButtonElement;
+  envelopeTargetSelect: HTMLSelectElement;
   playBtn: HTMLButtonElement;
   loopBtn: HTMLButtonElement;
   stopBtn: HTMLButtonElement;
@@ -2779,7 +2818,31 @@ function buildUi(root: HTMLElement): ArrangerUi {
   const sepEnv = makeSep();
   const envelopeBtn = makeToolbarBtn("Envelopes");
   envelopeBtn.title =
-    "Toggle envelope edit mode. Click on a clip to add a volume breakpoint, drag to move, double-click to delete.";
+    "Toggle envelope edit mode. Click on a clip to add a breakpoint, drag to move, double-click to delete. The dropdown picks volume vs pan.";
+  // Target picker — chooses whether the envelope overlay edits volume
+  // or pan. Sits adjacent to the Envelopes button so both controls
+  // travel together visually.
+  const envelopeTargetSelect = document.createElement("select");
+  Object.assign(envelopeTargetSelect.style, {
+    background: "var(--bg-1)",
+    color: "var(--text-1)",
+    border: "1px solid var(--line-1)",
+    borderRadius: "3px",
+    padding: "2px 4px",
+    fontSize: "11px",
+    marginLeft: "4px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  for (const opt of [
+    { value: "volume", label: "vol" },
+    { value: "pan", label: "pan" },
+  ]) {
+    const o = document.createElement("option");
+    o.value = opt.value;
+    o.textContent = opt.label;
+    envelopeTargetSelect.appendChild(o);
+  }
+  envelopeTargetSelect.value = "volume";
+  envelopeTargetSelect.title = "Envelope target: volume (dB) or pan (L–R)";
 
   toolbar.appendChild(tracksTitle);
   toolbar.appendChild(addTrackBtn);
@@ -2810,6 +2873,7 @@ function buildUi(root: HTMLElement): ArrangerUi {
   toolbar.appendChild(zoomFitBtn);
   toolbar.appendChild(sepEnv);
   toolbar.appendChild(envelopeBtn);
+  toolbar.appendChild(envelopeTargetSelect);
   tracksPane.appendChild(toolbar);
 
   // tracks-body: headers column on the left, lanes-scroll on the right.
@@ -3047,6 +3111,7 @@ function buildUi(root: HTMLElement): ArrangerUi {
     zoomOutBtn,
     zoomFitBtn,
     envelopeBtn,
+    envelopeTargetSelect,
     playBtn,
     loopBtn,
     stopBtn,
