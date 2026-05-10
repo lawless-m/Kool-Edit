@@ -1209,11 +1209,16 @@ export async function mountArranger(
 
       // Choke: trim each clip's source_out so it ends where the next clip on
       // this track begins. For drum tracks where every kick is longer than a
-      // beat, this stops the tails summing additively into distortion.
+      // beat, this stops the tails summing additively into distortion. If
+      // any clips on this track are in the current selection, the trim is
+      // restricted to just those — useful for choking a region without
+      // disturbing tails elsewhere on the same track.
       const chokeBtn = document.createElement("button");
       chokeBtn.type = "button";
       chokeBtn.textContent = "Choke";
-      chokeBtn.title = "Trim each clip on this track to end where the next clip starts";
+      chokeBtn.title =
+        "Trim clips on this track to end where the next clip starts " +
+        "(restricted to selected clips when any are selected on this track)";
       Object.assign(chokeBtn.style, {
         padding: "0 5px",
         height: "16px",
@@ -1229,8 +1234,16 @@ export async function mountArranger(
         const list = (clipsByTrack.get(track.id) ?? [])
           .slice()
           .sort((a, b) => a.position - b.position);
+        // Restrict to the user's selection on this track when any clip on
+        // this track is selected; otherwise choke the whole track.
+        const selectedHere = new Set(
+          list.filter((c) => isClipSelected(track.id, c.id)).map((c) => c.id),
+        );
+        const restrictToSelection = selectedHere.size > 0;
+        let trimmed = 0;
         for (let i = 0; i < list.length - 1; i++) {
           const cur = list[i];
+          if (restrictToSelection && !selectedHere.has(cur.id)) continue;
           const next = list[i + 1];
           if (cur.endPosition <= next.position) continue;
           const overlap = next.position - cur.position;
@@ -1238,7 +1251,13 @@ export async function mountArranger(
           const newSourceOut = cur.sourceIn + overlap;
           if (newSourceOut <= cur.sourceIn) continue;
           await client.setClipSourceRange(track.id, cur.id, cur.sourceIn, newSourceOut);
+          trimmed++;
         }
+        setStatus(
+          restrictToSelection
+            ? `choked ${trimmed} selected clip${trimmed === 1 ? "" : "s"} on "${track.name}"`
+            : `choked ${trimmed} clip${trimmed === 1 ? "" : "s"} on "${track.name}"`,
+        );
         await refresh();
         rerenderIfPlaying();
       });
