@@ -119,6 +119,7 @@ export async function mountEditor(
     ui.inInput.disabled = sourceFrameCount === 0;
     ui.outInput.disabled = sourceFrameCount === 0;
     ui.trimBtn.disabled = !hasSelection || currentSourceId === null;
+    ui.copyToNewBtn.disabled = !hasSelection || currentSourceId === null;
   };
 
   const trim = (which: "in" | "out", deltaMs: number): void => {
@@ -2506,6 +2507,29 @@ export async function mountEditor(
     }
   });
 
+  ui.copyToNewBtn.addEventListener("click", async () => {
+    if (!currentSourceId || !selection) return;
+    const range = { start: selection.inFrame, end: selection.outFrame };
+    if (range.end <= range.start) return;
+    ui.copyToNewBtn.disabled = true;
+    try {
+      // Duplicate the source then Trim the copy to the selection — gives
+      // us a new library source containing just the selected audio
+      // without disturbing the original. Equivalent to Audition's
+      // "Copy to New".
+      const newId = await client.duplicateSource(currentSourceId);
+      await client.applyOp(newId, JSON.stringify({ Trim: { range } }));
+      await refreshLibrary();
+      await loadSource(newId);
+      opts.onSourceImported?.();
+      ui.status.textContent = `copied selection to new source (${range.end - range.start} frames)`;
+    } catch (err) {
+      ui.status.textContent = `copy to new failed: ${String(err)}`;
+    } finally {
+      syncSelectionInputs();
+    }
+  });
+
   ui.undoBtn.addEventListener("click", async () => {
     if (!currentSourceId) return;
     ui.undoBtn.disabled = true;
@@ -2608,6 +2632,7 @@ interface UiHandles {
   fxParamsRow: HTMLDivElement;
   fxApplyBtn: HTMLButtonElement;
   trimBtn: HTMLButtonElement;
+  copyToNewBtn: HTMLButtonElement;
   undoBtn: HTMLButtonElement;
   redoBtn: HTMLButtonElement;
 }
@@ -2900,6 +2925,15 @@ function buildUi(root: HTMLElement): UiHandles {
   Object.assign(trimBtn.style, btnStyle(), {
     padding: "4px 10px",
   } satisfies Partial<CSSStyleDeclaration>);
+  const copyToNewBtn = document.createElement("button");
+  copyToNewBtn.textContent = "Copy to new";
+  copyToNewBtn.type = "button";
+  copyToNewBtn.disabled = true;
+  copyToNewBtn.title =
+    "Create a new source in the library containing just the selection";
+  Object.assign(copyToNewBtn.style, btnStyle(), {
+    padding: "4px 10px",
+  } satisfies Partial<CSSStyleDeclaration>);
   const fxSep2 = document.createElement("span");
   fxSep2.textContent = "·";
   fxSep2.style.color = "#555";
@@ -2926,6 +2960,7 @@ function buildUi(root: HTMLElement): UiHandles {
   fxRow.appendChild(fxApplyBtn);
   fxRow.appendChild(fxSep);
   fxRow.appendChild(trimBtn);
+  fxRow.appendChild(copyToNewBtn);
   fxRow.appendChild(fxSep2);
   fxRow.appendChild(undoBtn);
   fxRow.appendChild(redoBtn);
@@ -3031,6 +3066,7 @@ function buildUi(root: HTMLElement): UiHandles {
     fxParamsRow,
     fxApplyBtn,
     trimBtn,
+    copyToNewBtn,
     undoBtn,
     redoBtn,
   };
