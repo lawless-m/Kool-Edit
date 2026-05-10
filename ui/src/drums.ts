@@ -290,48 +290,50 @@ export async function mountDrums(
       });
       row.appendChild(label);
 
-      // Two source pickers per lane (A = white "X" cells, B = grey "x"
+      // Two source slots per lane (A = white "X" cells, B = grey "x"
       // cells). Each cell cycles off → A → B → off so the lane can layer
       // two timbres on the same time grid (e.g. open vs closed hat,
-      // accents vs ghost notes). Either picker can stay unassigned —
-      // preview/bake just skip cells whose source is missing.
-      const makePicker = (
+      // accents vs ghost notes). The swatches act as buttons that open a
+      // modal source picker with a per-row preview ▶; either slot can
+      // stay unassigned (preview/bake skip those cells).
+      const makeSwatch = (
         which: "A" | "B",
         currentValue: string | null,
-        onChange: (id: string | null) => void,
-      ): HTMLSelectElement => {
-        const sel = document.createElement("select");
-        Object.assign(sel.style, {
-          width: "120px",
+        onPicked: (id: string | null) => void,
+      ): HTMLButtonElement => {
+        const btn = document.createElement("button");
+        btn.type = "button";
+        const fill = which === "A" ? "#ffffff" : "#7a7a7a";
+        // Filled square when assigned; dashed outline when empty so the
+        // user can tell at a glance which slots are wired up.
+        const assigned = currentValue !== null;
+        Object.assign(btn.style, {
+          width: "24px",
+          height: "24px",
           boxSizing: "border-box",
-          background: "#1a1a1a",
-          // The select chip echoes the cell colour so the user can tell
-          // which slot drives the white vs grey cells at a glance.
-          color: which === "A" ? "#e6e6e6" : "#aaaaaa",
-          border: which === "A" ? "1px solid #555" : "1px solid #3a3a3a",
-          padding: "2px 4px",
-          fontSize: "12px",
+          background: assigned ? fill : "transparent",
+          border: assigned ? `1px solid ${fill}` : `1px dashed ${fill}`,
+          borderRadius: "3px",
+          padding: "0",
+          margin: "0 2px",
+          cursor: "pointer",
+          flexShrink: "0",
         } satisfies Partial<CSSStyleDeclaration>);
-        const noneOpt = document.createElement("option");
-        noneOpt.value = "";
-        noneOpt.textContent = which === "A" ? "— X —" : "— x —";
-        sel.appendChild(noneOpt);
-        for (const s of sources) {
-          const o = document.createElement("option");
-          o.value = s.id;
-          o.textContent = s.name;
-          sel.appendChild(o);
-        }
-        sel.value = currentValue ?? "";
-        sel.addEventListener("change", () => {
-          const v = sel.value || null;
-          onChange(v);
-          if (v) void prefetchBuffer(v);
+        const assignedName = assigned
+          ? sources.find((s) => s.id === currentValue)?.name ?? "(missing)"
+          : "(none)";
+        btn.title = `Slot ${which} (${which === "A" ? "X" : "x"}): ${assignedName} — click to change`;
+        btn.addEventListener("click", async () => {
+          const result = await pickSource(which, currentValue);
+          if (result === undefined) return; // cancelled
+          onPicked(result);
+          if (result) void prefetchBuffer(result);
+          drawGrid();
         });
-        return sel;
+        return btn;
       };
-      row.appendChild(makePicker("A", lane.sourceA, (id) => (lane.sourceA = id)));
-      row.appendChild(makePicker("B", lane.sourceB, (id) => (lane.sourceB = id)));
+      row.appendChild(makeSwatch("A", lane.sourceA, (id) => (lane.sourceA = id)));
+      row.appendChild(makeSwatch("B", lane.sourceB, (id) => (lane.sourceB = id)));
 
       // Per-lane remove button. Disabled when there's only one lane left
       // so the user can't accidentally empty the kit.
@@ -486,6 +488,200 @@ export async function mountDrums(
     node.buffer = buf;
     node.connect(ctx.destination);
     node.start();
+  };
+
+  /** Modal source picker. Resolves to the chosen source id, `null` when
+   *  the user clears the slot, or `undefined` on cancel. Each row in the
+   *  list has a ▶ button that auditions the source without committing. */
+  const pickSource = (
+    which: "A" | "B",
+    currentId: string | null,
+  ): Promise<string | null | undefined> => {
+    return new Promise((resolve) => {
+      // Pause the lane-loop preview while the dialog is open so the
+      // user's audition isn't fighting the running pattern.
+      if (previewLoopTimer !== null) stopPreview();
+      let dialogPreview: AudioBufferSourceNode | null = null;
+      const stopDialogPreview = (): void => {
+        if (dialogPreview) {
+          try {
+            dialogPreview.stop();
+          } catch {
+            // already stopped or not-yet-started — fine
+          }
+          dialogPreview = null;
+        }
+      };
+      const slotColor = which === "A" ? "#ffffff" : "#7a7a7a";
+      const overlay = document.createElement("div");
+      Object.assign(overlay.style, {
+        position: "fixed",
+        inset: "0",
+        background: "rgba(0,0,0,0.6)",
+        zIndex: "1000",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const panel = document.createElement("div");
+      Object.assign(panel.style, {
+        width: "min(420px, 90vw)",
+        maxHeight: "min(70vh, 600px)",
+        display: "flex",
+        flexDirection: "column",
+        background: "#1a1a1a",
+        border: "1px solid #444",
+        borderRadius: "6px",
+        color: "#d8d8d8",
+        fontFamily: "system-ui, sans-serif",
+        fontSize: "13px",
+        boxShadow: "0 8px 24px rgba(0,0,0,0.5)",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const header = document.createElement("div");
+      Object.assign(header.style, {
+        display: "flex",
+        alignItems: "center",
+        gap: "8px",
+        padding: "10px 14px",
+        borderBottom: "1px solid #333",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const swatch = document.createElement("div");
+      Object.assign(swatch.style, {
+        width: "16px",
+        height: "16px",
+        background: slotColor,
+        border: "1px solid #555",
+        borderRadius: "3px",
+        flexShrink: "0",
+      } satisfies Partial<CSSStyleDeclaration>);
+      header.appendChild(swatch);
+      const title = document.createElement("div");
+      title.textContent = `Pick source for slot ${which} (${which === "A" ? "X" : "x"})`;
+      title.style.fontWeight = "600";
+      header.appendChild(title);
+      panel.appendChild(header);
+      const list = document.createElement("div");
+      Object.assign(list.style, {
+        flex: "1 1 auto",
+        overflowY: "auto",
+        padding: "4px",
+      } satisfies Partial<CSSStyleDeclaration>);
+      panel.appendChild(list);
+      const close = (result: string | null | undefined): void => {
+        stopDialogPreview();
+        document.removeEventListener("keydown", onKey);
+        overlay.remove();
+        resolve(result);
+      };
+      const onKey = (ev: KeyboardEvent): void => {
+        if (ev.key === "Escape") close(undefined);
+      };
+      document.addEventListener("keydown", onKey);
+      const makeRow = (
+        labelText: string,
+        sourceId: string | null,
+      ): HTMLDivElement => {
+        const isCurrent = sourceId === currentId;
+        const row = document.createElement("div");
+        Object.assign(row.style, {
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          padding: "6px 10px",
+          borderRadius: "3px",
+          cursor: "pointer",
+          background: isCurrent ? "#2a3a2a" : "transparent",
+        } satisfies Partial<CSSStyleDeclaration>);
+        row.addEventListener("mouseenter", () => {
+          if (!isCurrent) row.style.background = "#252525";
+        });
+        row.addEventListener("mouseleave", () => {
+          if (!isCurrent) row.style.background = "transparent";
+        });
+        const name = document.createElement("div");
+        name.textContent = labelText;
+        Object.assign(name.style, {
+          flex: "1 1 auto",
+          overflow: "hidden",
+          textOverflow: "ellipsis",
+          whiteSpace: "nowrap",
+        } satisfies Partial<CSSStyleDeclaration>);
+        row.appendChild(name);
+        if (sourceId) {
+          const playBtn = document.createElement("button");
+          playBtn.type = "button";
+          playBtn.textContent = "▶";
+          playBtn.title = "Preview";
+          Object.assign(playBtn.style, {
+            background: "#2a2a2a",
+            color: "#d8d8d8",
+            border: "1px solid #444",
+            borderRadius: "3px",
+            padding: "2px 8px",
+            cursor: "pointer",
+            fontSize: "12px",
+          } satisfies Partial<CSSStyleDeclaration>);
+          playBtn.addEventListener("click", async (ev) => {
+            // Stop row click from picking the source — preview only.
+            ev.stopPropagation();
+            stopDialogPreview();
+            const buf = await prefetchBuffer(sourceId);
+            if (!buf) return;
+            const ctx = ensureCtx();
+            const node = ctx.createBufferSource();
+            node.buffer = buf;
+            node.connect(ctx.destination);
+            node.onended = () => {
+              if (dialogPreview === node) dialogPreview = null;
+            };
+            node.start();
+            dialogPreview = node;
+          });
+          row.appendChild(playBtn);
+        }
+        row.addEventListener("click", () => close(sourceId));
+        return row;
+      };
+      list.appendChild(makeRow("(none)", null));
+      if (sources.length === 0) {
+        const empty = document.createElement("div");
+        empty.textContent = "No sources loaded — load a WAV from the library.";
+        Object.assign(empty.style, {
+          padding: "10px",
+          color: "#7a7a7a",
+          fontStyle: "italic",
+        } satisfies Partial<CSSStyleDeclaration>);
+        list.appendChild(empty);
+      } else {
+        for (const s of sources) list.appendChild(makeRow(s.name, s.id));
+      }
+      const footer = document.createElement("div");
+      Object.assign(footer.style, {
+        padding: "8px 14px",
+        borderTop: "1px solid #333",
+        display: "flex",
+        justifyContent: "flex-end",
+      } satisfies Partial<CSSStyleDeclaration>);
+      const cancelBtn = document.createElement("button");
+      cancelBtn.type = "button";
+      cancelBtn.textContent = "Cancel";
+      Object.assign(cancelBtn.style, {
+        background: "#2a2a2a",
+        color: "#d8d8d8",
+        border: "1px solid #444",
+        borderRadius: "3px",
+        padding: "4px 12px",
+        cursor: "pointer",
+      } satisfies Partial<CSSStyleDeclaration>);
+      cancelBtn.addEventListener("click", () => close(undefined));
+      footer.appendChild(cancelBtn);
+      panel.appendChild(footer);
+      overlay.addEventListener("click", (ev) => {
+        if (ev.target === overlay) close(undefined);
+      });
+      overlay.appendChild(panel);
+      document.body.appendChild(overlay);
+    });
   };
 
   const stepDurationSec = (): number => {
