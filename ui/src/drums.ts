@@ -46,7 +46,8 @@ interface Lane {
  *  step is recomputed from the current project tempo on insert.
  *
  *  Older patterns saved before dual-source lanes use `sourceId` and
- *  boolean steps; loadSavedPattern reads both shapes. */
+ *  boolean steps; loadSavedPattern reads both shapes. `accents` is also
+ *  optional — patterns saved before the accent row default to all-off. */
 export interface SavedPatternGrid {
   lanes: Array<{
     label: string;
@@ -57,7 +58,15 @@ export interface SavedPatternGrid {
   }>;
   stepCount: number;
   stepsPerBeat: number;
+  accents?: boolean[];
 }
+
+/** dB attenuation applied to non-accented hits when baking / inserting a
+ *  drum pattern. Accented hits stay at unity (no envelope). Picked a small
+ *  number so a default un-accented pattern doesn't sound dramatically
+ *  quieter than the user's ears expect — the user can boost the track or
+ *  flatten individual envelopes later if they want different ratios. */
+export const NON_ACCENT_DB = -3.0;
 
 // Ordered low-to-high so the kit stacks from the deepest sound at the
 // bottom (BD) up through the brighter ones (cymbals at the top), matching
@@ -110,6 +119,13 @@ export async function mountDrums(
     sourceB: null,
     steps: new Array<StepValue>(stepCount).fill(0),
   }));
+  // 808-style shared accent row. One boolean per step; an accented step
+  // boosts every lane that fires on it. Stored at the pattern level (not
+  // per-lane) so the AC row is a single visual line under the kit.
+  let accents: boolean[] = new Array<boolean>(stepCount).fill(false);
+  // Pre-compute the linear gain applied to non-accented hits in the
+  // preview path so we don't pow() once per scheduled node.
+  const NON_ACCENT_LINEAR = Math.pow(10, NON_ACCENT_DB / 20);
 
   // AudioBuffer cache keyed by sourceId. Populated lazily on first preview
   // or pad-tap; invalidated when the assigned source changes.
@@ -445,6 +461,83 @@ export async function mountDrums(
       row.appendChild(cells);
       grid.appendChild(row);
     }
+
+    // Shared accent row, mirroring the column layout above. The left-side
+    // block (label + A/B swatches + remove btn) is replaced with a single
+    // "AC" label and an inert spacer of the matching width so the cells
+    // line up with the lane cells exactly.
+    const acRow = document.createElement("div");
+    Object.assign(acRow.style, {
+      display: "flex",
+      alignItems: "center",
+      gap: "8px",
+      marginTop: "10px",
+    } satisfies Partial<CSSStyleDeclaration>);
+    const acLabel = document.createElement("div");
+    acLabel.textContent = "AC";
+    Object.assign(acLabel.style, {
+      width: "44px",
+      boxSizing: "border-box",
+      color: "#d8d8d8",
+      fontSize: "12px",
+      fontWeight: "600",
+      textAlign: "right",
+      padding: "2px 4px",
+      flexShrink: "0",
+    } satisfies Partial<CSSStyleDeclaration>);
+    acRow.appendChild(acLabel);
+    // Spacer that absorbs the same horizontal space the lane row uses for
+    // (swatch A + 8gap + swatch B + 8gap + × button) — total 28+8+28+8+20
+    // = 92 px. Keeps the AC cells aligned with the lane cells.
+    const acSpacer = document.createElement("div");
+    Object.assign(acSpacer.style, {
+      width: "92px",
+      flexShrink: "0",
+    } satisfies Partial<CSSStyleDeclaration>);
+    acRow.appendChild(acSpacer);
+    const acCells = document.createElement("div");
+    Object.assign(acCells.style, {
+      display: "flex",
+      gap: "0",
+      flex: "1",
+    } satisfies Partial<CSSStyleDeclaration>);
+    for (let s = 0; s < stepCount; s++) {
+      if (s > 0 && s % STEPS_PER_GROUP === 0) {
+        const gutter = document.createElement("div");
+        gutter.style.width = "10px";
+        gutter.style.flexShrink = "0";
+        acCells.appendChild(gutter);
+      }
+      const on = accents[s] ?? false;
+      const isActiveStep = activeStep === s;
+      const cell = document.createElement("button");
+      cell.type = "button";
+      cell.dataset["step"] = String(s);
+      Object.assign(cell.style, {
+        width: "26px",
+        height: "20px",
+        boxSizing: "border-box",
+        margin: "0 2px",
+        borderRadius: "3px",
+        // Amber when accented (#ffaa33) — distinct from the white/grey of
+        // lane cells and the gold #ffe066 of the active-step indicator,
+        // so the three colours can coexist on the same column without
+        // visual collision.
+        border: isActiveStep ? "1px solid #ffe066" : "1px solid #3a3a3a",
+        background: on ? "#ffaa33" : "#0e0e0e",
+        cursor: "pointer",
+        padding: "0",
+        flexShrink: "0",
+      } satisfies Partial<CSSStyleDeclaration>);
+      cell.title = `Accent step ${s + 1} (${on ? "on" : "off"})`;
+      cell.addEventListener("click", () => {
+        accents[s] = !(accents[s] ?? false);
+        drawGrid();
+      });
+      acCells.appendChild(cell);
+    }
+    acRow.appendChild(acCells);
+    grid.appendChild(acRow);
   };
 
   // ---- buffer cache + preview -----------------------------------------
@@ -716,13 +809,19 @@ export async function mountDrums(
     }
     for (let s = 0; s < stepCount; s++) {
       const t = startCtxTime + s * stepDur;
+      // Apply the column-wide accent gain once per step. Accented steps
+      // play at unity; non-accented steps are pulled down by NON_ACCENT_DB.
+      const stepGain = (accents[s] ?? false) ? 1.0 : NON_ACCENT_LINEAR;
       for (const { lane, bufA, bufB } of lanesWithBufs) {
         const v = lane.steps[s] ?? 0;
         const buf = v === 1 ? bufA : v === 2 ? bufB : null;
         if (!buf) continue;
         const node = ctx.createBufferSource();
         node.buffer = buf;
-        node.connect(ctx.destination);
+        const gainNode = ctx.createGain();
+        gainNode.gain.value = stepGain;
+        node.connect(gainNode);
+        gainNode.connect(ctx.destination);
         node.start(t);
         out.push(node);
       }
@@ -854,6 +953,15 @@ export async function mountDrums(
             hit.src.frames,
           );
           await client.setClipGroup(trackId, clipId, groupId);
+          // Non-accented hits get a constant volume envelope at
+          // NON_ACCENT_DB; accented hits are left at unity (no envelope)
+          // so the user can later "de-envelope" a clip to undo its
+          // attenuation, or flatten it with the arranger envelope tools.
+          if (!(accents[hit.stepIdx] ?? false)) {
+            await client.setClipEnvelope(trackId, clipId, "volume", [
+              { time: 0, value: NON_ACCENT_DB, curve: "Linear" },
+            ]);
+          }
           clipsAdded++;
         } catch (err) {
           console.warn("bake: addClip failed", err);
@@ -885,6 +993,7 @@ export async function mountDrums(
     })),
     stepCount,
     stepsPerBeat,
+    accents: [...accents],
   });
 
   /** Rebuild the load picker from the engine's saved patterns. */
@@ -960,6 +1069,17 @@ export async function mountDrums(
       }
       lanes.push({ label: savedLane.label, sourceA, sourceB, steps });
     }
+    // Restore the accent row, defaulting to all-off for older patterns
+    // saved before the AC row existed. Truncate / pad to match stepCount
+    // so a pattern saved at 16 steps still loads cleanly when stepCount
+    // was extended to 32 by a previous pattern.
+    accents = new Array<boolean>(stepCount).fill(false);
+    if (Array.isArray(grid.accents)) {
+      const limit = Math.min(accents.length, grid.accents.length);
+      for (let s = 0; s < limit; s++) {
+        accents[s] = !!grid.accents[s];
+      }
+    }
     nameInput.value = name;
     updateLengthDisplay();
     drawGrid();
@@ -1005,6 +1125,7 @@ export async function mountDrums(
     for (const lane of lanes) {
       lane.steps.push(...new Array<StepValue>(added).fill(0));
     }
+    accents.push(...new Array<boolean>(added).fill(false));
     updateLengthDisplay();
     drawGrid();
     setStatus(`extended to ${stepCount / STEPS_PER_BAR} bars`);
@@ -1030,6 +1151,7 @@ export async function mountDrums(
   });
   clearBtn.addEventListener("click", () => {
     for (const lane of lanes) lane.steps.fill(0);
+    accents.fill(false);
     drawGrid();
     setStatus("pattern cleared");
   });

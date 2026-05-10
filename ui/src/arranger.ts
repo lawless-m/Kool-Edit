@@ -16,6 +16,7 @@ import type {
 } from "./engine/client";
 import { btnStyle } from "./editor";
 import type { SavedPatternGrid } from "./drums";
+import { NON_ACCENT_DB } from "./drums";
 
 const DEFAULT_PIXELS_PER_SECOND = 60;
 const MIN_PIXELS_PER_SECOND = 5;
@@ -1708,6 +1709,10 @@ export async function mountArranger(
     const newGroup = nextGroupId();
     await client.setGroupName(newGroup, name);
     let clipCount = 0;
+    // Pattern-level shared accent row. Optional in the saved format —
+    // older patterns saved before the AC row default to all-off, which
+    // means every clip gets the non-accent envelope.
+    const accents: boolean[] = Array.isArray(grid.accents) ? grid.accents : [];
     for (const lane of grid.lanes) {
       // New patterns store sourceA/sourceB; legacy patterns store sourceId
       // (and boolean steps). Treat legacy as sourceA so old saves still load.
@@ -1736,6 +1741,14 @@ export async function mountArranger(
         try {
           const clipId = await client.addClip(trackId, hit.sourceId, positionFrame, 0, src.frames);
           await client.setClipGroup(trackId, clipId, newGroup);
+          // Mirror the bake path: non-accented hits get a constant volume
+          // envelope at NON_ACCENT_DB; accented hits stay at unity (no
+          // envelope) so they stand out in the column.
+          if (!(accents[hit.stepIdx] ?? false)) {
+            await client.setClipEnvelope(trackId, clipId, "volume", [
+              { time: 0, value: NON_ACCENT_DB, curve: "Linear" },
+            ]);
+          }
           clipCount++;
         } catch (err) {
           console.warn("insertPattern: addClip failed", err);
