@@ -392,26 +392,42 @@ export async function mountDrums(
       ): HTMLButtonElement => {
         const btn = document.createElement("button");
         btn.type = "button";
-        const fill = which === "A" ? "#ffffff" : "#7a7a7a";
-        // Filled square when assigned; dashed outline when empty so the
-        // user can tell at a glance which slots are wired up.
+        const fill = which === "A" ? "#7a7a7a" : "#ffffff";
+        // Always paint the swatch in its slot colour (white for A, mid
+        // grey for B) so the visual key never inverts to near-black when
+        // a slot is empty. Empty slots are signalled by a dashed border
+        // and reduced opacity instead. The slot letter ("X" / "x") is
+        // rendered inside the square so the slot identity is readable
+        // even if a future style regression flattens the fill.
         const assigned = currentValue !== null;
+        btn.textContent = which === "A" ? "⚫" : "⚪";
         Object.assign(btn.style, {
           width: "24px",
           height: "24px",
           boxSizing: "border-box",
-          background: assigned ? fill : "transparent",
-          border: assigned ? `1px solid ${fill}` : `1px dashed ${fill}`,
+          appearance: "none",
+          webkitAppearance: "none",
+          background: fill,
+          border: `1px ${assigned ? "solid" : "dashed"} ${fill}`,
+          opacity: assigned ? "1" : "0.5",
           borderRadius: "3px",
           padding: "0",
           margin: "0 2px",
           cursor: "pointer",
           flexShrink: "0",
+          color: "#0e0e0e",
+          fontWeight: "700",
+          fontSize: which === "A" ? "13px" : "14px",
+          lineHeight: "1",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          fontFamily: "inherit",
         } satisfies Partial<CSSStyleDeclaration>);
         const assignedName = assigned
           ? sources.find((s) => s.id === currentValue)?.name ?? "(missing)"
           : "(none)";
-        btn.title = `Slot ${which} (${which === "A" ? "X" : "x"}): ${assignedName} — click to change`;
+        btn.title = `Slot ${which} (${which === "A" ? "⚫" : "⚪"}): ${assignedName} — click to change`;
         btn.addEventListener("click", async () => {
           const result = await pickSource(which, currentValue);
           if (result === undefined) return; // cancelled
@@ -508,9 +524,14 @@ export async function mountDrums(
         cell.dataset["step"] = String(s);
         const value: StepValue = lane.steps[s] ?? 0;
         const isActiveStep = activeStep === s;
-        // Three-state colouring: off = dark, X = white, x = grey.
+        // Three-state colouring: off = dark, X = white, x = grey. The
+        // cell paints its slot letter inside (capital "X" for slot A,
+        // lowercase "x" for slot B) so a glance at the row shows which
+        // timbre fires on each step without having to map colour to
+        // slot in your head.
         const cellBg =
-          value === 1 ? "#ffffff" : value === 2 ? "#7a7a7a" : "#0e0e0e";
+          value === 1 ? "#7a7a7a" : value === 2 ? "#ffffff" : "#0e0e0e";
+        cell.textContent = value === 1 ? "⚫" : value === 2 ? "⚪" : "";
         // One column = cell width (26) + 2×margin (4) = 30 px. Shifting
         // the cell by `nudge × column_width` makes the visual offset on
         // the grid match the actual timing offset on the audio clock —
@@ -528,7 +549,21 @@ export async function mountDrums(
           margin: "0 2px",
           borderRadius: "3px",
           border: isActiveStep ? "1px solid #ffe066" : "1px solid #555",
+          // Disable native button styling so `background` actually wins —
+          // some browsers paint a dark OS-themed gradient over white
+          // backgrounds when `appearance: auto` is left on, which made
+          // active-step "X" cells render dark instead of white.
+          appearance: "none",
+          webkitAppearance: "none",
           background: cellBg,
+          color: "#0e0e0e",
+          fontWeight: "700",
+          fontSize: value === 1 ? "14px" : "15px",
+          lineHeight: "1",
+          fontFamily: "inherit",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
           cursor: "pointer",
           padding: "0",
           flexShrink: "0",
@@ -780,7 +815,7 @@ export async function mountDrums(
       } satisfies Partial<CSSStyleDeclaration>);
       header.appendChild(swatch);
       const title = document.createElement("div");
-      title.textContent = `Pick source for slot ${which} (${which === "A" ? "X" : "x"})`;
+      title.textContent = `Pick source for slot ${which} (${which === "A" ? "⚫" : "⚪"})`;
       title.style.fontWeight = "600";
       header.appendChild(title);
       panel.appendChild(header);
