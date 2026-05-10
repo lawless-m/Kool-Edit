@@ -59,6 +59,9 @@ export interface SavedPatternGrid {
   stepCount: number;
   stepsPerBeat: number;
   accents?: boolean[];
+  /** Linn-style 16th swing as a 50–75 percentage. Optional — patterns
+   *  saved before swing existed default to 50 (straight). */
+  swing?: number;
 }
 
 /** dB attenuation applied to non-accented hits when baking / inserting a
@@ -126,6 +129,19 @@ export async function mountDrums(
   // Pre-compute the linear gain applied to non-accented hits in the
   // preview path so we don't pow() once per scheduled node.
   const NON_ACCENT_LINEAR = Math.pow(10, NON_ACCENT_DB / 20);
+  // Linn-style 16th-note swing as a 50–75 percentage. 50 = straight,
+  // 67 ≈ triplet feel, 75 = dotted-8th + 16th. Odd-indexed steps get
+  // pushed forward in time by ((swing-50)/50) * (stepDur/2).
+  let swing = 50;
+
+  /** Offset (seconds) added to step `s`'s start time when swing > 50.
+   *  Even-indexed steps stay on the grid; odd-indexed steps slide later
+   *  by up to half a step at swing=75. Same formula serves the preview,
+   *  the bake path, and the arranger Insert pattern. */
+  const swingOffsetSec = (s: number, stepDur: number): number => {
+    if (s % 2 === 0) return 0;
+    return ((swing - 50) / 50) * (stepDur / 2);
+  };
 
   // AudioBuffer cache keyed by sourceId. Populated lazily on first preview
   // or pad-tap; invalidated when the assigned source changes.
@@ -184,6 +200,45 @@ export async function mountDrums(
   const addLaneBtn = makeBtn("+ lane");
   addLaneBtn.title = "Append an empty lane to the bottom of the kit";
   toolbar.appendChild(addLaneBtn);
+
+  // Linn-style swing slider. 50 (straight) → 75 (dotted-8th + 16th).
+  // Capped at 75 because anything past that lands on top of the next
+  // even step and stops sounding musical. Anti-swing (<50) is rarely
+  // useful for drum patterns, so we don't expose it.
+  const swingWrap = document.createElement("div");
+  Object.assign(swingWrap.style, {
+    display: "flex",
+    alignItems: "center",
+    gap: "6px",
+    fontSize: "12px",
+    color: "#d8d8d8",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const swingLabel = document.createElement("span");
+  swingLabel.textContent = "Swing";
+  swingWrap.appendChild(swingLabel);
+  const swingInput = document.createElement("input");
+  swingInput.type = "range";
+  swingInput.min = "50";
+  swingInput.max = "75";
+  swingInput.step = "1";
+  swingInput.value = String(swing);
+  Object.assign(swingInput.style, {
+    width: "100px",
+  } satisfies Partial<CSSStyleDeclaration>);
+  const swingReadout = document.createElement("span");
+  swingReadout.textContent = `${swing}%`;
+  Object.assign(swingReadout.style, {
+    width: "32px",
+    fontFamily: "ui-monospace, monospace",
+    color: "#9a9a9a",
+  } satisfies Partial<CSSStyleDeclaration>);
+  swingInput.addEventListener("input", () => {
+    swing = Number(swingInput.value) || 50;
+    swingReadout.textContent = `${swing}%`;
+  });
+  swingWrap.appendChild(swingInput);
+  swingWrap.appendChild(swingReadout);
+  toolbar.appendChild(swingWrap);
 
   const spacer = document.createElement("div");
   spacer.style.flex = "1";
@@ -808,7 +863,7 @@ export async function mountDrums(
       if (bufA || bufB) lanesWithBufs.push({ lane, bufA, bufB });
     }
     for (let s = 0; s < stepCount; s++) {
-      const t = startCtxTime + s * stepDur;
+      const t = startCtxTime + s * stepDur + swingOffsetSec(s, stepDur);
       // Apply the column-wide accent gain once per step. Accented steps
       // play at unity; non-accented steps are pulled down by NON_ACCENT_DB.
       const stepGain = (accents[s] ?? false) ? 1.0 : NON_ACCENT_LINEAR;
@@ -943,7 +998,12 @@ export async function mountDrums(
       const trackId = await client.addTrack(lane.label);
       tracksAdded++;
       for (const hit of hits) {
-        const positionFrame = hit.stepIdx * stepFrames;
+        // Convert the per-step swing offset (seconds) to whole frames at
+        // the project sample rate so the bake matches the live preview.
+        const swingFrames = Math.round(
+          swingOffsetSec(hit.stepIdx, stepDurationSec()) * projectSr,
+        );
+        const positionFrame = hit.stepIdx * stepFrames + swingFrames;
         try {
           const clipId = await client.addClip(
             trackId,
@@ -994,6 +1054,7 @@ export async function mountDrums(
     stepCount,
     stepsPerBeat,
     accents: [...accents],
+    swing,
   });
 
   /** Rebuild the load picker from the engine's saved patterns. */
@@ -1080,6 +1141,11 @@ export async function mountDrums(
         accents[s] = !!grid.accents[s];
       }
     }
+    // Restore swing, clamped to the slider's range. Patterns without
+    // swing fall back to 50 (straight).
+    swing = Math.max(50, Math.min(75, Number(grid.swing ?? 50) || 50));
+    swingInput.value = String(swing);
+    swingReadout.textContent = `${swing}%`;
     nameInput.value = name;
     updateLengthDisplay();
     drawGrid();

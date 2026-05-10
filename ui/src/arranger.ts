@@ -1706,6 +1706,14 @@ export async function mountArranger(
     // BPM/time-sig later still gives you a musically aligned insert.
     const stepDurSec = secondsPerBeat() / Math.max(1, grid.stepsPerBeat ?? 4);
     const stepFrames = Math.round(stepDurSec * projectSr);
+    // Apply the saved pattern's swing (50–75 = straight..dotted) to odd-
+    // indexed steps. Patterns without swing default to straight.
+    const swingPct = Math.max(50, Math.min(75, Number(grid.swing ?? 50) || 50));
+    const swingFramesFor = (s: number): number => {
+      if (s % 2 === 0) return 0;
+      const sec = ((swingPct - 50) / 50) * (stepDurSec / 2);
+      return Math.round(sec * projectSr);
+    };
     const newGroup = nextGroupId();
     await client.setGroupName(newGroup, name);
     let clipCount = 0;
@@ -1737,7 +1745,8 @@ export async function mountArranger(
       for (const hit of hits) {
         const src = sources.find((s) => s.id === hit.sourceId);
         if (!src) continue;
-        const positionFrame = startFrame + hit.stepIdx * stepFrames;
+        const positionFrame =
+          startFrame + hit.stepIdx * stepFrames + swingFramesFor(hit.stepIdx);
         try {
           const clipId = await client.addClip(trackId, hit.sourceId, positionFrame, 0, src.frames);
           await client.setClipGroup(trackId, clipId, newGroup);
