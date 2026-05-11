@@ -89,9 +89,15 @@ pub struct KepzArchive {
 /// Build a `.kepz` zip from a project plus the sample blobs every source
 /// references. The caller is responsible for reading the samples out of
 /// whatever storage backend they live in (e.g. MemoryStorage).
+///
+/// Samples are streamed into the zip's deflate writer in 16 KB chunks
+/// instead of materialised as one big `Vec<u8>` per source — multi-source
+/// projects on the 4 GB-capped WASM heap were OOM'ing inside the zip
+/// writer because each source was effectively held twice (once as f32s,
+/// once as the f32→le_bytes copy).
 pub fn write_archive<I>(project: &Project, sources: I) -> Result<Vec<u8>, KepzError>
 where
-    I: IntoIterator<Item = KepzSource>,
+    I: IntoIterator<Item = Result<KepzSource, KepzError>>,
 {
     let mut buf = Cursor::new(Vec::<u8>::new());
     {
@@ -106,13 +112,24 @@ where
             .map_err(|e| KepzError::Io(std::io::Error::other(e)))?;
         zip.write_all(json.as_bytes())?;
 
+        // Reused across sources so we don't pay an allocation per file.
+        // 4096 f32 = 16 KB on the stack pays for a deflate input batch
+        // without ballooning the WASM heap.
+        const CHUNK_FRAMES: usize = 4096;
+        let mut chunk_bytes = [0u8; CHUNK_FRAMES * 4];
         for source in sources {
+            let source = source?;
             zip.start_file(&source.path, opts)?;
-            let mut bytes = Vec::with_capacity(source.samples.len() * 4);
-            for s in &source.samples {
-                bytes.extend_from_slice(&s.to_le_bytes());
+            for chunk in source.samples.chunks(CHUNK_FRAMES) {
+                for (i, s) in chunk.iter().enumerate() {
+                    chunk_bytes[i * 4..i * 4 + 4].copy_from_slice(&s.to_le_bytes());
+                }
+                zip.write_all(&chunk_bytes[..chunk.len() * 4])?;
             }
-            zip.write_all(&bytes)?;
+            // `source` (and its samples Vec) drops here — the next
+            // iteration reads the next source fresh from storage, so
+            // peak WASM heap stays at ~one source rather than scaling
+            // with the project's total sample count.
         }
 
         zip.finish()?;
@@ -186,7 +203,7 @@ mod tests {
             path: "sources/src_a/base.f32".into(),
             samples: samples.clone(),
         }];
-        let bytes = write_archive(&p, sources).unwrap();
+        let bytes = write_archive(&p, sources.into_iter().map(Ok)).unwrap();
         let arc = read_archive(&bytes).unwrap();
         assert_eq!(arc.sources.len(), 1);
         assert_eq!(arc.sources[0].path, "sources/src_a/base.f32");

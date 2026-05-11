@@ -785,19 +785,23 @@ impl Engine {
     /// base file, zipped. The result is shareable across machines without
     /// any external file dependencies.
     pub fn export_kepz(&self) -> Result<Vec<u8>, KepzError> {
-        let mut sources = Vec::with_capacity(self.project.sources.len());
-        for source in self.project.sources.values() {
+        // Stream each source from storage on demand instead of collecting
+        // them all up-front. write_archive drops each KepzSource once it
+        // finishes its file, so peak WASM heap stays at ~one source's
+        // worth of samples rather than scaling with the whole project.
+        // Previously a multi-source project on the 4 GB-capped browser
+        // heap could OOM inside the deflate writer.
+        let storage = &self.storage;
+        let sources = self.project.sources.values().map(move |source| {
             let path = source.base_file.as_str().to_owned();
-            let len = self
-                .storage
+            let len = storage
                 .length(&path)
                 .map_err(|e| KepzError::Io(std::io::Error::other(e.to_string())))?;
-            let samples = self
-                .storage
+            let samples = storage
                 .read(&path, 0..len)
                 .map_err(|e| KepzError::Io(std::io::Error::other(e.to_string())))?;
-            sources.push(KepzSource { path, samples });
-        }
+            Ok(KepzSource { path, samples })
+        });
         kepz::write_archive(&self.project, sources)
     }
 

@@ -50,6 +50,14 @@ mod wasm_api {
     use crate::range::SampleRange;
     use crate::source::Timestamp;
 
+    /// Route Rust panics to `console.error` with the message + location.
+    /// Called automatically from wasm-bindgen's start hook so the very first
+    /// panic surfaces a real message rather than a bare WASM `unreachable`.
+    #[wasm_bindgen(start)]
+    pub fn install_panic_hook() {
+        console_error_panic_hook::set_once();
+    }
+
     #[wasm_bindgen]
     pub fn banner() -> String {
         super::banner()
