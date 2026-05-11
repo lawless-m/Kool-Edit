@@ -146,7 +146,10 @@ async function loadWasm(): Promise<EngineModule | { error: string }> {
   const wasmUrl = new URL("./pkg/kool_edit_engine_bg.wasm", import.meta.url).href;
   try {
     const mod = (await import(/* @vite-ignore */ jsUrl)) as EngineModule;
-    await mod.default(wasmUrl);
+    // wasm-bindgen ≥ 0.2.93 deprecated the positional URL argument in
+    // favour of a single options object — passing the bare URL still
+    // works but emits a console warning on every page load.
+    await mod.default({ module_or_path: wasmUrl });
     return mod;
   } catch {
     return {
